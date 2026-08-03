@@ -1,0 +1,37 @@
+# Autoconf and Automake generated files
+aclocal.m4
+autom4te.cache/
+configure
+config.h
+config.h.in
+config.h.in~
+config.log
+config.status
+stamp-h1
+Makefile
+Makefile.in
+libzstfs/Makefile
+libzstfs/Makefile.in
+test/Makefile
+test/Makefile.in
+depcomp
+install-sh
+missing
+test-driver
+
+# Build outputs and dependency metadata
+*.a
+*.o
+*.Po
+*.Tpo
+.deps/
+.dirstamp
+test/test_api
+test/*.log
+test/*.trs
+test/test-suite.log
+
+.claude/
+CLAUDE.md
+todo.md
+prog.md
