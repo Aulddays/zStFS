@@ -5,14 +5,13 @@
 
 #include <assert.h>
 
+#include <fstream>
 #include <string>
 #include <vector>
 
 #include "zstfs/market.h"
 
-namespace {
-
-zstfs::Symbol NewSymbol(const std::string& code) {
+static zstfs::Symbol NewSymbol(const std::string& code) {
 	zstfs::Symbol symbol = {};
 	symbol.code = code;
 	symbol.name = "Example Security";
@@ -30,10 +29,20 @@ void ExpectOk(const zstfs::Status& status) {
 	assert(status.ok());
 }
 
-}  // namespace
-
 int main() {
-	zstfs::Market market("test-market", "/tmp/zstfs-test-market", "market-local");
+	zstfs::Market market("test-market", "/tmp/zstfs-test-market", "CNA");
+	assert(market.type() == "CNA");
+
+	const std::string markets_path = "/tmp/zstfs-markets-test.conf";
+	std::ofstream markets_config(markets_path.c_str());
+	markets_config << "shanghai,CNA,/tmp/zstfs-shanghai\n";
+	markets_config << "shenzhen,CNA,/tmp/zstfs-shenzhen\n";
+	markets_config.close();
+	zstfs::Markets markets;
+	ExpectOk(markets.load(markets_path));
+	zstfs::Market* shanghai = NULL;
+	ExpectOk(markets.get("shanghai", &shanghai));
+	assert(shanghai->type() == "CNA");
 
 	zstfs::SymbolId symbol_id = zstfs::kInvalidSymbolId;
 	ExpectOk(market.symbols().add(NewSymbol("TEST"), &symbol_id));
@@ -48,6 +57,19 @@ int main() {
 	ExpectOk(market.symbols().find("TEST", &symbol));
 	assert(symbol.id == symbol_id);
 	ExpectOk(market.symbols().find("TEST2", &symbol));
+	ExpectOk(market.symbols().get(symbol_id, &symbol));
+	assert(symbol.aliases.size() == 1);
+	assert(symbol.aliases[0].code == "TEST");
+	ExpectOk(market.symbols().find("TEST", "20260803", &symbol));
+
+	const std::string symbols_path = "/tmp/zstfs-symbols-test.bin";
+	ExpectOk(market.symbols().save(symbols_path));
+	zstfs::Symbols restored_symbols;
+	ExpectOk(restored_symbols.load(symbols_path));
+	ExpectOk(restored_symbols.find("TEST", &symbol));
+	assert(symbol.id == symbol_id);
+	ExpectOk(restored_symbols.find("TEST2", &symbol));
+	assert(symbol.name == "Example Security");
 
 	zstfs::Action action = {};
 	action.symbol_id = symbol_id;

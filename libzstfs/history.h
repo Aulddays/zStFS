@@ -1,10 +1,9 @@
-// history_internal.h
+// history.h
 //
 // Defines the calendar-addressed block and frame structures used inside
 // History. Public callers only operate on complete Bar records.
 
-#ifndef ZSTFS_HISTORY_INTERNAL_H_
-#define ZSTFS_HISTORY_INTERNAL_H_
+#pragma once
 
 #include <cstdint>
 #include <vector>
@@ -29,6 +28,11 @@ struct BlockBar {
 
 struct StockTimeBlock {
 	BlockKey key;
+	// One bit identifies whether this symbol has any data on a day in the
+	// block. The hourly payload uses the market slot layout only when the
+	// corresponding day bit is set; intra-day gaps remain explicit payload
+	// positions rather than expanding the day into a fixed 256-slot grid.
+	uint64_t day_presence;
 	std::vector<BlockBar> positions;
 };
 
@@ -83,4 +87,3 @@ private:
 
 }  // namespace zstfs
 
-#endif  // ZSTFS_HISTORY_INTERNAL_H_

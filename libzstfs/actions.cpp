@@ -4,16 +4,12 @@
 
 namespace zstfs {
 
-namespace {
-
-bool ActionOrder(const Action& left, const Action& right) {
+static bool ActionOrder(const Action& left, const Action& right) {
 	if (left.effective_date != right.effective_date) {
 		return left.effective_date < right.effective_date;
 	}
 	return left.id < right.id;
 }
-
-}  // namespace
 
 Actions::Actions()
 	: next_id_(kInvalidActionId + 1) {

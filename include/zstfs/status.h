@@ -1,5 +1,4 @@
-#ifndef ZSTFS_STATUS_H_
-#define ZSTFS_STATUS_H_
+#pragma once
 
 #include <string>
 
@@ -36,4 +35,3 @@ private:
 
 }  // namespace zstfs
 
-#endif  // ZSTFS_STATUS_H_

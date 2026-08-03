@@ -1,13 +1,16 @@
 #include "zstfs/market.h"
 
+#include "calendar.h"
+
 namespace zstfs {
 
 Market::Market(const std::string& name,
                const std::string& path,
-               const std::string& local_time_zone)
+               const std::string& type)
 	: name_(name),
 	  path_(path),
-	  local_time_zone_(local_time_zone),
+	  type_(type),
+	  calendar_(new Calendar(type)),
 	  symbols_(new Symbols()),
 	  actions_(new Actions()),
 	  daily_history_(new History(Frequency::Daily)),
@@ -25,8 +28,8 @@ const std::string& Market::path() const {
 	return path_;
 }
 
-const std::string& Market::local_time_zone() const {
-	return local_time_zone_;
+const std::string& Market::type() const {
+	return type_;
 }
 
 Symbols& Market::symbols() {

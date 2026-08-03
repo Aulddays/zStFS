@@ -1,5 +1,4 @@
-#ifndef ZSTFS_MARKET_H_
-#define ZSTFS_MARKET_H_
+#pragma once
 
 #include <map>
 #include <memory>
@@ -11,6 +10,7 @@
 
 namespace zstfs {
 
+class Calendar;
 class Symbols;
 class Actions;
 class History;
@@ -24,12 +24,12 @@ class Market {
 public:
 	Market(const std::string& name,
 	       const std::string& path,
-	       const std::string& local_time_zone);
+	       const std::string& type);
 	~Market();
 
 	const std::string& name() const;
 	const std::string& path() const;
-	const std::string& local_time_zone() const;
+	const std::string& type() const;
 
 	Symbols& symbols();
 	const Symbols& symbols() const;
@@ -41,7 +41,8 @@ public:
 private:
 	std::string name_;
 	std::string path_;
-	std::string local_time_zone_;
+	std::string type_;
+	std::unique_ptr<Calendar> calendar_;
 	std::unique_ptr<Symbols> symbols_;
 	std::unique_ptr<Actions> actions_;
 	std::unique_ptr<History> daily_history_;
@@ -57,9 +58,14 @@ public:
 	Status add(const Symbol& symbol, SymbolId* out_id);
 	Status get(SymbolId id, Symbol* out) const;
 	Status find(const std::string& code, Symbol* out) const;
+	Status find(const std::string& code,
+	            const std::string& date,
+	            Symbol* out) const;
 	Status update(SymbolId id, const Symbol& symbol);
 	Status remove(SymbolId id);
 	Status list(std::vector<Symbol>* out) const;
+	Status load(const std::string& file_path);
+	Status save(const std::string& file_path) const;
 
 private:
 	std::map<SymbolId, Symbol> by_id_;
@@ -119,6 +125,18 @@ private:
 	std::unique_ptr<VaultStore> vault_;
 };
 
+// Markets owns the statically configured Market instances for one process.
+// Its configuration file contains one comma-separated name,type,path entry per
+// line, allowing several market instances to share the same market type.
+class Markets {
+public:
+	Status load(const std::string& file_path);
+	Status get(const std::string& name, Market** out);
+	Status get(const std::string& name, const Market** out) const;
+
+private:
+	std::map<std::string, std::unique_ptr<Market> > by_name_;
+};
+
 }  // namespace zstfs
 
-#endif  // ZSTFS_MARKET_H_

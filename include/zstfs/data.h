@@ -4,19 +4,24 @@
 // internal history pipeline. Public callers use market-local time strings;
 // Calendar converts those strings into compact internal time identifiers.
 
-#ifndef ZSTFS_DATA_H_
-#define ZSTFS_DATA_H_
+#pragma once
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace zstfs {
 
 typedef uint32_t SymbolId;
 typedef uint32_t ActionId;
+typedef uint16_t DayId;
+typedef uint8_t HourSlot;
 typedef uint32_t TimeId;
 typedef uint32_t TimeBlockId;
 typedef uint16_t Position;
+
+const uint16_t kTimeBlockDayLength = 64;
+const DayId kEpochDayId = 0;
 
 const SymbolId kInvalidSymbolId = 0;
 const ActionId kInvalidActionId = 0;
@@ -83,6 +88,12 @@ struct PrecisionProfile {
 	double volume_relative_error;
 };
 
+struct SymbolAlias {
+	std::string code;
+	std::string begin_date;
+	std::string end_date;
+};
+
 struct Symbol {
 	SymbolId id;
 	std::string code;
@@ -95,6 +106,7 @@ struct Symbol {
 	uint64_t tradable_share;
 	uint32_t volume_unit;
 	SymbolState state;
+	std::vector<SymbolAlias> aliases;
 };
 
 struct Action {
@@ -108,4 +120,3 @@ struct Action {
 
 }  // namespace zstfs
 
-#endif  // ZSTFS_DATA_H_

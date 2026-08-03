@@ -27,6 +27,7 @@ test-driver
 .deps/
 .dirstamp
 test/test_api
+test/test_calendar
 test/*.log
 test/*.trs
 test/test-suite.log
