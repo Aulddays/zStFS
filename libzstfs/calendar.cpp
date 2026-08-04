@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 
 namespace zstfs {
@@ -13,7 +14,7 @@ namespace zstfs {
 // Gregorian date arithmetic
 //
 // 1900-01-01 was a Monday. We first measure ordinary calendar days from that
-// epoch, then remove only Saturday and Sunday from the compact DayId axis.
+// epoch, then remove only Saturday and Sunday from the compact TimeId axis.
 // Weekday holidays deliberately remain on the axis, preserving every existing
 // storage coordinate when a holiday or special slot layout is later added.
 struct DateParts {
@@ -110,24 +111,35 @@ static bool ValidSlots(const std::vector<HourSlot>& slots) {
 	return true;
 }
 
-static Status CNASlots(const std::string&, std::vector<HourSlot>* out) {
+// CNA normal trading slots are the starts of the two morning and two
+// afternoon trading hours. Historical branches remain in this function when a
+// real schedule change occurs; a new branch must use its actual future
+// effective date and must not alter an existing date range.
+static Status CNASlots(const std::string& date, std::vector<HourSlot>* out) {
 	if (out == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "slot output is required");
 	}
 	out->clear();
-	out->push_back(93);
-	out->push_back(103);
-	out->push_back(113);
-	out->push_back(133);
-	out->push_back(143);
+	out->push_back(93);   // 09:30
+	out->push_back(103);  // 10:30
+	out->push_back(130);  // 13:00
+	out->push_back(140);  // 14:00
+
+	// Future schedule change example, intentionally inactive. Replace the
+	// placeholder date and slot with a real effective rule when one is needed;
+	// keep the existing branch unchanged for all earlier dates.
+	// if (date >= "YYYYMMDD") {
+	// 	out->push_back(120);
+	// }
 	return Status::Ok();
 }
 
-// Markets configuration names a type such as "CNA"; this registry maps
-// that name to code which generates its normal weekday slots. Calendar calls
-// the function only after date overrides have been checked. A function clears
-// out and returns sorted, unique HHM slots; holidays and exceptional slot
-// layouts stay in Calendar's date override table.
+// Markets configuration names a type such as "CNA"; this registry maps that
+// name to the compiled function that generates normal weekday slots. Calendar
+// calls the function only after date overrides have been checked. The function
+// receives the date so it can preserve every historical layout while appending
+// only future-effective changes. It clears out and returns sorted, unique HHM
+// slots; holidays and exceptional layouts stay in Calendar's date overrides.
 static std::map<std::string, MarketSlotsFunction>& MarketTypes() {
 	static std::map<std::string, MarketSlotsFunction> functions;
 	if (functions.empty()) {
@@ -175,7 +187,7 @@ const std::string& Calendar::market_type() const {
 	return market_type_;
 }
 
-Status Calendar::day_id(const std::string& value, DayId* out) const {
+Status Calendar::time_id(const std::string& value, TimeId* out) const {
 	DateParts date_parts;
 	if (out == NULL || !ParseDate(value, &date_parts)) {
 		return Status::Error(ErrorCode::InvalidArgument, "invalid local date");
@@ -184,20 +196,22 @@ Status Calendar::day_id(const std::string& value, DayId* out) const {
 	if (IsWeekendOrdinal(ordinal)) {
 		return Status::Error(ErrorCode::NotFound, "local date is a weekend");
 	}
-	const int day_id_value = ordinal - (ordinal / 7) * 2;
-	if (day_id_value < 0 || day_id_value > 65535) {
-		return Status::Error(ErrorCode::Conflict, "day identifier is out of range");
+	const int day_number = ordinal - (ordinal / 7) * 2;
+	if (day_number < 0 ||
+	    static_cast<TimeId>(day_number) > (std::numeric_limits<TimeId>::max() >> 8)) {
+		return Status::Error(ErrorCode::Conflict, "time identifier is out of range");
 	}
-	*out = static_cast<DayId>(day_id_value);
+	*out = daily_bar_id(static_cast<TimeId>(day_number));
 	return Status::Ok();
 }
 
-Status Calendar::date(DayId value, std::string* out) const {
-	if (out == NULL) {
-		return Status::Error(ErrorCode::InvalidArgument, "date output is required");
+Status Calendar::date(TimeId value, std::string* out) const {
+	if (out == NULL || time_slot(value) != 0) {
+		return Status::Error(ErrorCode::InvalidArgument,
+		                     "daily time identifier is required");
 	}
 	int ordinal = 0;
-	int remaining = value;
+	int remaining = static_cast<int>(time_day(value));
 	while (remaining > 0) {
 		++ordinal;
 		if (!IsWeekendOrdinal(ordinal)) {
@@ -231,8 +245,8 @@ Status Calendar::hour_slot(const std::string& value, HourSlot* out) const {
 	if (out == NULL || !ParseHourlyTime(value, &date_value, &hour, &minute)) {
 		return Status::Error(ErrorCode::InvalidArgument, "invalid local hourly time");
 	}
-	DayId ignored_day_id = 0;
-	Status status = day_id(date_value, &ignored_day_id);
+	TimeId ignored_time_id = 0;
+	Status status = time_id(date_value, &ignored_time_id);
 	if (!status.ok()) {
 		return status;
 	}
@@ -240,7 +254,7 @@ Status Calendar::hour_slot(const std::string& value, HourSlot* out) const {
 	return Status::Ok();
 }
 
-Status Calendar::local_time(DayId value,
+Status Calendar::local_time(TimeId value,
                             HourSlot slot,
                             std::string* out) const {
 	if (out == NULL || slot > 235 || slot % 10 > 5) {
@@ -265,8 +279,8 @@ Status Calendar::slots(const std::string& value,
 	if (out == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "slot output is required");
 	}
-	DayId ignored_day_id = 0;
-	Status status = day_id(value, &ignored_day_id);
+	TimeId ignored_time_id = 0;
+	Status status = time_id(value, &ignored_time_id);
 	if (!status.ok()) {
 		return status;
 	}
@@ -279,25 +293,29 @@ Status Calendar::slots(const std::string& value,
 	return GetSlots(market_type_, value, out);
 }
 
-// Hourly positions use the prefix sum of actual slots in the block; closed
+// Hourly offsets use the prefix sum of actual slots in the block; closed
 // days and shorter slot layouts therefore consume no artificial 256-slot space.
-Status Calendar::block_position(Frequency frequency,
+Status Calendar::block_offset(Frequency frequency,
                                 const std::string& value,
-                                TimeBlockId* block_id,
-                                Position* position) const {
-	if (block_id == NULL || position == NULL) {
+                                TimeId* block_id,
+                                BlockOff* block_offset) const {
+	if (block_id == NULL || block_offset == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "block outputs are required");
 	}
 	std::string date_value = frequency == Frequency::Daily ? value : value.substr(0, 8);
-	DayId value_day = 0;
-	Status status = day_id(date_value, &value_day);
+	TimeId value_day_time_id = 0;
+	Status status = time_id(date_value, &value_day_time_id);
 	if (!status.ok()) {
 		return status;
 	}
-	*block_id = value_day / kTimeBlockDayLength;
-	const Position day_offset = value_day % kTimeBlockDayLength;
+	const TimeId day_number = time_day(value_day_time_id);
+	const TimeId block_day_length = frequency == Frequency::Daily
+		? kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	const BlockOff day_offset = day_number % block_day_length;
+	*block_id = value_day_time_id -
+		static_cast<TimeId>(day_offset) * kTimeIdDayStep;
 	if (frequency == Frequency::Daily) {
-		*position = day_offset;
+		*block_offset = day_offset;
 		return Status::Ok();
 	}
 
@@ -307,10 +325,11 @@ Status Calendar::block_position(Frequency frequency,
 		return status;
 	}
 	std::vector<HourSlot> date_slots;
-	Position compact_position = 0;
-	for (Position offset = 0; offset <= day_offset; ++offset) {
+	BlockOff compact_offset = 0;
+	TimeId current_day_time_id = *block_id;
+	for (BlockOff offset = 0; offset <= day_offset; ++offset) {
 		std::string current_date;
-		status = date((*block_id) * kTimeBlockDayLength + offset, &current_date);
+		status = date(current_day_time_id, &current_date);
 		if (!status.ok()) {
 			return status;
 		}
@@ -325,29 +344,37 @@ Status Calendar::block_position(Frequency frequency,
 				return Status::Error(ErrorCode::NotFound,
 				                     "hour slot is outside the market slots");
 			}
-			compact_position += static_cast<Position>(found - date_slots.begin());
-			*position = compact_position;
+			compact_offset += static_cast<BlockOff>(found - date_slots.begin());
+			*block_offset = compact_offset;
 			return Status::Ok();
 		}
-		compact_position += static_cast<Position>(date_slots.size());
+		compact_offset += static_cast<BlockOff>(date_slots.size());
+		current_day_time_id += kTimeIdDayStep;
 	}
-	return Status::Error(ErrorCode::Conflict, "failed to locate hourly position");
+	return Status::Error(ErrorCode::Conflict, "failed to locate hourly offset");
 }
 
 Status Calendar::block_length(Frequency frequency,
-                              TimeBlockId block_id,
-                              Position* out) const {
+                              TimeId block_id,
+                              BlockOff* out) const {
 	if (out == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "block length output is required");
 	}
+	const TimeId block_day_length = frequency == Frequency::Daily
+		? kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	if (time_slot(block_id) != 0 || time_day(block_id) % block_day_length != 0) {
+		return Status::Error(ErrorCode::InvalidArgument,
+		                     "invalid time block identifier");
+	}
 	if (frequency == Frequency::Daily) {
-		*out = kTimeBlockDayLength;
+		*out = block_day_length;
 		return Status::Ok();
 	}
-	Position total = 0;
-	for (Position offset = 0; offset < kTimeBlockDayLength; ++offset) {
+	BlockOff total = 0;
+	TimeId current_day_time_id = block_id;
+	for (BlockOff offset = 0; offset < block_day_length; ++offset) {
 		std::string current_date;
-		Status status = date(block_id * kTimeBlockDayLength + offset, &current_date);
+		Status status = date(current_day_time_id, &current_date);
 		if (!status.ok()) {
 			return status;
 		}
@@ -356,15 +383,16 @@ Status Calendar::block_length(Frequency frequency,
 		if (!status.ok()) {
 			return status;
 		}
-		total += static_cast<Position>(date_slots.size());
+		total += static_cast<BlockOff>(date_slots.size());
+		current_day_time_id += kTimeIdDayStep;
 	}
 	*out = total;
 	return Status::Ok();
 }
 
 Status Calendar::set_closed(const std::string& value) {
-	DayId ignored_day_id = 0;
-	Status status = day_id(value, &ignored_day_id);
+	TimeId ignored_time_id = 0;
+	Status status = time_id(value, &ignored_time_id);
 	if (!status.ok()) {
 		return status;
 	}
@@ -374,8 +402,8 @@ Status Calendar::set_closed(const std::string& value) {
 
 Status Calendar::set_slots(const std::string& value,
                                    const std::vector<HourSlot>& slots) {
-	DayId ignored_day_id = 0;
-	Status status = day_id(value, &ignored_day_id);
+	TimeId ignored_time_id = 0;
+	Status status = time_id(value, &ignored_time_id);
 	if (!status.ok()) {
 		return status;
 	}
@@ -476,8 +504,8 @@ Status Calendar::load(const std::string& file_path) {
 			                     "invalid calendar record");
 		}
 		std::vector<HourSlot> slots(record.begin() + record_offset, record.end());
-		DayId ignored_day_id = 0;
-		Status status = day_id(date_value, &ignored_day_id);
+		TimeId ignored_time_id = 0;
+		Status status = time_id(date_value, &ignored_time_id);
 		if (!status.ok() || !ValidSlots(slots) ||
 		    !loaded.insert(std::make_pair(date_value, slots)).second) {
 			return Status::Error(ErrorCode::CorruptData,

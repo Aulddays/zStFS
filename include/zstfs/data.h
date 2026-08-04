@@ -1,8 +1,8 @@
 // zstfs/data.h
 //
-// Declares the stable value types shared by the public Market API and the
-// internal history pipeline. Public callers use market-local time strings;
-// Calendar converts those strings into compact internal time identifiers.
+// Declares the stable value types exposed by the public Market API. Public
+// callers use market-local time strings; the private Calendar owns all compact
+// time coordinates used by the history pipeline.
 
 #pragma once
 
@@ -14,14 +14,6 @@ namespace zstfs {
 
 typedef uint32_t SymbolId;
 typedef uint32_t ActionId;
-typedef uint16_t DayId;
-typedef uint8_t HourSlot;
-typedef uint32_t TimeId;
-typedef uint32_t TimeBlockId;
-typedef uint16_t Position;
-
-const uint16_t kTimeBlockDayLength = 64;
-const DayId kEpochDayId = 0;
 
 const SymbolId kInvalidSymbolId = 0;
 const ActionId kInvalidActionId = 0;

@@ -9,12 +9,14 @@
 #include <vector>
 
 #include "zstfs/data.h"
+#include "calendar.h"
 
 namespace zstfs {
 
 struct BlockKey {
 	SymbolId symbol_id;
-	TimeBlockId time_block_id;
+	// The block key is the daily TimeId of the block's first trading day.
+	TimeId time_block_id;
 };
 
 struct BlockBar {
@@ -33,13 +35,15 @@ struct StockTimeBlock {
 	// corresponding day bit is set; intra-day gaps remain explicit payload
 	// positions rather than expanding the day into a fixed 256-slot grid.
 	uint64_t day_presence;
+	// Entries are addressed by BlockOff, not by adding the offset to the
+	// block's TimeId. Hourly entries follow the compact market slot layout.
 	std::vector<BlockBar> positions;
 };
 
 // Microblock is one field's sequence from one StockTimeBlock.
 struct Microblock {
 	FieldId field;
-	Position first_position;
+	BlockOff first_offset;
 	std::vector<int64_t> values;
 };
 
@@ -47,8 +51,8 @@ struct Microblock {
 // Microblock. Its codec fields make the on-disk representation self-describing.
 struct MicroblockFrame {
 	FieldId field;
-	Position first_position;
-	Position sample_count;
+	BlockOff first_offset;
+	BlockOff sample_count;
 	uint8_t codec_id;
 	uint8_t predictor_id;
 	uint8_t quantizer_id;
