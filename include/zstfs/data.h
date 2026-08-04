@@ -74,10 +74,12 @@ struct Bar {
 	double volume;
 };
 
+// PrecisionProfile controls lossy numeric quantization without exposing the
+// internal frame or codec format. Price precision is relative to the value's
+// magnitude; no fixed decimal scale is imposed on high-priced instruments.
 struct PrecisionProfile {
-	double absolute_epsilon;
-	double relative_epsilon;
-	double volume_relative_error;
+	double price_relative_epsilon;
+	double volume_relative_epsilon;
 };
 
 struct SymbolAlias {

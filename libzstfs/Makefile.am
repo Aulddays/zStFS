@@ -8,7 +8,8 @@ libzstfs_a_SOURCES = \
 	actions.cpp \
 	history.cpp \
 	market.cpp \
-	markets.cpp
+	markets.cpp \
+	codec.cpp
 
 nobase_include_HEADERS = \
 	$(top_srcdir)/include/zstfs/status.h \

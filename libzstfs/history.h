@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "zstfs/data.h"
+#include "zstfs/status.h"
+#include "codec.h"
 #include "calendar.h"
 
 namespace zstfs {
@@ -47,20 +49,34 @@ struct Microblock {
 	std::vector<int64_t> values;
 };
 
-// MicroblockFrame is the independently decodable encoded part of a
-// Microblock. Its codec fields make the on-disk representation self-describing.
-struct MicroblockFrame {
-	FieldId field;
-	BlockOff first_offset;
-	BlockOff sample_count;
-	uint8_t codec_id;
-	uint8_t predictor_id;
-	uint8_t quantizer_id;
-	std::vector<uint8_t> quantizer_parameters;
-	int64_t anchor;
-	std::vector<uint8_t> payload;
-	uint32_t checksum;
-};
+// EncodeFieldFrames turns a block's positions into independent normal runs.
+// Invalid normal values are treated as missing positions and therefore split
+// the output just like an explicit non-normal state.
+Status EncodeFieldFrames(FieldId field,
+                         BlockOff first_offset,
+                         const std::vector<BlockBar>& positions,
+                         const PrecisionProfile& profile,
+                         std::vector<MicroblockFrame>* output);
+
+// State frames cover all positions, including non-normal values, and use a
+// compact run representation independent of numeric quantization.
+Status EncodeStateFrame(BlockOff first_offset,
+                        const std::vector<BlockBar>& positions,
+                        MicroblockFrame* output);
+Status DecodeStateFrame(const MicroblockFrame& frame,
+                        std::vector<BarState>* states);
+
+// A complete block uses one state frame plus independent field frames. The
+// combined decoder restores the OHLC ordering constraints after quantization.
+Status EncodeOhlcvFrames(BlockOff first_offset,
+                         const std::vector<BlockBar>& positions,
+                         const PrecisionProfile& profile,
+                         std::vector<MicroblockFrame>* output);
+Status DecodeOhlcvFrames(BlockOff first_offset,
+                         BlockOff position_count,
+                         const std::vector<MicroblockFrame>& frames,
+                         const PrecisionProfile& profile,
+                         std::vector<BlockBar>* positions);
 
 // ActiveStore holds the current writable time window for one History.
 class ActiveStore {
