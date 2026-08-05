@@ -11,6 +11,7 @@
 
 #include "../libzstfs/codec.h"
 #include "../libzstfs/history.h"
+#include "../libzstfs/serialization.h"
 
 static zstfs::PrecisionProfile Profile(double price_epsilon) {
 	zstfs::PrecisionProfile profile = {};
@@ -40,6 +41,19 @@ static size_t WireSize(const zstfs::FrameInput& input,
 }
 
 int main() {
+	std::vector<uint8_t> double_bytes;
+	const double expected_double = -123.125;
+	zstfs::PutDouble(&double_bytes, expected_double);
+	assert(double_bytes.size() == 8);
+	size_t double_offset = 0;
+	double decoded_double = 0.0;
+	assert(zstfs::GetDouble(double_bytes, &double_offset, &decoded_double));
+	assert(double_offset == double_bytes.size());
+	assert(decoded_double == expected_double);
+	double_bytes.pop_back();
+	double_offset = 0;
+	assert(!zstfs::GetDouble(double_bytes, &double_offset, &decoded_double));
+
 	std::vector<double> prices;
 	for (size_t i = 0; i < 32; ++i) {
 		prices.push_back(100.0 + static_cast<double>(i) * 0.0737);

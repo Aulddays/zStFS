@@ -117,9 +117,12 @@ public:
 
 private:
 	friend class Market;
-	explicit History(Frequency frequency);
+	History(Frequency frequency,
+	        const Calendar& calendar,
+	        const std::string& market_path);
 
 	Frequency frequency_;
+	const Calendar& calendar_;
 	std::unique_ptr<ActiveStore> active_;
 	std::unique_ptr<StagingStore> staging_;
 	std::unique_ptr<VaultStore> vault_;

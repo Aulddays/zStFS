@@ -13,8 +13,8 @@ Market::Market(const std::string& name,
 	  calendar_(new Calendar(type)),
 	  symbols_(new Symbols()),
 	  actions_(new Actions()),
-	  daily_history_(new History(Frequency::Daily)),
-	  hourly_history_(new History(Frequency::Hourly)) {
+	  daily_history_(new History(Frequency::Daily, *calendar_, path_)),
+	  hourly_history_(new History(Frequency::Hourly, *calendar_, path_)) {
 }
 
 Market::~Market() {

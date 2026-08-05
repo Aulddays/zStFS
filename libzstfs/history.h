@@ -5,7 +5,13 @@
 
 #pragma once
 
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include "zstfs/data.h"
@@ -78,22 +84,109 @@ Status DecodeOhlcvFrames(BlockOff first_offset,
                          const PrecisionProfile& profile,
                          std::vector<BlockBar>* positions);
 
-// ActiveStore holds the current writable time window for one History.
-class ActiveStore {
-public:
-	explicit ActiveStore(Frequency frequency);
-
-private:
-	Frequency frequency_;
+// ActiveStore keeps mutable positions grouped by block so sealing can hand one
+// complete StockTimeBlock to the next layer. It also owns the low-frequency
+// recovery-log scheduler: byte thresholds are checked after accepted batches,
+// while a private timer flushes dirty records that remain below the threshold.
+// The time ID vector is retained
+// only for positions that have been written: hourly block offsets are compact
+// and cannot be converted back to TimeId with arithmetic alone.
+struct ActiveStockBlock {
+	std::vector<BlockBar> positions;
+	std::vector<TimeId> time_ids;
+	std::vector<bool> present;
+	std::vector<bool> dirty;
 };
 
-// StagingStore holds sealed immutable blocks ordered for recent range reads.
+struct ActiveTimeBlock {
+	BlockOff position_count;
+	std::map<SymbolId, ActiveStockBlock> stocks;
+};
+
+struct ActiveBar {
+	SymbolId symbol_id;
+	TimeId time_id;
+	BlockBar bar;
+};
+
+// ActiveStore is accessed by the foreground History calls and by its private
+// periodic flush thread. `mutex_` protects the complete mutable Active state:
+// block contents, presence and dirty bitmaps, replay_status_, dirty_bytes_, and
+// timer shutdown state. It also covers active.data writes so a flush cannot
+// race with a put, read, seal, or another flush. The public methods acquire the
+// mutex before touching that state; `flush_locked()` is private and may only be
+// called while the mutex is already held. The timer waits on the condition
+// variable with the same lock and releases it only while sleeping. Destruction
+// first marks the timer stopped under the lock, wakes and joins the timer, then
+// performs the final flush after no other thread can access the store.
+class ActiveStore {
+public:
+	ActiveStore(Frequency frequency,
+	            const Calendar& calendar,
+	            const std::string& market_path,
+	            size_t flush_bytes = 1024 * 1024,
+	            uint64_t flush_interval_milliseconds = 60 * 1000);
+	~ActiveStore();
+
+	Status put(SymbolId symbol_id,
+	           TimeId time_id,
+	           TimeId block_id,
+	           BlockOff block_offset,
+	           const BlockBar& bar,
+	           bool replay);
+	bool contains(SymbolId symbol_id, TimeId time_id) const;
+	Status get(SymbolId symbol_id,
+	           TimeId block_id,
+	           BlockOff block_offset,
+	           BlockBar* out) const;
+	Status range(const std::vector<SymbolId>& symbol_ids,
+	             TimeId begin,
+	             TimeId end,
+	             std::vector<ActiveBar>* out) const;
+	Status flush_if_needed();
+	Status flush();
+	Status seal_before(TimeId time_id,
+	                   std::vector<StockTimeBlock>* sealed,
+	                   std::vector<ActiveBar>* sealed_bars);
+	Status replay_status() const;
+
+private:
+	Status flush_locked();
+	void run_flush_timer();
+
+	Frequency frequency_;
+	const Calendar& calendar_;
+	std::string path_;
+	std::map<TimeId, ActiveTimeBlock> blocks_;
+	Status replay_status_;
+	size_t flush_bytes_;
+	uint64_t flush_interval_milliseconds_;
+	size_t dirty_bytes_;
+	bool stop_flush_timer_;
+	mutable std::mutex mutex_;
+	std::condition_variable flush_condition_;
+	std::thread flush_timer_;
+};
+
+// StagingStore temporarily owns complete blocks after Active sealing. M5
+// replaces this handoff buffer with immutable pages and a persistent index.
 class StagingStore {
 public:
 	explicit StagingStore(Frequency frequency);
 
+	void accept(const std::vector<StockTimeBlock>& blocks,
+	            const std::vector<ActiveBar>& bars);
+	bool contains(SymbolId symbol_id, TimeId time_id) const;
+	Status get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const;
+	Status range(const std::vector<SymbolId>& symbol_ids,
+	             TimeId begin,
+	             TimeId end,
+	             std::vector<ActiveBar>* out) const;
+
 private:
 	Frequency frequency_;
+	std::vector<StockTimeBlock> blocks_;
+	std::vector<ActiveBar> bars_;
 };
 
 // VaultStore holds compacted immutable blocks ordered by symbol history.

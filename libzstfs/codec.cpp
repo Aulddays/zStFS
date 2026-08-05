@@ -24,8 +24,6 @@
 
 namespace zstfs {
 
-namespace {
-
 // =============================================================================
 // Frame Format Contract and Validation
 //
@@ -616,8 +614,6 @@ static bool ValidFrameHeader(const MicroblockFrame& frame) {
 		(frame.quantizer_id == kQuantizerPrice ||
 		 frame.quantizer_id == kQuantizerVolume);
 }
-
-}  // namespace
 
 bool ValidPrecisionProfile(const PrecisionProfile& profile) {
 	return ValidProfile(profile);
