@@ -4,6 +4,7 @@
 
 #include <assert.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
@@ -11,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "zstfs/market.h"
@@ -56,8 +58,19 @@ std::string MakeTestDirectory() {
 	return path;
 }
 
+void RemoveFrequencyDirectory(const std::string& path) {
+	std::remove((path + "/active.data").c_str());
+	std::remove((path + "/staging-index").c_str());
+	std::remove((path + "/staging-pages-0001.seg").c_str());
+	std::remove((path + "/staging-pages-0002.seg").c_str());
+	const int result = rmdir(path.c_str());
+	assert(result == 0 || errno == ENOENT);
+}
+
 void RemoveTestDirectory(const std::string& path) {
 	std::remove((path + "/active.data").c_str());
+	RemoveFrequencyDirectory(path + "/daily");
+	RemoveFrequencyDirectory(path + "/hourly");
 	assert(rmdir(path.c_str()) == 0);
 }
 
@@ -103,7 +116,7 @@ void TestDailyWriteReadAndRecovery() {
 		assert(values[4].state == zstfs::BarState::Missing);
 		ExpectOk(history.flush());
 	}
-	std::ofstream tail((path + "/active.data").c_str(),
+	std::ofstream tail((path + "/daily/active.data").c_str(),
 		std::ios::binary | std::ios::app);
 	tail.write("tail", 4);
 	tail.close();
@@ -186,6 +199,78 @@ void TestAutomaticFlush() {
 	RemoveTestDirectory(timer_path);
 }
 
+void TestStagingBatchAndIndexRecovery() {
+	const std::string path = MakeTestDirectory();
+	const std::string frequency_path = path + "/daily";
+	assert(mkdir(frequency_path.c_str(), 0755) == 0);
+	zstfs::Calendar calendar("CNA");
+	zstfs::TimeId time_id = 0;
+	zstfs::TimeId block_id = 0;
+	zstfs::BlockOff block_offset = 0;
+	ExpectOk(calendar.time_id("20260803", &time_id));
+	ExpectOk(calendar.block_offset(zstfs::Frequency::Daily, "20260803", &block_id,
+		&block_offset));
+	zstfs::BlockOff block_length = 0;
+	ExpectOk(calendar.block_length(zstfs::Frequency::Daily, block_id, &block_length));
+
+	zstfs::BlockBar missing = {zstfs::BarState::Missing, 0.0, 0.0, 0.0, 0.0, 0.0};
+	zstfs::BlockBar first = {zstfs::BarState::Normal, 9.5, 11.0, 9.0, 10.0, 100.0};
+	zstfs::BlockBar second = {zstfs::BarState::Normal, 19.5, 21.0, 19.0, 20.0, 200.0};
+	zstfs::StockTimeBlock first_block = {};
+	first_block.key.symbol_id = 31;
+	first_block.key.time_block_id = block_id;
+	first_block.positions.assign(block_length, missing);
+	first_block.positions[block_offset] = first;
+	first_block.day_presence = static_cast<uint64_t>(1) <<
+		(zstfs::time_day(time_id) - zstfs::time_day(block_id));
+	zstfs::StockTimeBlock second_block = first_block;
+	second_block.key.symbol_id = 32;
+	second_block.positions[block_offset] = second;
+	zstfs::ActiveBar first_bar = {31, time_id, first};
+	zstfs::ActiveBar second_bar = {32, time_id, second};
+
+	{
+		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, frequency_path);
+		std::vector<zstfs::StockTimeBlock> first_batch(1, first_block);
+		std::vector<zstfs::ActiveBar> first_bars(1, first_bar);
+		ExpectOk(staging.accept(first_batch, first_bars));
+		std::vector<zstfs::StockTimeBlock> mixed_batch;
+		mixed_batch.push_back(first_block);
+		mixed_batch.push_back(second_block);
+		std::vector<zstfs::ActiveBar> mixed_bars;
+		mixed_bars.push_back(first_bar);
+		mixed_bars.push_back(second_bar);
+		ExpectOk(staging.accept(mixed_batch, mixed_bars));
+		zstfs::BlockBar value = {};
+		ExpectOk(staging.get(32, time_id, &value));
+		assert(value.close > 19.9 && value.close < 20.1);
+	}
+	assert(FileSize(frequency_path + "/staging-pages-0001.seg") > 0);
+	std::ofstream corrupt_index((frequency_path + "/staging-index").c_str(),
+		std::ios::binary | std::ios::trunc);
+	corrupt_index.write("invalid", 7);
+	corrupt_index.close();
+	{
+		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, frequency_path);
+		zstfs::BlockBar value = {};
+		ExpectOk(staging.get(31, time_id, &value));
+		assert(value.close > 9.9 && value.close < 10.1);
+		ExpectOk(staging.get(32, time_id, &value));
+		assert(value.close > 19.9 && value.close < 20.1);
+	}
+	std::fstream corrupt_page((frequency_path + "/staging-pages-0001.seg").c_str(),
+		std::ios::binary | std::ios::in | std::ios::out);
+	corrupt_page.seekp(0);
+	corrupt_page.write("X", 1);
+	corrupt_page.close();
+	{
+		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, frequency_path);
+		zstfs::BlockBar value = {};
+		assert(staging.get(31, time_id, &value).code() == zstfs::ErrorCode::CorruptData);
+	}
+	RemoveTestDirectory(path);
+}
+
 void TestHourlyOrderingAndCanonicalSlots() {
 	const std::string path = MakeTestDirectory();
 	const zstfs::SymbolId symbol_id = 8;
@@ -216,6 +301,7 @@ void TestHourlyOrderingAndCanonicalSlots() {
 int main() {
 	TestDailyWriteReadAndRecovery();
 	TestAutomaticFlush();
+	TestStagingBatchAndIndexRecovery();
 	TestHourlyOrderingAndCanonicalSlots();
 	return 0;
 }

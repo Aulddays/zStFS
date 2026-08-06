@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "zstfs/data.h"
@@ -145,9 +146,12 @@ public:
 	             std::vector<ActiveBar>* out) const;
 	Status flush_if_needed();
 	Status flush();
-	Status seal_before(TimeId time_id,
-	                   std::vector<StockTimeBlock>* sealed,
-	                   std::vector<ActiveBar>* sealed_bars);
+	// collect_before snapshots complete blocks without changing their Active
+	// ownership. History removes them only after Staging has published them.
+	Status collect_before(TimeId time_id,
+	                      std::vector<StockTimeBlock>* sealed,
+	                      std::vector<ActiveBar>* sealed_bars);
+	Status remove_before(TimeId time_id);
 	Status replay_status() const;
 
 private:
@@ -168,14 +172,18 @@ private:
 	std::thread flush_timer_;
 };
 
-// StagingStore temporarily owns complete blocks after Active sealing. M5
-// replaces this handoff buffer with immutable pages and a persistent index.
+// StagingStore owns immutable complete blocks after Active sealing. Its index
+// is ordered by (time_block_id, symbol_id), while pages retain the encoded
+// frames and the presence bitmap needed to distinguish padded Missing values
+// from explicitly written Missing bars.
 class StagingStore {
 public:
-	explicit StagingStore(Frequency frequency);
+	StagingStore(Frequency frequency,
+	             const Calendar& calendar,
+	             const std::string& frequency_path);
 
-	void accept(const std::vector<StockTimeBlock>& blocks,
-	            const std::vector<ActiveBar>& bars);
+	Status accept(const std::vector<StockTimeBlock>& blocks,
+	              const std::vector<ActiveBar>& bars);
 	bool contains(SymbolId symbol_id, TimeId time_id) const;
 	Status get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const;
 	Status range(const std::vector<SymbolId>& symbol_ids,
@@ -184,9 +192,29 @@ public:
 	             std::vector<ActiveBar>* out) const;
 
 private:
+	struct Locator {
+		uint32_t segment_id;
+		uint64_t page_offset;
+		uint32_t page_length;
+		uint32_t record_index;
+	};
+
+	struct Entry {
+		StockTimeBlock block;
+		std::vector<ActiveBar> bars;
+	};
+
+	Status load();
+	Status write_index() const;
+
 	Frequency frequency_;
-	std::vector<StockTimeBlock> blocks_;
-	std::vector<ActiveBar> bars_;
+	const Calendar& calendar_;
+	std::string path_;
+	Status status_;
+	uint32_t next_page_id_;
+	uint32_t current_segment_id_;
+	std::map<std::pair<TimeId, SymbolId>, Locator> index_;
+	std::map<std::pair<TimeId, SymbolId>, Entry> entries_;
 };
 
 // VaultStore holds compacted immutable blocks ordered by symbol history.

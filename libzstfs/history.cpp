@@ -16,14 +16,18 @@
 #include "codec.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <set>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <utility>
 
 #include "serialization.h"
@@ -839,10 +843,10 @@ Status ActiveStore::flush_locked() {
 	return Status::Ok();
 }
 
-Status ActiveStore::seal_before(TimeId time_id,
-					std::vector<StockTimeBlock>* sealed,
-					std::vector<ActiveBar>* sealed_bars) {
-	// This seal operation must be synchronized with writes, reads, and timer flushes.
+Status ActiveStore::collect_before(TimeId time_id,
+					       std::vector<StockTimeBlock>* sealed,
+					       std::vector<ActiveBar>* sealed_bars) {
+	// This snapshot must be synchronized with writes, reads, and timer flushes.
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (sealed == NULL || sealed_bars == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "sealed outputs are required");
@@ -886,7 +890,62 @@ Status ActiveStore::seal_before(TimeId time_id,
 			}
 			sealed->push_back(completed);
 		}
-		blocks_.erase(block++);
+		++block;
+	}
+	return Status::Ok();
+}
+
+Status ActiveStore::remove_before(TimeId time_id) {
+	// This ownership commit must be synchronized with writes and timer flushes.
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (!replay_status_.ok()) {
+		return replay_status_;
+	}
+	const TimeId cutoff_day = time_day(time_id);
+	const TimeId block_days = frequency_ == Frequency::Daily ?
+		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	const std::string temporary_path = path_ + ".tmp";
+	std::ofstream output(temporary_path.c_str(), std::ios::binary | std::ios::trunc);
+	if (!output) {
+		return Status::Error(ErrorCode::IoError, "cannot rewrite active log");
+	}
+	for (std::map<TimeId, ActiveTimeBlock>::const_iterator block = blocks_.begin();
+		 block != blocks_.end(); ++block) {
+		if (time_day(block->first) + block_days <= cutoff_day) {
+			continue;
+		}
+		for (std::map<SymbolId, ActiveStockBlock>::const_iterator stock =
+			 block->second.stocks.begin(); stock != block->second.stocks.end(); ++stock) {
+			for (size_t offset = 0; offset < stock->second.present.size(); ++offset) {
+				if (!stock->second.present[offset]) {
+					continue;
+				}
+				ActiveRecord record = {frequency_, stock->first, stock->second.time_ids[offset],
+					stock->second.positions[offset]};
+				std::vector<uint8_t> bytes;
+				if (!SerializeActiveRecord(record, &bytes)) {
+					return Status::Error(ErrorCode::CorruptData, "invalid active bar during rewrite");
+				}
+				output.write(reinterpret_cast<const char*>(&bytes[0]), bytes.size());
+				if (!output) {
+					return Status::Error(ErrorCode::IoError, "cannot rewrite active log");
+				}
+			}
+		}
+	}
+	output.flush();
+	output.close();
+	if (!output || std::rename(temporary_path.c_str(), path_.c_str()) != 0) {
+		std::remove(temporary_path.c_str());
+		return Status::Error(ErrorCode::IoError, "cannot publish rewritten active log");
+	}
+	for (std::map<TimeId, ActiveTimeBlock>::iterator block = blocks_.begin();
+		 block != blocks_.end();) {
+		if (time_day(block->first) + block_days <= cutoff_day) {
+			blocks_.erase(block++);
+		} else {
+			++block;
+		}
 	}
 	return Status::Ok();
 }
@@ -897,20 +956,651 @@ Status ActiveStore::replay_status() const {
 	return replay_status_;
 }
 
-StagingStore::StagingStore(Frequency frequency)
-	: frequency_(frequency) {
+// =============================================================================
+// Staging Pages and Index
+//
+// Staging pages are variable-length sequential file records. The 64 KiB target
+// controls aggregation only: a page closes after appending the first complete
+// block that reaches the target, so no padding or special oversized-page format
+// is needed. A separate index maps immutable block keys to page locators.
+// =============================================================================
+
+static const size_t kStagingPageTargetBytes = 64 * 1024;
+static const uint64_t kStagingSegmentTargetBytes = 64ULL * 1024 * 1024;
+static const uint8_t kStagingVersion = 1;
+static const size_t kStagingPageHeaderBytes = 28;
+
+struct PendingStagingRecord {
+	StockTimeBlock block;
+	std::vector<uint8_t> present;
+	std::vector<std::vector<uint8_t> > frame_bytes;
+};
+
+struct ParsedStagingRecord {
+	StockTimeBlock block;
+	std::vector<ActiveBar> bars;
+};
+
+static bool PendingStagingOrder(const PendingStagingRecord& left,
+					const PendingStagingRecord& right) {
+	return left.block.key.time_block_id != right.block.key.time_block_id ?
+		left.block.key.time_block_id < right.block.key.time_block_id :
+		left.block.key.symbol_id < right.block.key.symbol_id;
 }
 
-void StagingStore::accept(const std::vector<StockTimeBlock>& blocks,
-				  const std::vector<ActiveBar>& bars) {
-	blocks_.insert(blocks_.end(), blocks.begin(), blocks.end());
-	bars_.insert(bars_.end(), bars.begin(), bars.end());
+static bool SameBlockBar(const BlockBar& left, const BlockBar& right) {
+	return left.state == right.state && left.open == right.open && left.high == right.high &&
+		left.low == right.low && left.close == right.close && left.volume == right.volume;
+}
+
+static PrecisionProfile StagingPrecisionProfile() {
+	PrecisionProfile profile = {};
+	profile.price_relative_epsilon = 5e-4;
+	profile.volume_relative_epsilon = 0.04;
+	return profile;
+}
+
+static std::string StagingSegmentPath(const std::string& path, uint32_t segment_id) {
+	char name[64];
+	std::snprintf(name, sizeof(name), "staging-pages-%04u.seg", segment_id);
+	return path + "/" + name;
+}
+
+static bool ReadFile(const std::string& path, std::vector<uint8_t>* bytes) {
+	std::ifstream input(path.c_str(), std::ios::binary);
+	if (!input) {
+		return false;
+	}
+	bytes->assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+	return input.good() || input.eof();
+}
+
+static Status StagingTimeIds(const Calendar& calendar,
+				     Frequency frequency,
+				     TimeId block_id,
+				     BlockOff position_count,
+				     std::vector<TimeId>* time_ids) {
+	if (time_ids == NULL) {
+		return Status::Error(ErrorCode::InvalidArgument, "staging time-id output is required");
+	}
+	time_ids->clear();
+	time_ids->reserve(position_count);
+	const TimeId first_day = time_day(block_id);
+	if (frequency == Frequency::Daily) {
+		for (BlockOff offset = 0; offset < position_count; ++offset) {
+			time_ids->push_back(daily_bar_id(first_day + offset));
+		}
+		return Status::Ok();
+	}
+	for (TimeId day_offset = 0; day_offset < kHourlyTimeBlockDayLength; ++day_offset) {
+		const TimeId day_id = daily_bar_id(first_day + day_offset);
+		std::string date;
+		Status status = calendar.date(day_id, &date);
+		if (!status.ok()) {
+			return status;
+		}
+		std::vector<HourSlot> slots;
+		status = calendar.slots(date, &slots);
+		if (!status.ok()) {
+			return status;
+		}
+		for (size_t slot = 0; slot < slots.size(); ++slot) {
+			if (time_ids->size() == position_count) {
+				return Status::Error(ErrorCode::CorruptData, "hourly staging block is too short");
+			}
+			time_ids->push_back(day_id | slots[slot]);
+		}
+	}
+	if (time_ids->size() != position_count) {
+		return Status::Error(ErrorCode::CorruptData, "hourly staging block length changed");
+	}
+	return Status::Ok();
+}
+
+static Status MakePendingStagingRecord(const Calendar& calendar,
+					       Frequency frequency,
+					       const StockTimeBlock& block,
+					       const std::vector<ActiveBar>& bars,
+					       PendingStagingRecord* output) {
+	if (output == NULL || block.key.symbol_id == kInvalidSymbolId ||
+		block.positions.empty() || block.positions.size() > std::numeric_limits<BlockOff>::max()) {
+		return Status::Error(ErrorCode::InvalidArgument, "invalid staging block");
+	}
+	BlockOff expected_position_count = 0;
+	Status status = calendar.block_length(frequency, block.key.time_block_id,
+		&expected_position_count);
+	if (!status.ok() || block.positions.size() != expected_position_count) {
+		return !status.ok() ? status : Status::Error(ErrorCode::InvalidArgument,
+			"staging block does not cover its complete calendar range");
+	}
+	std::vector<TimeId> time_ids;
+	status = StagingTimeIds(calendar, frequency, block.key.time_block_id,
+		expected_position_count, &time_ids);
+	if (!status.ok()) {
+		return status;
+	}
+	PendingStagingRecord pending = {};
+	pending.block = block;
+	pending.present.assign((block.positions.size() + 7) / 8, 0);
+	for (size_t i = 0; i < bars.size(); ++i) {
+		if (bars[i].symbol_id != block.key.symbol_id) {
+			continue;
+		}
+		std::vector<TimeId>::const_iterator position = std::lower_bound(time_ids.begin(),
+			time_ids.end(), bars[i].time_id);
+		if (position == time_ids.end() || *position != bars[i].time_id) {
+			continue;
+		}
+		const size_t offset = static_cast<size_t>(position - time_ids.begin());
+		const uint8_t bit = static_cast<uint8_t>(1U << (offset % 8));
+		if ((pending.present[offset / 8] & bit) != 0 ||
+			!SameBlockBar(block.positions[offset], bars[i].bar)) {
+			return Status::Error(ErrorCode::InvalidArgument, "inconsistent staging bar record");
+		}
+		pending.present[offset / 8] |= bit;
+	}
+	for (size_t offset = 0; offset < block.positions.size(); ++offset) {
+		if (block.positions[offset].state != BarState::Missing &&
+			(pending.present[offset / 8] & static_cast<uint8_t>(1U << (offset % 8))) == 0) {
+			return Status::Error(ErrorCode::InvalidArgument, "staging block has an unrecorded position");
+		}
+	}
+	std::vector<MicroblockFrame> frames;
+	status = EncodeOhlcvFrames(0, block.positions, StagingPrecisionProfile(), &frames);
+	if (!status.ok()) {
+		return status;
+	}
+	pending.frame_bytes.reserve(frames.size());
+	for (size_t i = 0; i < frames.size(); ++i) {
+		std::vector<uint8_t> frame_bytes;
+		status = SerializeFrame(frames[i], &frame_bytes);
+		if (!status.ok()) {
+			return status;
+		}
+		pending.frame_bytes.push_back(frame_bytes);
+	}
+	*output = pending;
+	return Status::Ok();
+}
+
+static Status SerializeStagingPage(uint32_t page_id,
+					  Frequency frequency,
+					  const std::vector<PendingStagingRecord>& records,
+					  std::vector<uint8_t>* bytes) {
+	if (bytes == NULL || records.empty() || records.size() > std::numeric_limits<uint32_t>::max()) {
+		return Status::Error(ErrorCode::InvalidArgument, "invalid staging page");
+	}
+	std::vector<uint8_t> directory;
+	std::vector<uint8_t> payload;
+	for (size_t i = 0; i < records.size(); ++i) {
+		const PendingStagingRecord& record = records[i];
+		if (record.present.size() != (record.block.positions.size() + 7) / 8 ||
+			record.frame_bytes.size() > std::numeric_limits<uint16_t>::max()) {
+			return Status::Error(ErrorCode::InvalidArgument, "invalid staging page record");
+		}
+		PutU32(&directory, record.block.key.symbol_id);
+		PutU32(&directory, record.block.key.time_block_id);
+		PutU16(&directory, static_cast<uint16_t>(record.block.positions.size()));
+		PutU64(&directory, record.block.day_presence);
+		PutU16(&directory, static_cast<uint16_t>(record.present.size()));
+		directory.insert(directory.end(), record.present.begin(), record.present.end());
+		PutU16(&directory, static_cast<uint16_t>(record.frame_bytes.size()));
+		for (size_t frame = 0; frame < record.frame_bytes.size(); ++frame) {
+			if (payload.size() > std::numeric_limits<uint32_t>::max() ||
+				record.frame_bytes[frame].size() > std::numeric_limits<uint32_t>::max()) {
+				return Status::Error(ErrorCode::InvalidArgument, "staging payload is too large");
+			}
+			PutU32(&directory, static_cast<uint32_t>(payload.size()));
+			PutU32(&directory, static_cast<uint32_t>(record.frame_bytes[frame].size()));
+			payload.insert(payload.end(), record.frame_bytes[frame].begin(),
+				record.frame_bytes[frame].end());
+		}
+	}
+	if (directory.size() > std::numeric_limits<uint32_t>::max() ||
+		payload.size() > std::numeric_limits<uint32_t>::max()) {
+		return Status::Error(ErrorCode::InvalidArgument, "staging page is too large");
+	}
+	bytes->clear();
+	bytes->reserve(kStagingPageHeaderBytes + directory.size() + payload.size());
+	PutU8(bytes, 'Z');
+	PutU8(bytes, 'S');
+	PutU8(bytes, 'P');
+	PutU8(bytes, '5');
+	PutU8(bytes, kStagingVersion);
+	PutU8(bytes, static_cast<uint8_t>(frequency));
+	PutU16(bytes, 0);
+	PutU64(bytes, page_id);
+	PutU32(bytes, static_cast<uint32_t>(records.size()));
+	PutU32(bytes, static_cast<uint32_t>(directory.size()));
+	PutU32(bytes, static_cast<uint32_t>(payload.size()));
+	bytes->insert(bytes->end(), directory.begin(), directory.end());
+	bytes->insert(bytes->end(), payload.begin(), payload.end());
+	return Status::Ok();
+}
+
+static Status ParseStagingPage(const Calendar& calendar,
+				       Frequency frequency,
+				       const std::vector<uint8_t>& bytes,
+				       std::vector<ParsedStagingRecord>* records,
+				       uint32_t* page_id) {
+	if (records == NULL || page_id == NULL || bytes.size() < kStagingPageHeaderBytes) {
+		return Status::Error(ErrorCode::CorruptData, "truncated staging page");
+	}
+	size_t cursor = 0;
+	uint8_t magic[4] = {};
+	uint8_t version = 0;
+	uint8_t stored_frequency = 0;
+	uint16_t reserved = 0;
+	uint64_t stored_page_id = 0;
+	uint32_t count = 0;
+	uint32_t directory_size = 0;
+	uint32_t payload_size = 0;
+	if (!GetU8(bytes, &cursor, &magic[0]) || !GetU8(bytes, &cursor, &magic[1]) ||
+		!GetU8(bytes, &cursor, &magic[2]) || !GetU8(bytes, &cursor, &magic[3]) ||
+		magic[0] != 'Z' || magic[1] != 'S' || magic[2] != 'P' || magic[3] != '5' ||
+		!GetU8(bytes, &cursor, &version) || !GetU8(bytes, &cursor, &stored_frequency) ||
+		!GetU16(bytes, &cursor, &reserved) || !GetU64(bytes, &cursor, &stored_page_id) ||
+		!GetU32(bytes, &cursor, &count) ||
+		!GetU32(bytes, &cursor, &directory_size) || !GetU32(bytes, &cursor, &payload_size) ||
+		version != kStagingVersion || stored_frequency != static_cast<uint8_t>(frequency) ||
+		reserved != 0 || stored_page_id == 0 ||
+		stored_page_id > std::numeric_limits<uint32_t>::max() || count == 0 ||
+		kStagingPageHeaderBytes + static_cast<size_t>(directory_size) + payload_size != bytes.size()) {
+		return Status::Error(ErrorCode::CorruptData, "invalid staging page header");
+	}
+	*page_id = static_cast<uint32_t>(stored_page_id);
+	const size_t directory_end = cursor + directory_size;
+	const size_t payload_start = directory_end;
+	records->clear();
+	records->reserve(count);
+	for (uint32_t record_index = 0; record_index < count; ++record_index) {
+		uint32_t symbol_id = 0;
+		uint32_t block_id = 0;
+		uint16_t position_count = 0;
+		uint64_t day_presence = 0;
+		uint16_t present_size = 0;
+		uint16_t frame_count = 0;
+		if (!GetU32(bytes, &cursor, &symbol_id) || !GetU32(bytes, &cursor, &block_id) ||
+			!GetU16(bytes, &cursor, &position_count) || !GetU64(bytes, &cursor, &day_presence) ||
+			!GetU16(bytes, &cursor, &present_size) || symbol_id == kInvalidSymbolId ||
+			position_count == 0 || present_size != (position_count + 7) / 8 ||
+			cursor + present_size > directory_end) {
+			return Status::Error(ErrorCode::CorruptData, "invalid staging record directory");
+		}
+		std::vector<uint8_t> present(bytes.begin() + cursor, bytes.begin() + cursor + present_size);
+		cursor += present_size;
+		if (!GetU16(bytes, &cursor, &frame_count) || frame_count == 0) {
+			return Status::Error(ErrorCode::CorruptData, "staging record has no frames");
+		}
+		std::vector<MicroblockFrame> frames;
+		frames.reserve(frame_count);
+		for (uint16_t frame_index = 0; frame_index < frame_count; ++frame_index) {
+			uint32_t offset = 0;
+			uint32_t length = 0;
+			if (!GetU32(bytes, &cursor, &offset) || !GetU32(bytes, &cursor, &length) ||
+				offset > payload_size || length > payload_size - offset) {
+				return Status::Error(ErrorCode::CorruptData, "invalid staging frame locator");
+			}
+			std::vector<uint8_t> frame_bytes(bytes.begin() + payload_start + offset,
+				bytes.begin() + payload_start + offset + length);
+			MicroblockFrame frame;
+			Status status = ParseFrame(frame_bytes, &frame);
+			if (!status.ok()) {
+				return status;
+			}
+			frames.push_back(frame);
+		}
+		std::vector<BlockBar> positions;
+		Status status = DecodeOhlcvFrames(0, position_count, frames, StagingPrecisionProfile(),
+			&positions);
+		if (!status.ok()) {
+			return status;
+		}
+		std::vector<TimeId> time_ids;
+		status = StagingTimeIds(calendar, frequency, block_id, position_count, &time_ids);
+		if (!status.ok()) {
+			return status;
+		}
+		ParsedStagingRecord parsed = {};
+		parsed.block.key.symbol_id = symbol_id;
+		parsed.block.key.time_block_id = block_id;
+		parsed.block.day_presence = day_presence;
+		parsed.block.positions = positions;
+		for (size_t offset = 0; offset < positions.size(); ++offset) {
+			if ((present[offset / 8] & static_cast<uint8_t>(1U << (offset % 8))) != 0) {
+				ActiveBar bar = {symbol_id, time_ids[offset], positions[offset]};
+				parsed.bars.push_back(bar);
+			}
+		}
+		records->push_back(parsed);
+	}
+	if (cursor != directory_end) {
+		return Status::Error(ErrorCode::CorruptData, "trailing staging directory bytes");
+	}
+	return Status::Ok();
+}
+
+StagingStore::StagingStore(Frequency frequency,
+				   const Calendar& calendar,
+				   const std::string& frequency_path)
+	: frequency_(frequency),
+	  calendar_(calendar),
+	  path_(frequency_path),
+	  status_(Status::Ok()),
+	  next_page_id_(1),
+	  current_segment_id_(1) {
+	status_ = load();
+}
+
+Status StagingStore::load() {
+	entries_.clear();
+	index_.clear();
+	next_page_id_ = 1;
+	current_segment_id_ = 1;
+
+	// A valid index directly locates pages for the M5 in-memory query state.
+	// Pages remain the source of truth when an index must be rebuilt.
+	std::map<std::pair<TimeId, SymbolId>, Locator> persisted_index;
+	bool persisted_index_valid = false;
+	std::vector<uint8_t> index_bytes;
+	if (ReadFile(path_ + "/staging-index", &index_bytes)) {
+		size_t cursor = 0;
+		uint8_t magic[4] = {};
+		uint8_t version = 0;
+		uint8_t stored_frequency = 0;
+		uint16_t reserved = 0;
+		uint32_t count = 0;
+		if (GetU8(index_bytes, &cursor, &magic[0]) && GetU8(index_bytes, &cursor, &magic[1]) &&
+			GetU8(index_bytes, &cursor, &magic[2]) && GetU8(index_bytes, &cursor, &magic[3]) &&
+			magic[0] == 'Z' && magic[1] == 'S' && magic[2] == 'I' && magic[3] == '5' &&
+			GetU8(index_bytes, &cursor, &version) && GetU8(index_bytes, &cursor, &stored_frequency) &&
+			GetU16(index_bytes, &cursor, &reserved) && GetU32(index_bytes, &cursor, &count) &&
+			version == kStagingVersion && stored_frequency == static_cast<uint8_t>(frequency_) &&
+			reserved == 0 && index_bytes.size() == 12 + static_cast<size_t>(count) * 28) {
+			persisted_index_valid = true;
+			for (uint32_t i = 0; i < count; ++i) {
+				uint32_t block_id = 0;
+				uint32_t symbol_id = 0;
+				Locator locator = {};
+				if (!GetU32(index_bytes, &cursor, &block_id) ||
+					!GetU32(index_bytes, &cursor, &symbol_id) ||
+					!GetU32(index_bytes, &cursor, &locator.segment_id) ||
+					!GetU64(index_bytes, &cursor, &locator.page_offset) ||
+					!GetU32(index_bytes, &cursor, &locator.page_length) ||
+					!GetU32(index_bytes, &cursor, &locator.record_index) ||
+					symbol_id == kInvalidSymbolId ||
+					!persisted_index.insert(std::make_pair(
+						std::make_pair(block_id, symbol_id), locator)).second) {
+					persisted_index_valid = false;
+					break;
+				}
+			}
+		}
+	}
+	if (persisted_index_valid) {
+		std::map<uint32_t, std::vector<uint8_t> > segment_bytes;
+		for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator locator =
+			 persisted_index.begin(); locator != persisted_index.end(); ++locator) {
+			std::map<uint32_t, std::vector<uint8_t> >::iterator segment =
+				segment_bytes.find(locator->second.segment_id);
+			if (segment == segment_bytes.end()) {
+				std::vector<uint8_t> bytes;
+				if (!ReadFile(StagingSegmentPath(path_, locator->second.segment_id), &bytes)) {
+					persisted_index_valid = false;
+					break;
+				}
+				segment = segment_bytes.insert(std::make_pair(locator->second.segment_id, bytes)).first;
+			}
+			if (locator->second.page_offset > segment->second.size() ||
+				locator->second.page_length > segment->second.size() - locator->second.page_offset) {
+				persisted_index_valid = false;
+				break;
+			}
+			const size_t page_offset = static_cast<size_t>(locator->second.page_offset);
+			std::vector<uint8_t> page(segment->second.begin() + page_offset,
+				segment->second.begin() + page_offset + locator->second.page_length);
+			std::vector<ParsedStagingRecord> parsed;
+			uint32_t page_id = 0;
+			Status status = ParseStagingPage(calendar_, frequency_, page, &parsed, &page_id);
+			if (!status.ok() || locator->second.record_index >= parsed.size() ||
+				parsed[locator->second.record_index].block.key.time_block_id != locator->first.first ||
+				parsed[locator->second.record_index].block.key.symbol_id != locator->first.second) {
+				persisted_index_valid = false;
+				break;
+			}
+			next_page_id_ = std::max(next_page_id_, page_id + 1);
+			current_segment_id_ = std::max(current_segment_id_, locator->second.segment_id);
+			Entry entry = {parsed[locator->second.record_index].block,
+				parsed[locator->second.record_index].bars};
+			entries_[locator->first] = entry;
+		}
+		if (persisted_index_valid) {
+			index_ = persisted_index;
+			return Status::Ok();
+		}
+		entries_.clear();
+		index_.clear();
+		next_page_id_ = 1;
+		current_segment_id_ = 1;
+	}
+	for (uint32_t segment_id = 1;; ++segment_id) {
+		const std::string segment_path = StagingSegmentPath(path_, segment_id);
+		struct stat information;
+		if (stat(segment_path.c_str(), &information) != 0) {
+			if (errno == ENOENT) {
+				break;
+			}
+			return Status::Error(ErrorCode::IoError, "cannot inspect staging segment");
+		}
+		std::vector<uint8_t> segment;
+		if (!ReadFile(segment_path, &segment)) {
+			return Status::Error(ErrorCode::IoError, "cannot read staging segment");
+		}
+		size_t offset = 0;
+		while (offset < segment.size()) {
+			if (segment.size() - offset < kStagingPageHeaderBytes) {
+				if (truncate(segment_path.c_str(), static_cast<off_t>(offset)) != 0) {
+					return Status::Error(ErrorCode::IoError, "cannot repair staging segment tail");
+				}
+				break;
+			}
+			size_t header_cursor = offset + 20;
+			uint32_t directory_size = 0;
+			uint32_t payload_size = 0;
+			if (!GetU32(segment, &header_cursor, &directory_size) ||
+				!GetU32(segment, &header_cursor, &payload_size) ||
+				directory_size > segment.size() || payload_size > segment.size() - directory_size ||
+				kStagingPageHeaderBytes + static_cast<size_t>(directory_size) + payload_size >
+					segment.size() - offset) {
+				if (truncate(segment_path.c_str(), static_cast<off_t>(offset)) != 0) {
+					return Status::Error(ErrorCode::IoError, "cannot repair staging segment tail");
+				}
+				break;
+			}
+			const size_t page_length = kStagingPageHeaderBytes + directory_size + payload_size;
+			std::vector<uint8_t> page(segment.begin() + offset, segment.begin() + offset + page_length);
+			std::vector<ParsedStagingRecord> parsed;
+			uint32_t page_id = 0;
+			Status status = ParseStagingPage(calendar_, frequency_, page, &parsed, &page_id);
+			if (!status.ok()) {
+				return status;
+			}
+			for (size_t record = 0; record < parsed.size(); ++record) {
+				const std::pair<TimeId, SymbolId> key(parsed[record].block.key.time_block_id,
+					parsed[record].block.key.symbol_id);
+				if (index_.find(key) != index_.end()) {
+					return Status::Error(ErrorCode::CorruptData, "duplicate staged block");
+				}
+				Locator locator = {segment_id, static_cast<uint64_t>(offset),
+					static_cast<uint32_t>(page_length), static_cast<uint32_t>(record)};
+				index_[key] = locator;
+				Entry entry = {parsed[record].block, parsed[record].bars};
+				entries_[key] = entry;
+			}
+			next_page_id_ = std::max(next_page_id_, page_id + 1);
+			offset += page_length;
+		}
+		current_segment_id_ = segment_id;
+	}
+	if (persisted_index_valid && persisted_index.size() == index_.size()) {
+		std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator expected =
+			persisted_index.begin();
+		std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator actual = index_.begin();
+		for (; expected != persisted_index.end(); ++expected, ++actual) {
+			if (expected->first != actual->first ||
+				expected->second.segment_id != actual->second.segment_id ||
+				expected->second.page_offset != actual->second.page_offset ||
+				expected->second.page_length != actual->second.page_length ||
+				expected->second.record_index != actual->second.record_index) {
+				persisted_index_valid = false;
+				break;
+			}
+		}
+	} else {
+		persisted_index_valid = false;
+	}
+	return persisted_index_valid ? Status::Ok() : write_index();
+}
+
+Status StagingStore::write_index() const {
+	std::vector<uint8_t> bytes;
+	PutU8(&bytes, 'Z');
+	PutU8(&bytes, 'S');
+	PutU8(&bytes, 'I');
+	PutU8(&bytes, '5');
+	PutU8(&bytes, kStagingVersion);
+	PutU8(&bytes, static_cast<uint8_t>(frequency_));
+	PutU16(&bytes, 0);
+	PutU32(&bytes, static_cast<uint32_t>(index_.size()));
+	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator entry = index_.begin();
+		 entry != index_.end(); ++entry) {
+		PutU32(&bytes, entry->first.first);
+		PutU32(&bytes, entry->first.second);
+		PutU32(&bytes, entry->second.segment_id);
+		PutU64(&bytes, entry->second.page_offset);
+		PutU32(&bytes, entry->second.page_length);
+		PutU32(&bytes, entry->second.record_index);
+	}
+	const std::string temporary_path = path_ + "/staging-index.tmp";
+	const std::string index_path = path_ + "/staging-index";
+	std::ofstream output(temporary_path.c_str(), std::ios::binary | std::ios::trunc);
+	if (!output) {
+		return Status::Error(ErrorCode::IoError, "cannot write staging index");
+	}
+	output.write(reinterpret_cast<const char*>(&bytes[0]), bytes.size());
+	output.flush();
+	output.close();
+	if (!output || std::rename(temporary_path.c_str(), index_path.c_str()) != 0) {
+		std::remove(temporary_path.c_str());
+		return Status::Error(ErrorCode::IoError, "cannot publish staging index");
+	}
+	return Status::Ok();
+}
+
+Status StagingStore::accept(const std::vector<StockTimeBlock>& blocks,
+				    const std::vector<ActiveBar>& bars) {
+	if (!status_.ok()) {
+		return status_;
+	}
+	std::set<std::pair<TimeId, SymbolId> > batch_keys;
+	std::vector<PendingStagingRecord> pending;
+	for (size_t i = 0; i < blocks.size(); ++i) {
+		const std::pair<TimeId, SymbolId> key(blocks[i].key.time_block_id,
+			blocks[i].key.symbol_id);
+		if (!batch_keys.insert(key).second) {
+			return Status::Error(ErrorCode::Conflict, "duplicate block in staging batch");
+		}
+		if (index_.find(key) != index_.end()) {
+			continue;
+		}
+		PendingStagingRecord record;
+		Status status = MakePendingStagingRecord(calendar_, frequency_, blocks[i], bars, &record);
+		if (!status.ok()) {
+			return status;
+		}
+		pending.push_back(record);
+	}
+	if (pending.empty()) {
+		return Status::Ok();
+	}
+	std::sort(pending.begin(), pending.end(), PendingStagingOrder);
+	std::vector<std::vector<PendingStagingRecord> > pages;
+	std::vector<PendingStagingRecord> page_records;
+	for (size_t i = 0; i < pending.size(); ++i) {
+		page_records.push_back(pending[i]);
+		std::vector<uint8_t> page_bytes;
+		Status status = SerializeStagingPage(next_page_id_, frequency_, page_records, &page_bytes);
+		if (!status.ok()) {
+			return status;
+		}
+		if (page_bytes.size() >= kStagingPageTargetBytes) {
+			pages.push_back(page_records);
+			page_records.clear();
+		}
+	}
+	if (!page_records.empty()) {
+		pages.push_back(page_records);
+	}
+	for (size_t page = 0; page < pages.size(); ++page) {
+		const std::string segment_path = StagingSegmentPath(path_, current_segment_id_);
+		struct stat information;
+		uint64_t offset = 0;
+		if (stat(segment_path.c_str(), &information) == 0) {
+			offset = static_cast<uint64_t>(information.st_size);
+			if (offset >= kStagingSegmentTargetBytes) {
+				++current_segment_id_;
+				offset = 0;
+			}
+		} else if (errno != ENOENT) {
+			return Status::Error(ErrorCode::IoError, "cannot inspect staging segment");
+		}
+		const std::string output_path = StagingSegmentPath(path_, current_segment_id_);
+		std::vector<uint8_t> page_bytes;
+		Status status = SerializeStagingPage(next_page_id_, frequency_, pages[page], &page_bytes);
+		if (!status.ok()) {
+			return status;
+		}
+		std::ofstream output(output_path.c_str(), std::ios::binary | std::ios::app);
+		if (!output) {
+			return Status::Error(ErrorCode::IoError, "cannot append staging page");
+		}
+		output.write(reinterpret_cast<const char*>(&page_bytes[0]), page_bytes.size());
+		output.flush();
+		if (!output) {
+			return Status::Error(ErrorCode::IoError, "cannot write staging page");
+		}
+		std::vector<ParsedStagingRecord> parsed;
+		uint32_t parsed_page_id = 0;
+		status = ParseStagingPage(calendar_, frequency_, page_bytes, &parsed, &parsed_page_id);
+		if (!status.ok() || parsed.size() != pages[page].size()) {
+			return !status.ok() ? status : Status::Error(ErrorCode::CorruptData,
+				"staging page record count changed");
+		}
+		for (size_t record = 0; record < pages[page].size(); ++record) {
+			const std::pair<TimeId, SymbolId> key(pages[page][record].block.key.time_block_id,
+				pages[page][record].block.key.symbol_id);
+			Locator locator = {current_segment_id_, offset, static_cast<uint32_t>(page_bytes.size()),
+				static_cast<uint32_t>(record)};
+			index_[key] = locator;
+			Entry entry = {parsed[record].block, parsed[record].bars};
+			entries_[key] = entry;
+		}
+		++next_page_id_;
+	}
+	return write_index();
 }
 
 bool StagingStore::contains(SymbolId symbol_id, TimeId time_id) const {
-	for (size_t i = 0; i < bars_.size(); ++i) {
-		if (bars_[i].symbol_id == symbol_id && bars_[i].time_id == time_id) {
-			return true;
+	if (!status_.ok()) {
+		return false;
+	}
+	for (std::map<std::pair<TimeId, SymbolId>, Entry>::const_iterator entry = entries_.begin();
+		 entry != entries_.end(); ++entry) {
+		for (size_t i = 0; i < entry->second.bars.size(); ++i) {
+			if (entry->second.bars[i].symbol_id == symbol_id &&
+				entry->second.bars[i].time_id == time_id) {
+				return true;
+			}
 		}
 	}
 	return false;
@@ -920,10 +1610,17 @@ Status StagingStore::get(SymbolId symbol_id, TimeId time_id, BlockBar* out) cons
 	if (out == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "staging read output is required");
 	}
-	for (size_t i = 0; i < bars_.size(); ++i) {
-		if (bars_[i].symbol_id == symbol_id && bars_[i].time_id == time_id) {
-			*out = bars_[i].bar;
-			return Status::Ok();
+	if (!status_.ok()) {
+		return status_;
+	}
+	for (std::map<std::pair<TimeId, SymbolId>, Entry>::const_iterator entry = entries_.begin();
+		 entry != entries_.end(); ++entry) {
+		for (size_t i = 0; i < entry->second.bars.size(); ++i) {
+			if (entry->second.bars[i].symbol_id == symbol_id &&
+				entry->second.bars[i].time_id == time_id) {
+				*out = entry->second.bars[i].bar;
+				return Status::Ok();
+			}
 		}
 	}
 	return Status::Error(ErrorCode::NotFound, "staged bar was not found");
@@ -933,15 +1630,22 @@ Status StagingStore::range(const std::vector<SymbolId>& symbol_ids,
 				   TimeId begin,
 				   TimeId end,
 				   std::vector<ActiveBar>* out) const {
-	if (out == NULL) {
-		return Status::Error(ErrorCode::InvalidArgument, "staging range output is required");
+	if (out == NULL || begin > end) {
+		return Status::Error(ErrorCode::InvalidArgument, "invalid staging range");
+	}
+	if (!status_.ok()) {
+		return status_;
 	}
 	std::set<SymbolId> requested(symbol_ids.begin(), symbol_ids.end());
 	out->clear();
-	for (size_t i = 0; i < bars_.size(); ++i) {
-		if (requested.find(bars_[i].symbol_id) != requested.end() &&
-			bars_[i].time_id >= begin && bars_[i].time_id <= end) {
-			out->push_back(bars_[i]);
+	for (std::map<std::pair<TimeId, SymbolId>, Entry>::const_iterator entry = entries_.begin();
+		 entry != entries_.end(); ++entry) {
+		for (size_t i = 0; i < entry->second.bars.size(); ++i) {
+			const ActiveBar& bar = entry->second.bars[i];
+			if (requested.find(bar.symbol_id) != requested.end() &&
+				bar.time_id >= begin && bar.time_id <= end) {
+				out->push_back(bar);
+			}
 		}
 	}
 	std::sort(out->begin(), out->end(), ActiveBarOrder);
@@ -952,13 +1656,21 @@ VaultStore::VaultStore(Frequency frequency)
 	: frequency_(frequency) {
 }
 
+static std::string FrequencyPath(const std::string& market_path, Frequency frequency) {
+	const std::string path = market_path + (frequency == Frequency::Daily ? "/daily" : "/hourly");
+	if (mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
+		return std::string();
+	}
+	return path;
+}
+
 History::History(Frequency frequency,
 			 const Calendar& calendar,
 			 const std::string& market_path)
 	: frequency_(frequency),
 	  calendar_(calendar),
-	  active_(new ActiveStore(frequency, calendar, market_path)),
-	  staging_(new StagingStore(frequency)),
+	  active_(new ActiveStore(frequency, calendar, FrequencyPath(market_path, frequency))),
+	  staging_(new StagingStore(frequency, calendar, FrequencyPath(market_path, frequency))),
 	  vault_(new VaultStore(frequency)) {
 }
 
@@ -1152,12 +1864,15 @@ Status History::seal_before(const std::string& local_time) {
 	}
 	std::vector<StockTimeBlock> sealed;
 	std::vector<ActiveBar> sealed_bars;
-	status = active_->seal_before(time_id, &sealed, &sealed_bars);
+	status = active_->collect_before(time_id, &sealed, &sealed_bars);
 	if (!status.ok()) {
 		return status;
 	}
-	staging_->accept(sealed, sealed_bars);
-	return Status::Ok();
+	status = staging_->accept(sealed, sealed_bars);
+	if (!status.ok()) {
+		return status;
+	}
+	return active_->remove_before(time_id);
 }
 
 }  // namespace zstfs
