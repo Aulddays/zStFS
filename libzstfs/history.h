@@ -217,13 +217,48 @@ private:
 	std::map<std::pair<TimeId, SymbolId>, Entry> entries_;
 };
 
-// VaultStore holds compacted immutable blocks ordered by symbol history.
+// VaultStore holds compacted immutable blocks ordered by symbol history. Its
+// ingest entry point is intentionally internal: a later compactor can pass its
+// sorted completed blocks directly without coupling the Vault layout to the
+// mutable Active or time-oriented Staging stores.
 class VaultStore {
 public:
-	explicit VaultStore(Frequency frequency);
+	VaultStore(Frequency frequency,
+	           const Calendar& calendar,
+	           const std::string& frequency_path,
+	           uint64_t runtime_market_id);
+
+	// Appends completed blocks as symbol-ordered ZVB6 blobs and publishes their
+	// locators in the persistent Vault index.
+	Status ingest(const std::vector<StockTimeBlock>& blocks,
+	              const std::vector<ActiveBar>& bars);
+	bool contains(SymbolId symbol_id, TimeId time_id) const;
+	Status get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const;
+	Status range(const std::vector<SymbolId>& symbol_ids,
+	             TimeId begin,
+	             TimeId end,
+	             std::vector<ActiveBar>* out) const;
 
 private:
+	struct Locator {
+		SymbolId symbol_id;
+		TimeId first_time_block_id;
+		TimeId last_time_block_id;
+		uint32_t segment_id;
+		uint64_t blob_offset;
+		uint32_t blob_length;
+	};
+
+	Status load();
+	Status write_index() const;
+
 	Frequency frequency_;
+	const Calendar& calendar_;
+	std::string path_;
+	uint64_t runtime_market_id_;
+	Status status_;
+	uint32_t current_segment_id_;
+	std::vector<Locator> index_;
 };
 
 }  // namespace zstfs

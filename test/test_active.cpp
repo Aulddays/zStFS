@@ -63,6 +63,10 @@ void RemoveFrequencyDirectory(const std::string& path) {
 	std::remove((path + "/staging-index").c_str());
 	std::remove((path + "/staging-pages-0001.seg").c_str());
 	std::remove((path + "/staging-pages-0002.seg").c_str());
+	std::remove((path + "/vault-index").c_str());
+	std::remove((path + "/vault-index.tmp").c_str());
+	std::remove((path + "/vault-0001.seg").c_str());
+	std::remove((path + "/vault-0002.seg").c_str());
 	const int result = rmdir(path.c_str());
 	assert(result == 0 || errno == ENOENT);
 }
@@ -72,6 +76,36 @@ void RemoveTestDirectory(const std::string& path) {
 	RemoveFrequencyDirectory(path + "/daily");
 	RemoveFrequencyDirectory(path + "/hourly");
 	assert(rmdir(path.c_str()) == 0);
+}
+
+// Builds one complete daily block with a single explicitly present bar. The
+// remaining positions are intentionally Missing so the Vault test exercises
+// its persisted presence bitmap as well as sparse numeric frame locators.
+void IngestVaultBar(zstfs::VaultStore* vault,
+					const zstfs::Calendar& calendar,
+					zstfs::SymbolId symbol_id,
+					const std::string& local_time,
+					double close) {
+	zstfs::TimeId time_id = 0;
+	zstfs::TimeId block_id = 0;
+	zstfs::BlockOff block_offset = 0;
+	ExpectOk(calendar.time_id(local_time, &time_id));
+	ExpectOk(calendar.block_offset(zstfs::Frequency::Daily, local_time,
+		&block_id, &block_offset));
+	zstfs::BlockOff block_length = 0;
+	ExpectOk(calendar.block_length(zstfs::Frequency::Daily, block_id, &block_length));
+	zstfs::BlockBar missing = {zstfs::BarState::Missing, 0.0, 0.0, 0.0, 0.0, 0.0};
+	zstfs::StockTimeBlock block = {};
+	block.key.symbol_id = symbol_id;
+	block.key.time_block_id = block_id;
+	block.day_presence = 1;
+	block.positions.assign(block_length, missing);
+	const zstfs::Bar bar = BarFor(symbol_id, zstfs::Frequency::Daily, local_time, close);
+	block.positions[block_offset] = {bar.state, bar.open, bar.high, bar.low, bar.close, bar.volume};
+	zstfs::ActiveBar active_bar = {symbol_id, time_id, block.positions[block_offset]};
+	std::vector<zstfs::StockTimeBlock> blocks(1, block);
+	std::vector<zstfs::ActiveBar> bars(1, active_bar);
+	ExpectOk(vault->ingest(blocks, bars));
 }
 
 void TestDailyWriteReadAndRecovery() {
@@ -296,6 +330,98 @@ void TestHourlyOrderingAndCanonicalSlots() {
 	RemoveTestDirectory(path);
 }
 
+void TestVaultPersistenceMergeAndCorruption() {
+	const std::string path = MakeTestDirectory();
+	const zstfs::SymbolId corrupt_symbol = 41;
+	const zstfs::SymbolId intact_symbol = 42;
+	{
+		// Market creates the per-frequency directories; Vault ingestion then uses
+		// the same internal compaction boundary a future offline worker will use.
+		zstfs::Market bootstrap("vault-bootstrap", path, "CNA");
+	}
+	zstfs::Calendar calendar("CNA");
+	{
+		zstfs::VaultStore vault(zstfs::Frequency::Daily, calendar, path + "/daily", 1001);
+		IngestVaultBar(&vault, calendar, corrupt_symbol, "20260805", 12.0);
+		IngestVaultBar(&vault, calendar, corrupt_symbol, "20260803", 10.0);
+		IngestVaultBar(&vault, calendar, corrupt_symbol, "20260804", 11.0);
+		IngestVaultBar(&vault, calendar, intact_symbol, "20260803", 20.0);
+		zstfs::TimeId time_id = 0;
+		ExpectOk(calendar.time_id("20260803", &time_id));
+		zstfs::BlockBar bar = {};
+		ExpectOk(vault.get(corrupt_symbol, time_id, &bar));
+		assert(bar.close == 10.0);
+	}
+	{
+		zstfs::Market market("vault-read", path, "CNA");
+		zstfs::History& history = market.history(zstfs::Frequency::Daily);
+		zstfs::Bar bar = {};
+		ExpectOk(history.get(corrupt_symbol, "20260803", &bar));
+		assert(bar.close == 10.0);
+
+		// Active data is newer than Vault data for the same logical key.
+		ExpectOk(history.put(BarFor(corrupt_symbol, zstfs::Frequency::Daily,
+			"20260803", 30.0)));
+		bar = BarFor(corrupt_symbol, zstfs::Frequency::Daily, "20260803", 999.0);
+		assert(history.get(corrupt_symbol, "20260803", &bar).code() ==
+			zstfs::ErrorCode::CorruptData);
+		assert(bar.close == 999.0);
+
+		// Once sealed, Staging remains newer than the underlying Vault value.
+		ExpectOk(history.put(BarFor(corrupt_symbol, zstfs::Frequency::Daily,
+			"20260804", 40.0)));
+		ExpectOk(history.seal_before("20260805"));
+		bar = BarFor(corrupt_symbol, zstfs::Frequency::Daily, "20260804", 999.0);
+		assert(history.get(corrupt_symbol, "20260804", &bar).code() ==
+			zstfs::ErrorCode::CorruptData);
+		assert(bar.close == 999.0);
+		std::vector<zstfs::Bar> values;
+		std::vector<zstfs::SymbolId> symbols;
+		symbols.push_back(intact_symbol);
+		symbols.push_back(corrupt_symbol);
+		assert(history.get(symbols, "20260803", "20260804",
+			zstfs::AdjustMode::Raw, &values).code() == zstfs::ErrorCode::CorruptData);
+		assert(values.size() == 3);
+		assert(values[0].symbol_id == corrupt_symbol && values[0].close == 30.0);
+		assert(values[1].symbol_id == intact_symbol && values[1].close == 20.0);
+		assert(values[2].symbol_id == corrupt_symbol && values[2].close == 40.0);
+	}
+
+	// Keep only the immutable layer for the corruption phase, so a newer Active
+	// or Staging value cannot legitimately mask the damaged Vault target.
+	std::remove((path + "/daily/active.data").c_str());
+	std::remove((path + "/daily/staging-index").c_str());
+	std::remove((path + "/daily/staging-pages-0001.seg").c_str());
+
+	// A fresh runtime namespace cannot reuse the prior compressed cache. Corrupt
+	// one blob and verify a target get exposes no result while range retains the
+	// independently readable symbol in sorted partial output.
+	std::fstream corrupt((path + "/daily/vault-0001.seg").c_str(),
+		std::ios::binary | std::ios::in | std::ios::out);
+	assert(corrupt);
+	corrupt.seekp(0);
+	corrupt.write("X", 1);
+	corrupt.close();
+	{
+		zstfs::Market market("vault-corrupt", path, "CNA");
+		zstfs::History& history = market.history(zstfs::Frequency::Daily);
+		zstfs::Bar bar = BarFor(corrupt_symbol, zstfs::Frequency::Daily, "20260805", 999.0);
+		assert(history.get(corrupt_symbol, "20260805", &bar).code() == zstfs::ErrorCode::CorruptData);
+		assert(bar.close == 999.0);
+		std::vector<zstfs::Bar> values;
+		std::vector<zstfs::SymbolId> symbols;
+		symbols.push_back(corrupt_symbol);
+		symbols.push_back(intact_symbol);
+		assert(history.get(symbols, "20260803", "20260805",
+			zstfs::AdjustMode::Raw, &values).code() == zstfs::ErrorCode::CorruptData);
+		assert(values.size() == 3);
+		assert(values[0].symbol_id == corrupt_symbol && values[0].close == 10.0);
+		assert(values[1].symbol_id == intact_symbol && values[1].close == 20.0);
+		assert(values[2].symbol_id == corrupt_symbol && values[2].close == 11.0);
+	}
+	RemoveTestDirectory(path);
+}
+
 }  // namespace
 
 int main() {
@@ -303,5 +429,6 @@ int main() {
 	TestAutomaticFlush();
 	TestStagingBatchAndIndexRecovery();
 	TestHourlyOrderingAndCanonicalSlots();
+	TestVaultPersistenceMergeAndCorruption();
 	return 0;
 }
