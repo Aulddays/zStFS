@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <dirent.h>
 #include <fstream>
 #include <string>
 #include <thread>
@@ -58,24 +59,31 @@ std::string MakeTestDirectory() {
 	return path;
 }
 
-void RemoveFrequencyDirectory(const std::string& path) {
-	std::remove((path + "/active.data").c_str());
-	std::remove((path + "/staging-index").c_str());
-	std::remove((path + "/staging-pages-0001.seg").c_str());
-	std::remove((path + "/staging-pages-0002.seg").c_str());
-	std::remove((path + "/vault-index").c_str());
-	std::remove((path + "/vault-index.tmp").c_str());
-	std::remove((path + "/vault-0001.seg").c_str());
-	std::remove((path + "/vault-0002.seg").c_str());
-	const int result = rmdir(path.c_str());
-	assert(result == 0 || errno == ENOENT);
+void RemoveTree(const std::string& path) {
+	DIR* directory = opendir(path.c_str());
+	if (directory == NULL) {
+		std::remove(path.c_str());
+		return;
+	}
+	for (dirent* entry = readdir(directory); entry != NULL; entry = readdir(directory)) {
+		const std::string name(entry->d_name);
+		if (name == "." || name == "..") {
+			continue;
+		}
+		const std::string child = path + "/" + name;
+		struct stat metadata = {};
+		if (stat(child.c_str(), &metadata) == 0 && S_ISDIR(metadata.st_mode)) {
+			RemoveTree(child);
+		} else {
+			std::remove(child.c_str());
+		}
+	}
+	closedir(directory);
+	assert(rmdir(path.c_str()) == 0 || errno == ENOENT);
 }
 
 void RemoveTestDirectory(const std::string& path) {
-	std::remove((path + "/active.data").c_str());
-	RemoveFrequencyDirectory(path + "/daily");
-	RemoveFrequencyDirectory(path + "/hourly");
-	assert(rmdir(path.c_str()) == 0);
+	RemoveTree(path);
 }
 
 // Builds one complete daily block with a single explicitly present bar. The
@@ -422,6 +430,102 @@ void TestVaultPersistenceMergeAndCorruption() {
 	RemoveTestDirectory(path);
 }
 
+// Creates one block that crosses the cutoff and an unrelated newer Vault block.
+// The fixture makes the compactor exercise logical block splitting rather than
+// treating the block timestamp as a coarse retention boundary.
+void PopulateCompactionFixture(const std::string& path) {
+	const zstfs::SymbolId symbol_id = 61;
+	assert(mkdir((path + "/daily").c_str(), 0755) == 0);
+	zstfs::Calendar calendar("CNA");
+	zstfs::TimeId block_id = 0;
+	zstfs::BlockOff first_offset = 0;
+	ExpectOk(calendar.block_offset(zstfs::Frequency::Daily, "20260803", &block_id, &first_offset));
+	zstfs::BlockOff position_count = 0;
+	ExpectOk(calendar.block_length(zstfs::Frequency::Daily, block_id, &position_count));
+	zstfs::StockTimeBlock staged = {};
+	staged.key = {symbol_id, block_id};
+	staged.day_presence = 0;
+	staged.positions.assign(position_count, zstfs::BlockBar{zstfs::BarState::Missing, 0, 0, 0, 0, 0});
+	std::vector<zstfs::ActiveBar> staged_bars;
+	const zstfs::Bar bars[] = {
+		BarFor(symbol_id, zstfs::Frequency::Daily, "20260803", 10.0),
+		MissingBar(symbol_id, zstfs::Frequency::Daily, "20260804"),
+		BarFor(symbol_id, zstfs::Frequency::Daily, "20260806", 20.0)
+	};
+	for (size_t i = 0; i < sizeof(bars) / sizeof(bars[0]); ++i) {
+		zstfs::TimeId time_id = 0;
+		zstfs::BlockOff offset = 0;
+		ExpectOk(calendar.block_offset(zstfs::Frequency::Daily, bars[i].local_time,
+			&block_id, &offset));
+		ExpectOk(calendar.time_id(bars[i].local_time, &time_id));
+		staged.positions[offset] = {bars[i].state, bars[i].open, bars[i].high, bars[i].low,
+			bars[i].close, bars[i].volume};
+		staged.day_presence |= static_cast<uint64_t>(1) << (zstfs::time_day(time_id) -
+			zstfs::time_day(staged.key.time_block_id));
+		staged_bars.push_back({symbol_id, time_id, staged.positions[offset]});
+	}
+	zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, path + "/daily");
+	ExpectOk(staging.accept(std::vector<zstfs::StockTimeBlock>(1, staged), staged_bars));
+	zstfs::VaultStore vault(zstfs::Frequency::Daily, calendar, path + "/daily", 991);
+	IngestVaultBar(&vault, calendar, symbol_id, "20270105", 50.0);
+}
+
+bool HasBackupDirectory(const std::string& path, const std::string& prefix) {
+	DIR* directory = opendir(path.c_str());
+	assert(directory != NULL);
+	bool found = false;
+	for (dirent* entry = readdir(directory); entry != NULL; entry = readdir(directory)) {
+		const std::string name(entry->d_name);
+		if (name.compare(0, prefix.size(), prefix) == 0) {
+			struct stat metadata = {};
+			const std::string candidate = path + "/" + name;
+			found = stat(candidate.c_str(), &metadata) == 0 && S_ISDIR(metadata.st_mode);
+			if (found) {
+				break;
+			}
+		}
+	}
+	closedir(directory);
+	return found;
+}
+
+void TestOfflineVaultCompaction() {
+	const std::string path = MakeTestDirectory();
+	const std::string duplicate_path = MakeTestDirectory();
+	const zstfs::SymbolId symbol_id = 61;
+	PopulateCompactionFixture(path);
+	PopulateCompactionFixture(duplicate_path);
+	zstfs::VaultCompactionStats stats = {};
+	zstfs::VaultCompactionStats duplicate_stats = {};
+	ExpectOk(zstfs::CompactVault(path, "CNA", zstfs::Frequency::Daily, "20260805", &stats));
+	ExpectOk(zstfs::CompactVault(duplicate_path, "CNA", zstfs::Frequency::Daily, "20260805",
+		&duplicate_stats));
+	assert(stats.input_blocks >= 2);
+	assert(stats.output_blocks >= 3);
+	assert(stats.temporary_bytes > 0 && stats.io_bytes > stats.temporary_bytes);
+	assert(stats.input_blocks == duplicate_stats.input_blocks);
+	assert(stats.output_blocks == duplicate_stats.output_blocks);
+	assert(stats.temporary_bytes == duplicate_stats.temporary_bytes);
+	assert(stats.io_bytes == duplicate_stats.io_bytes);
+	assert(HasBackupDirectory(path + "/daily", "vault."));
+	assert(HasBackupDirectory(path + "/daily", "staging."));
+	{
+		zstfs::Market market("compact-restart", path, "CNA");
+		zstfs::History& history = market.history(zstfs::Frequency::Daily);
+		zstfs::Bar bar = {};
+		ExpectOk(history.get(symbol_id, "20260803", &bar));
+		assert(bar.close == 10.0);
+		ExpectOk(history.get(symbol_id, "20260804", &bar));
+		assert(bar.state == zstfs::BarState::Missing);
+		ExpectOk(history.get(symbol_id, "20260806", &bar));
+		assert(bar.close == 20.0);
+		ExpectOk(history.get(symbol_id, "20270105", &bar));
+		assert(bar.close == 50.0);
+	}
+	RemoveTestDirectory(path);
+	RemoveTestDirectory(duplicate_path);
+}
+
 }  // namespace
 
 int main() {
@@ -430,5 +534,6 @@ int main() {
 	TestStagingBatchAndIndexRecovery();
 	TestHourlyOrderingAndCanonicalSlots();
 	TestVaultPersistenceMergeAndCorruption();
+	TestOfflineVaultCompaction();
 	return 0;
 }

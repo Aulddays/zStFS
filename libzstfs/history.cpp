@@ -22,9 +22,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <dirent.h>
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <queue>
 #include <set>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -1652,6 +1655,25 @@ Status StagingStore::range(const std::vector<SymbolId>& symbol_ids,
 	return Status::Ok();
 }
 
+Status StagingStore::snapshot(std::vector<StockTimeBlock>* blocks,
+								 std::vector<ActiveBar>* bars) const {
+	if (blocks == NULL || bars == NULL) {
+		return Status::Error(ErrorCode::InvalidArgument, "staging snapshot outputs are required");
+	}
+	if (!status_.ok()) {
+		return status_;
+	}
+	blocks->clear();
+	bars->clear();
+	for (std::map<std::pair<TimeId, SymbolId>, Entry>::const_iterator entry = entries_.begin();
+		 entry != entries_.end(); ++entry) {
+		blocks->push_back(entry->second.block);
+		bars->insert(bars->end(), entry->second.bars.begin(), entry->second.bars.end());
+	}
+	std::sort(bars->begin(), bars->end(), ActiveBarOrder);
+	return Status::Ok();
+}
+
 // =============================================================================
 // Vault Blobs, Index, and Shared Read Caches
 //
@@ -2411,6 +2433,91 @@ Status VaultStore::range(const std::vector<SymbolId>& symbol_ids,
 	return corrupt ? Status::Error(ErrorCode::CorruptData, "one or more vault blocks are corrupt") : Status::Ok();
 }
 
+// Reconstruct logical blocks from explicit bars when copying an immutable
+// store. The persistent codecs already retain complete positions, but this
+// helper keeps compaction independent from their private blob/page directories.
+static TimeId CompactionBlockDayLength(Frequency frequency) {
+	return frequency == Frequency::Daily ? kDailyTimeBlockDayLength :
+		kHourlyTimeBlockDayLength;
+}
+
+static TimeId CompactionBlockId(Frequency frequency, TimeId time_id) {
+	const TimeId length = CompactionBlockDayLength(frequency);
+	return daily_bar_id((time_day(time_id) / length) * length);
+}
+
+static Status BlocksFromBars(const Calendar& calendar,
+					 Frequency frequency,
+					 const std::vector<ActiveBar>& bars,
+					 std::vector<StockTimeBlock>* blocks) {
+	if (blocks == NULL) {
+		return Status::Error(ErrorCode::InvalidArgument, "block reconstruction output is required");
+	}
+	std::map<std::pair<SymbolId, TimeId>, std::vector<ActiveBar> > grouped;
+	for (size_t i = 0; i < bars.size(); ++i) {
+		const TimeId block_id = CompactionBlockId(frequency, bars[i].time_id);
+		grouped[std::make_pair(bars[i].symbol_id, block_id)].push_back(bars[i]);
+	}
+	blocks->clear();
+	for (std::map<std::pair<SymbolId, TimeId>, std::vector<ActiveBar> >::const_iterator group =
+		 grouped.begin(); group != grouped.end(); ++group) {
+		BlockOff position_count = 0;
+		Status status = calendar.block_length(frequency, group->first.second, &position_count);
+		if (!status.ok()) {
+			return status;
+		}
+		std::vector<TimeId> time_ids;
+		status = StagingTimeIds(calendar, frequency, group->first.second, position_count, &time_ids);
+		if (!status.ok()) {
+			return status;
+		}
+		StockTimeBlock block = {};
+		block.key.symbol_id = group->first.first;
+		block.key.time_block_id = group->first.second;
+		block.positions.assign(position_count, MissingBlockBar());
+		std::vector<bool> occupied(position_count, false);
+		for (size_t i = 0; i < group->second.size(); ++i) {
+			std::vector<TimeId>::const_iterator position = std::lower_bound(time_ids.begin(),
+				time_ids.end(), group->second[i].time_id);
+			if (position == time_ids.end() || *position != group->second[i].time_id) {
+				return Status::Error(ErrorCode::CorruptData, "stored bar does not fit its block");
+			}
+			const size_t offset = static_cast<size_t>(position - time_ids.begin());
+			if (occupied[offset]) {
+				return Status::Error(ErrorCode::Conflict, "duplicate bar in immutable block");
+			}
+			occupied[offset] = true;
+			block.positions[offset] = group->second[i].bar;
+			const TimeId day_offset = time_day(group->second[i].time_id) -
+				time_day(block.key.time_block_id);
+			block.day_presence |= static_cast<uint64_t>(1) << day_offset;
+		}
+		blocks->push_back(block);
+	}
+	return Status::Ok();
+}
+
+Status VaultStore::snapshot(std::vector<StockTimeBlock>* blocks,
+							  std::vector<ActiveBar>* bars) const {
+	if (blocks == NULL || bars == NULL) {
+		return Status::Error(ErrorCode::InvalidArgument, "vault snapshot outputs are required");
+	}
+	if (!status_.ok()) {
+		return status_;
+	}
+	std::vector<SymbolId> symbols;
+	for (size_t i = 0; i < index_.size(); ++i) {
+		if (symbols.empty() || symbols.back() != index_[i].symbol_id) {
+			symbols.push_back(index_[i].symbol_id);
+		}
+	}
+	Status status = range(symbols, 0, std::numeric_limits<TimeId>::max(), bars);
+	if (!status.ok()) {
+		return status;
+	}
+	return BlocksFromBars(calendar_, frequency_, *bars, blocks);
+}
+
 static std::string FrequencyPath(const std::string& market_path, Frequency frequency) {
 	const std::string path = market_path + (frequency == Frequency::Daily ? "/daily" : "/hourly");
 	if (mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
@@ -2695,6 +2802,704 @@ Status History::seal_before(const std::string& local_time) {
 		return status;
 	}
 	return active_->remove_before(time_id);
+}
+
+// =============================================================================
+// Offline Vault Compaction
+//
+// Compaction rewrites logical block records, not their on-disk frames. The run
+// files are private, short-lived transport between bounded sorting batches and
+// the final merge; Vault and Staging output is always written by their native
+// stores so their public persistent formats remain unchanged.
+// =============================================================================
+
+static const size_t kCompactionBatchBytes = 64U * 1024U * 1024U;
+
+enum class CompactionDestination : uint8_t {
+	Vault = 0,
+	Staging = 1
+};
+
+enum class CompactionSource : uint8_t {
+	Vault = 0,
+	Staging = 1
+};
+
+struct CompactionRecord {
+	CompactionDestination destination;
+	CompactionSource source;
+	StockTimeBlock block;
+	std::vector<ActiveBar> bars;
+};
+
+static bool CompactionRecordOrder(const CompactionRecord& left,
+							  const CompactionRecord& right) {
+	if (left.destination != right.destination) {
+		return static_cast<uint8_t>(left.destination) < static_cast<uint8_t>(right.destination);
+	}
+	if (left.block.key.symbol_id != right.block.key.symbol_id) {
+		return left.block.key.symbol_id < right.block.key.symbol_id;
+	}
+	if (left.block.key.time_block_id != right.block.key.time_block_id) {
+		return left.block.key.time_block_id < right.block.key.time_block_id;
+	}
+	return static_cast<uint8_t>(left.source) < static_cast<uint8_t>(right.source);
+}
+
+static Status SerializeCompactionRecord(const CompactionRecord& record,
+										std::vector<uint8_t>* bytes) {
+	if (bytes == NULL || record.block.key.symbol_id == kInvalidSymbolId ||
+		record.block.positions.size() > std::numeric_limits<uint32_t>::max() ||
+		record.bars.size() > std::numeric_limits<uint32_t>::max()) {
+		return Status::Error(ErrorCode::InvalidArgument, "invalid compaction record");
+	}
+	bytes->clear();
+	PutU8(bytes, 1);
+	PutU8(bytes, static_cast<uint8_t>(record.destination));
+	PutU8(bytes, static_cast<uint8_t>(record.source));
+	PutU8(bytes, 0);
+	PutU32(bytes, record.block.key.symbol_id);
+	PutU32(bytes, record.block.key.time_block_id);
+	PutU64(bytes, record.block.day_presence);
+	PutU32(bytes, static_cast<uint32_t>(record.block.positions.size()));
+	for (size_t i = 0; i < record.block.positions.size(); ++i) {
+		const BlockBar& bar = record.block.positions[i];
+		if (!ValidState(bar.state) || !ValidBar(bar)) {
+			return Status::Error(ErrorCode::InvalidArgument, "invalid block bar in compaction record");
+		}
+		PutU8(bytes, static_cast<uint8_t>(bar.state));
+		PutDouble(bytes, bar.open);
+		PutDouble(bytes, bar.high);
+		PutDouble(bytes, bar.low);
+		PutDouble(bytes, bar.close);
+		PutDouble(bytes, bar.volume);
+	}
+	PutU32(bytes, static_cast<uint32_t>(record.bars.size()));
+	for (size_t i = 0; i < record.bars.size(); ++i) {
+		const ActiveBar& bar = record.bars[i];
+		if (bar.symbol_id != record.block.key.symbol_id || !ValidState(bar.bar.state) ||
+			!ValidBar(bar.bar)) {
+			return Status::Error(ErrorCode::InvalidArgument, "invalid explicit bar in compaction record");
+		}
+		PutU32(bytes, bar.time_id);
+		PutU8(bytes, static_cast<uint8_t>(bar.bar.state));
+		PutDouble(bytes, bar.bar.open);
+		PutDouble(bytes, bar.bar.high);
+		PutDouble(bytes, bar.bar.low);
+		PutDouble(bytes, bar.bar.close);
+		PutDouble(bytes, bar.bar.volume);
+	}
+	return Status::Ok();
+}
+
+static Status ParseCompactionRecord(const std::vector<uint8_t>& bytes,
+									 CompactionRecord* record) {
+	if (record == NULL) {
+		return Status::Error(ErrorCode::InvalidArgument, "compaction record output is required");
+	}
+	size_t offset = 0;
+	uint8_t version = 0;
+	uint8_t destination = 0;
+	uint8_t source = 0;
+	uint8_t reserved = 0;
+	uint32_t positions = 0;
+	uint32_t bars = 0;
+	if (!GetU8(bytes, &offset, &version) || !GetU8(bytes, &offset, &destination) ||
+		!GetU8(bytes, &offset, &source) || !GetU8(bytes, &offset, &reserved) ||
+		!GetU32(bytes, &offset, &record->block.key.symbol_id) ||
+		!GetU32(bytes, &offset, &record->block.key.time_block_id) ||
+		!GetU64(bytes, &offset, &record->block.day_presence) ||
+		!GetU32(bytes, &offset, &positions) || version != 1 || reserved != 0 ||
+		destination > static_cast<uint8_t>(CompactionDestination::Staging) ||
+		source > static_cast<uint8_t>(CompactionSource::Staging) ||
+		record->block.key.symbol_id == kInvalidSymbolId) {
+		return Status::Error(ErrorCode::CorruptData, "invalid compaction run record");
+	}
+	record->destination = static_cast<CompactionDestination>(destination);
+	record->source = static_cast<CompactionSource>(source);
+	record->block.positions.assign(positions, MissingBlockBar());
+	for (uint32_t i = 0; i < positions; ++i) {
+		uint8_t state = 0;
+		BlockBar& bar = record->block.positions[i];
+		if (!GetU8(bytes, &offset, &state) || !GetDouble(bytes, &offset, &bar.open) ||
+			!GetDouble(bytes, &offset, &bar.high) || !GetDouble(bytes, &offset, &bar.low) ||
+			!GetDouble(bytes, &offset, &bar.close) || !GetDouble(bytes, &offset, &bar.volume)) {
+			return Status::Error(ErrorCode::CorruptData, "truncated compaction block");
+		}
+		bar.state = static_cast<BarState>(state);
+		if (!ValidState(bar.state) || !ValidBar(bar)) {
+			return Status::Error(ErrorCode::CorruptData, "invalid compaction block bar");
+		}
+	}
+	if (!GetU32(bytes, &offset, &bars)) {
+		return Status::Error(ErrorCode::CorruptData, "truncated compaction presence list");
+	}
+	record->bars.clear();
+	record->bars.reserve(bars);
+	for (uint32_t i = 0; i < bars; ++i) {
+		ActiveBar bar = {};
+		uint8_t state = 0;
+		bar.symbol_id = record->block.key.symbol_id;
+		if (!GetU32(bytes, &offset, &bar.time_id) || !GetU8(bytes, &offset, &state) ||
+			!GetDouble(bytes, &offset, &bar.bar.open) || !GetDouble(bytes, &offset, &bar.bar.high) ||
+			!GetDouble(bytes, &offset, &bar.bar.low) || !GetDouble(bytes, &offset, &bar.bar.close) ||
+			!GetDouble(bytes, &offset, &bar.bar.volume)) {
+			return Status::Error(ErrorCode::CorruptData, "truncated compaction explicit bar");
+		}
+		bar.bar.state = static_cast<BarState>(state);
+		if (!ValidState(bar.bar.state) || !ValidBar(bar.bar)) {
+			return Status::Error(ErrorCode::CorruptData, "invalid compaction explicit bar");
+		}
+		record->bars.push_back(bar);
+	}
+	return offset == bytes.size() ? Status::Ok() :
+		Status::Error(ErrorCode::CorruptData, "trailing compaction run bytes");
+}
+
+static Status WriteCompactionRun(const std::string& path,
+								 std::vector<CompactionRecord>* records,
+								 uint64_t* written_bytes) {
+	std::sort(records->begin(), records->end(), CompactionRecordOrder);
+	std::ofstream output(path.c_str(), std::ios::binary | std::ios::trunc);
+	if (!output) {
+		return Status::Error(ErrorCode::IoError, "cannot create compaction run");
+	}
+	for (size_t i = 0; i < records->size(); ++i) {
+		std::vector<uint8_t> bytes;
+		Status status = SerializeCompactionRecord((*records)[i], &bytes);
+		if (!status.ok() || bytes.size() > std::numeric_limits<uint32_t>::max()) {
+			return status.ok() ? Status::Error(ErrorCode::InvalidArgument, "compaction record is too large") : status;
+		}
+		std::vector<uint8_t> length;
+		PutU32(&length, static_cast<uint32_t>(bytes.size()));
+		output.write(reinterpret_cast<const char*>(&length[0]), length.size());
+		output.write(reinterpret_cast<const char*>(&bytes[0]), bytes.size());
+		if (!output) {
+			return Status::Error(ErrorCode::IoError, "cannot write compaction run");
+		}
+		*written_bytes += length.size() + bytes.size();
+	}
+	records->clear();
+	return Status::Ok();
+}
+
+struct CompactionRunReader {
+	std::ifstream input;
+	CompactionRecord record;
+	bool has_record;
+};
+
+static Status ReadCompactionRunRecord(CompactionRunReader* reader) {
+	uint8_t length_bytes[4] = {};
+	reader->input.read(reinterpret_cast<char*>(length_bytes), sizeof(length_bytes));
+	if (reader->input.eof() && reader->input.gcount() == 0) {
+		reader->has_record = false;
+		return Status::Ok();
+	}
+	if (reader->input.gcount() != static_cast<std::streamsize>(sizeof(length_bytes))) {
+		return Status::Error(ErrorCode::CorruptData, "truncated compaction run length");
+	}
+	const uint32_t length = static_cast<uint32_t>(length_bytes[0]) |
+		(static_cast<uint32_t>(length_bytes[1]) << 8) |
+		(static_cast<uint32_t>(length_bytes[2]) << 16) |
+		(static_cast<uint32_t>(length_bytes[3]) << 24);
+	if (length == 0 || length > kCompactionBatchBytes) {
+		return Status::Error(ErrorCode::CorruptData, "invalid compaction run length");
+	}
+	std::vector<uint8_t> bytes(length);
+	reader->input.read(reinterpret_cast<char*>(&bytes[0]), bytes.size());
+	if (reader->input.gcount() != static_cast<std::streamsize>(bytes.size())) {
+		return Status::Error(ErrorCode::CorruptData, "truncated compaction run record");
+	}
+	Status status = ParseCompactionRecord(bytes, &reader->record);
+	if (!status.ok()) {
+		return status;
+	}
+	reader->has_record = true;
+	return Status::Ok();
+}
+
+static Status BuildCompactionPart(const Calendar& calendar,
+								  Frequency frequency,
+								  const StockTimeBlock& source,
+								  const std::vector<ActiveBar>& bars,
+								  CompactionDestination destination,
+								  CompactionSource origin,
+								  CompactionRecord* record) {
+	if (record == NULL || bars.empty()) {
+		return Status::Error(ErrorCode::InvalidArgument, "compaction part requires explicit bars");
+	}
+	std::vector<TimeId> time_ids;
+	Status status = StagingTimeIds(calendar, frequency, source.key.time_block_id,
+		static_cast<BlockOff>(source.positions.size()), &time_ids);
+	if (!status.ok()) {
+		return status;
+	}
+	*record = {};
+	record->destination = destination;
+	record->source = origin;
+	record->block.key = source.key;
+	record->block.positions.assign(source.positions.size(), MissingBlockBar());
+	std::vector<bool> present(source.positions.size(), false);
+	for (size_t i = 0; i < bars.size(); ++i) {
+		if (bars[i].symbol_id != source.key.symbol_id) {
+			return Status::Error(ErrorCode::CorruptData, "bar belongs to another compaction block");
+		}
+		std::vector<TimeId>::const_iterator position = std::lower_bound(time_ids.begin(),
+			time_ids.end(), bars[i].time_id);
+		if (position == time_ids.end() || *position != bars[i].time_id) {
+			return Status::Error(ErrorCode::CorruptData, "bar does not fit compaction block");
+		}
+		const size_t offset = static_cast<size_t>(position - time_ids.begin());
+		if (present[offset]) {
+			return Status::Error(ErrorCode::Conflict, "duplicate bar in compaction block");
+		}
+		present[offset] = true;
+		record->block.positions[offset] = bars[i].bar;
+		record->block.day_presence |= static_cast<uint64_t>(1) <<
+			(time_day(bars[i].time_id) - time_day(source.key.time_block_id));
+		record->bars.push_back(bars[i]);
+	}
+	return Status::Ok();
+}
+
+static uint64_t FileBytes(const std::string& path) {
+	struct stat metadata = {};
+	return stat(path.c_str(), &metadata) == 0 && metadata.st_size > 0 ?
+		static_cast<uint64_t>(metadata.st_size) : 0;
+}
+
+static bool IsStoreFile(const std::string& name, CompactionDestination destination) {
+	if (destination == CompactionDestination::Vault) {
+		return name == "vault-index" || name == "vault-index.tmp" ||
+			name.compare(0, 6, "vault-") == 0;
+	}
+	return name == "staging-index" || name.compare(0, 14, "staging-pages-") == 0;
+}
+
+static Status StoreFiles(const std::string& directory,
+					 CompactionDestination destination,
+					 std::vector<std::string>* files) {
+	files->clear();
+	DIR* handle = opendir(directory.c_str());
+	if (handle == NULL) {
+		return errno == ENOENT ? Status::Ok() :
+			Status::Error(ErrorCode::IoError, "cannot inspect store directory");
+	}
+	for (dirent* entry = readdir(handle); entry != NULL; entry = readdir(handle)) {
+		const std::string name(entry->d_name);
+		if (IsStoreFile(name, destination)) {
+			files->push_back(name);
+		}
+	}
+	closedir(handle);
+	std::sort(files->begin(), files->end());
+	return Status::Ok();
+}
+
+static void RemoveCompactionTree(const std::string& directory) {
+	DIR* handle = opendir(directory.c_str());
+	if (handle == NULL) {
+		return;
+	}
+	for (dirent* entry = readdir(handle); entry != NULL; entry = readdir(handle)) {
+		const std::string name(entry->d_name);
+		if (name == "." || name == "..") {
+			continue;
+		}
+		const std::string path = directory + "/" + name;
+		struct stat metadata = {};
+		if (stat(path.c_str(), &metadata) == 0 && S_ISDIR(metadata.st_mode)) {
+			RemoveCompactionTree(path);
+		} else {
+			unlink(path.c_str());
+		}
+	}
+	closedir(handle);
+	rmdir(directory.c_str());
+}
+
+static Status PublishCompactedStore(const std::string& frequency_path,
+									 const std::string& build_path,
+									 const std::string& backup_path,
+									 CompactionDestination destination) {
+	if (mkdir(backup_path.c_str(), 0755) != 0) {
+		return Status::Error(ErrorCode::IoError, "cannot create store backup directory");
+	}
+	std::vector<std::string> old_files;
+	std::vector<std::string> new_files;
+	Status status = StoreFiles(frequency_path, destination, &old_files);
+	if (!status.ok()) {
+		return status;
+	}
+	status = StoreFiles(build_path, destination, &new_files);
+	if (!status.ok()) {
+		return status;
+	}
+	std::vector<std::string> moved_old;
+	for (size_t i = 0; i < old_files.size(); ++i) {
+		if (rename((frequency_path + "/" + old_files[i]).c_str(),
+			(backup_path + "/" + old_files[i]).c_str()) != 0) {
+			for (size_t rollback = moved_old.size(); rollback > 0; --rollback) {
+				const std::string& name = moved_old[rollback - 1];
+				rename((backup_path + "/" + name).c_str(), (frequency_path + "/" + name).c_str());
+			}
+			return Status::Error(ErrorCode::IoError, "cannot preserve old store file");
+		}
+		moved_old.push_back(old_files[i]);
+	}
+	std::vector<std::string> moved_new;
+	for (size_t i = 0; i < new_files.size(); ++i) {
+		if (rename((build_path + "/" + new_files[i]).c_str(),
+			(frequency_path + "/" + new_files[i]).c_str()) != 0) {
+			for (size_t rollback = moved_new.size(); rollback > 0; --rollback) {
+				const std::string& name = moved_new[rollback - 1];
+				rename((frequency_path + "/" + name).c_str(), (build_path + "/" + name).c_str());
+			}
+			for (size_t rollback = moved_old.size(); rollback > 0; --rollback) {
+				const std::string& name = moved_old[rollback - 1];
+				rename((backup_path + "/" + name).c_str(), (frequency_path + "/" + name).c_str());
+			}
+			return Status::Error(ErrorCode::IoError, "cannot publish compacted store file");
+		}
+		moved_new.push_back(new_files[i]);
+	}
+	return Status::Ok();
+}
+
+// A compaction publishes Vault and Staging as one logical operation. If the
+// second publication fails, move the new Vault files back to the build tree
+// and restore the preserved files before returning the error.
+static Status RestoreCompactedStore(const std::string& frequency_path,
+									const std::string& build_path,
+									const std::string& backup_path,
+									CompactionDestination destination) {
+	std::vector<std::string> current_files;
+	Status status = StoreFiles(frequency_path, destination, &current_files);
+	if (!status.ok()) {
+		return status;
+	}
+	for (size_t i = 0; i < current_files.size(); ++i) {
+		if (rename((frequency_path + "/" + current_files[i]).c_str(),
+			(build_path + "/" + current_files[i]).c_str()) != 0) {
+			return Status::Error(ErrorCode::IoError, "cannot stage compacted store rollback");
+		}
+	}
+	std::vector<std::string> backup_files;
+	status = StoreFiles(backup_path, destination, &backup_files);
+	if (!status.ok()) {
+		return status;
+	}
+	for (size_t i = 0; i < backup_files.size(); ++i) {
+		if (rename((backup_path + "/" + backup_files[i]).c_str(),
+			(frequency_path + "/" + backup_files[i]).c_str()) != 0) {
+			return Status::Error(ErrorCode::IoError, "cannot restore compacted store backup");
+		}
+	}
+	return Status::Ok();
+}
+
+Status CompactVault(const std::string& market_path,
+					const std::string& market_type,
+					Frequency frequency,
+					const std::string& cutoff_local_time,
+					VaultCompactionStats* stats) {
+	if (stats == NULL || market_path.empty() || market_type.empty()) {
+		return Status::Error(ErrorCode::InvalidArgument, "market path, type, and compaction stats are required");
+	}
+	*stats = {};
+	const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+	Calendar calendar(market_type);
+	TimeId cutoff = 0;
+	TimeId unused_block = 0;
+	BlockOff unused_offset = 0;
+	Status status = ResolveTime(calendar, frequency, cutoff_local_time, &cutoff, &unused_block, &unused_offset);
+	if (!status.ok()) {
+		return status;
+	}
+	const std::string frequency_path = FrequencyPath(market_path, frequency);
+	if (frequency_path.empty()) {
+		return Status::Error(ErrorCode::IoError, "cannot create frequency directory");
+	}
+	StagingStore old_staging(frequency, calendar, frequency_path);
+	VaultStore old_vault(frequency, calendar, frequency_path, NextRuntimeMarketId());
+	std::vector<StockTimeBlock> staging_blocks;
+	std::vector<ActiveBar> staging_bars;
+	std::vector<StockTimeBlock> vault_blocks;
+	std::vector<ActiveBar> vault_bars;
+	status = old_staging.snapshot(&staging_blocks, &staging_bars);
+	if (!status.ok()) {
+		return status;
+	}
+	status = old_vault.snapshot(&vault_blocks, &vault_bars);
+	if (!status.ok()) {
+		return status;
+	}
+	stats->input_blocks = staging_blocks.size() + vault_blocks.size();
+	std::map<std::pair<SymbolId, TimeId>, std::vector<ActiveBar> > staging_by_block;
+	std::map<std::pair<SymbolId, TimeId>, std::vector<ActiveBar> > vault_by_block;
+	for (size_t i = 0; i < staging_bars.size(); ++i) {
+		const TimeId block_id = CompactionBlockId(frequency, staging_bars[i].time_id);
+		staging_by_block[std::make_pair(staging_bars[i].symbol_id, block_id)].push_back(staging_bars[i]);
+	}
+	for (size_t i = 0; i < vault_bars.size(); ++i) {
+		const TimeId block_id = CompactionBlockId(frequency, vault_bars[i].time_id);
+		vault_by_block[std::make_pair(vault_bars[i].symbol_id, block_id)].push_back(vault_bars[i]);
+	}
+	const uint64_t token = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::system_clock::now().time_since_epoch()).count());
+	const std::string build_root = frequency_path + "/makevault.build." + std::to_string(token);
+	if (mkdir(build_root.c_str(), 0755) != 0) {
+		return Status::Error(ErrorCode::IoError, "cannot create compaction build directory");
+	}
+	const std::string vault_build = build_root + "/vault";
+	const std::string staging_build = build_root + "/staging";
+	if (mkdir(vault_build.c_str(), 0755) != 0 || mkdir(staging_build.c_str(), 0755) != 0) {
+		RemoveCompactionTree(build_root);
+		return Status::Error(ErrorCode::IoError, "cannot create compacted store directories");
+	}
+	std::vector<CompactionRecord> batch;
+	std::vector<std::string> runs;
+	size_t batch_bytes = 0;
+	uint32_t run_id = 0;
+	const auto append_record = [&](const CompactionRecord& record) -> Status {
+		std::vector<uint8_t> bytes;
+		Status append_status = SerializeCompactionRecord(record, &bytes);
+		if (!append_status.ok()) {
+			return append_status;
+		}
+		const size_t record_bytes = bytes.size() + sizeof(uint32_t);
+		if (record_bytes > kCompactionBatchBytes) {
+			return Status::Error(ErrorCode::InvalidArgument, "compaction record exceeds 64 MiB batch limit");
+		}
+		if (!batch.empty() && batch_bytes + record_bytes > kCompactionBatchBytes) {
+			const std::string run = build_root + "/run-" + std::to_string(run_id++) + ".bin";
+			Status flush_status = WriteCompactionRun(run, &batch, &stats->temporary_bytes);
+			if (!flush_status.ok()) {
+				return flush_status;
+			}
+			runs.push_back(run);
+			batch_bytes = 0;
+		}
+		batch.push_back(record);
+		batch_bytes += record_bytes;
+		return Status::Ok();
+	};
+	for (size_t i = 0; i < vault_blocks.size(); ++i) {
+		const std::pair<SymbolId, TimeId> key(vault_blocks[i].key.symbol_id, vault_blocks[i].key.time_block_id);
+		std::map<std::pair<SymbolId, TimeId>, std::vector<ActiveBar> >::const_iterator bars = vault_by_block.find(key);
+		if (bars == vault_by_block.end()) {
+			continue;
+		}
+		CompactionRecord record;
+		status = BuildCompactionPart(calendar, frequency, vault_blocks[i], bars->second,
+			CompactionDestination::Vault, CompactionSource::Vault, &record);
+		if (!status.ok() || !(status = append_record(record)).ok()) {
+			RemoveCompactionTree(build_root);
+			return status;
+		}
+	}
+	for (size_t i = 0; i < staging_blocks.size(); ++i) {
+		const std::pair<SymbolId, TimeId> key(staging_blocks[i].key.symbol_id, staging_blocks[i].key.time_block_id);
+		std::map<std::pair<SymbolId, TimeId>, std::vector<ActiveBar> >::const_iterator bars = staging_by_block.find(key);
+		if (bars == staging_by_block.end()) {
+			continue;
+		}
+		std::vector<ActiveBar> old_bars;
+		std::vector<ActiveBar> new_bars;
+		for (size_t j = 0; j < bars->second.size(); ++j) {
+			(bars->second[j].time_id < cutoff ? old_bars : new_bars).push_back(bars->second[j]);
+		}
+		if (!old_bars.empty()) {
+			CompactionRecord record;
+			status = BuildCompactionPart(calendar, frequency, staging_blocks[i], old_bars,
+				CompactionDestination::Vault, CompactionSource::Staging, &record);
+			if (!status.ok() || !(status = append_record(record)).ok()) {
+				RemoveCompactionTree(build_root);
+				return status;
+			}
+		}
+		if (!new_bars.empty()) {
+			CompactionRecord record;
+			status = BuildCompactionPart(calendar, frequency, staging_blocks[i], new_bars,
+				CompactionDestination::Staging, CompactionSource::Staging, &record);
+			if (!status.ok() || !(status = append_record(record)).ok()) {
+				RemoveCompactionTree(build_root);
+				return status;
+			}
+		}
+	}
+	if (!batch.empty()) {
+		const std::string run = build_root + "/run-" + std::to_string(run_id++) + ".bin";
+		status = WriteCompactionRun(run, &batch, &stats->temporary_bytes);
+		if (!status.ok()) {
+			RemoveCompactionTree(build_root);
+			return status;
+		}
+		runs.push_back(run);
+	}
+	VaultStore new_vault(frequency, calendar, vault_build, NextRuntimeMarketId());
+	StagingStore new_staging(frequency, calendar, staging_build);
+	std::vector<CompactionRunReader> readers(runs.size());
+	struct EarlierRun {
+		const std::vector<CompactionRunReader>* readers;
+		bool operator()(size_t left, size_t right) const {
+			return CompactionRecordOrder((*readers)[right].record, (*readers)[left].record);
+		}
+	};
+	EarlierRun earlier = {&readers};
+	std::priority_queue<size_t, std::vector<size_t>, EarlierRun> heap(earlier);
+	for (size_t i = 0; i < runs.size(); ++i) {
+		readers[i].input.open(runs[i].c_str(), std::ios::binary);
+		if (!readers[i].input || !(status = ReadCompactionRunRecord(&readers[i])).ok()) {
+			RemoveCompactionTree(build_root);
+			return status.ok() ? Status::Error(ErrorCode::IoError, "cannot read compaction run") : status;
+		}
+		if (readers[i].has_record) {
+			heap.push(i);
+		}
+	}
+	std::vector<StockTimeBlock> vault_batch;
+	std::vector<ActiveBar> vault_batch_bars;
+	std::vector<StockTimeBlock> staging_batch;
+	std::vector<ActiveBar> staging_batch_bars;
+	const auto flush_output = [&](CompactionDestination destination) -> Status {
+		if (destination == CompactionDestination::Vault) {
+			if (vault_batch.empty()) {
+				return Status::Ok();
+			}
+			Status flush_status = new_vault.ingest(vault_batch, vault_batch_bars);
+			vault_batch.clear();
+			vault_batch_bars.clear();
+			return flush_status;
+		}
+		if (staging_batch.empty()) {
+			return Status::Ok();
+		}
+		Status flush_status = new_staging.accept(staging_batch, staging_batch_bars);
+		staging_batch.clear();
+		staging_batch_bars.clear();
+		return flush_status;
+	};
+	CompactionDestination last_destination = CompactionDestination::Vault;
+	bool have_destination = false;
+	while (!heap.empty()) {
+		const CompactionRecord first = readers[heap.top()].record;
+		const CompactionDestination destination = first.destination;
+		const SymbolId symbol_id = first.block.key.symbol_id;
+		const TimeId block_id = first.block.key.time_block_id;
+		bool have_vault = false;
+		bool have_staging = false;
+		CompactionRecord chosen;
+		while (!heap.empty()) {
+			const size_t index = heap.top();
+			const CompactionRecord& candidate = readers[index].record;
+			if (candidate.destination != destination || candidate.block.key.symbol_id != symbol_id ||
+				candidate.block.key.time_block_id != block_id) {
+				break;
+			}
+			heap.pop();
+			if (candidate.source == CompactionSource::Vault) {
+				if (have_vault) {
+					RemoveCompactionTree(build_root);
+					return Status::Error(ErrorCode::Conflict, "conflicting duplicate Vault block");
+				}
+				have_vault = true;
+				chosen = candidate;
+			} else {
+				if (have_staging) {
+					RemoveCompactionTree(build_root);
+					return Status::Error(ErrorCode::Conflict, "conflicting duplicate Staging block");
+				}
+				have_staging = true;
+				chosen = candidate;
+			}
+			status = ReadCompactionRunRecord(&readers[index]);
+			if (!status.ok()) {
+				RemoveCompactionTree(build_root);
+				return status;
+			}
+			if (readers[index].has_record) {
+				heap.push(index);
+			}
+		}
+		if (have_destination && destination != last_destination) {
+			status = flush_output(last_destination);
+			if (!status.ok()) {
+				RemoveCompactionTree(build_root);
+				return status;
+			}
+		}
+		have_destination = true;
+		last_destination = destination;
+		if (destination == CompactionDestination::Vault) {
+			vault_batch.push_back(chosen.block);
+			vault_batch_bars.insert(vault_batch_bars.end(), chosen.bars.begin(), chosen.bars.end());
+		} else {
+			staging_batch.push_back(chosen.block);
+			staging_batch_bars.insert(staging_batch_bars.end(), chosen.bars.begin(), chosen.bars.end());
+		}
+		++stats->output_blocks;
+	}
+	if (have_destination && !(status = flush_output(last_destination)).ok()) {
+		RemoveCompactionTree(build_root);
+		return status;
+	}
+	std::vector<std::string> files;
+	status = StoreFiles(frequency_path, CompactionDestination::Vault, &files);
+	if (!status.ok()) {
+		RemoveCompactionTree(build_root);
+		return status;
+	}
+	for (size_t i = 0; i < files.size(); ++i) {
+		stats->io_bytes += FileBytes(frequency_path + "/" + files[i]);
+	}
+	status = StoreFiles(frequency_path, CompactionDestination::Staging, &files);
+	if (!status.ok()) {
+		RemoveCompactionTree(build_root);
+		return status;
+	}
+	for (size_t i = 0; i < files.size(); ++i) {
+		stats->io_bytes += FileBytes(frequency_path + "/" + files[i]);
+	}
+	stats->io_bytes += stats->temporary_bytes * 2;
+	status = StoreFiles(vault_build, CompactionDestination::Vault, &files);
+	if (!status.ok()) {
+		RemoveCompactionTree(build_root);
+		return status;
+	}
+	for (size_t i = 0; i < files.size(); ++i) {
+		stats->io_bytes += FileBytes(vault_build + "/" + files[i]);
+	}
+	status = StoreFiles(staging_build, CompactionDestination::Staging, &files);
+	if (!status.ok()) {
+		RemoveCompactionTree(build_root);
+		return status;
+	}
+	for (size_t i = 0; i < files.size(); ++i) {
+		stats->io_bytes += FileBytes(staging_build + "/" + files[i]);
+	}
+	status = PublishCompactedStore(frequency_path, vault_build,
+		frequency_path + "/vault." + std::to_string(token), CompactionDestination::Vault);
+	const bool vault_published = status.ok();
+	if (vault_published) {
+		status = PublishCompactedStore(frequency_path, staging_build,
+			frequency_path + "/staging." + std::to_string(token), CompactionDestination::Staging);
+		if (!status.ok()) {
+			const Status rollback_status = RestoreCompactedStore(frequency_path, vault_build,
+				frequency_path + "/vault." + std::to_string(token), CompactionDestination::Vault);
+			if (!rollback_status.ok()) {
+				status = Status::Error(ErrorCode::IoError, "compaction publication and rollback both failed");
+			}
+		}
+	}
+	RemoveCompactionTree(build_root);
+	if (!status.ok()) {
+		return status;
+	}
+	stats->elapsed_milliseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - started).count());
+	return Status::Ok();
 }
 
 }  // namespace zstfs

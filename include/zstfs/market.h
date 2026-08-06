@@ -18,6 +18,26 @@ class ActiveStore;
 class StagingStore;
 class VaultStore;
 
+// VaultCompactionStats reports the stable operational totals produced by one
+// offline compaction. Elapsed time is observational; the byte and block counts
+// are derived from deterministic ordered input and output records.
+struct VaultCompactionStats {
+	uint64_t input_blocks;
+	uint64_t output_blocks;
+	uint64_t temporary_bytes;
+	uint64_t io_bytes;
+	uint64_t elapsed_milliseconds;
+};
+
+// CompactVault rebuilds one frequency's immutable Vault from the existing Vault
+// and the Staging records strictly before cutoff_local_time. The caller runs it
+// while the market daemon is stopped because publication replaces store files.
+Status CompactVault(const std::string& market_path,
+                    const std::string& market_type,
+                    Frequency frequency,
+                    const std::string& cutoff_local_time,
+                    VaultCompactionStats* stats);
+
 // Market owns all data domains for one configured market. It provides access
 // to symbols, corporate actions, and independent daily/hourly histories.
 class Market {

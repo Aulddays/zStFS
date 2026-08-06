@@ -190,6 +190,10 @@ public:
 	             TimeId begin,
 	             TimeId end,
 	             std::vector<ActiveBar>* out) const;
+	// snapshot exposes complete logical records to the offline compactor without
+	// exposing the persistent Staging page layout outside this implementation.
+	Status snapshot(std::vector<StockTimeBlock>* blocks,
+	                std::vector<ActiveBar>* bars) const;
 
 private:
 	struct Locator {
@@ -238,6 +242,9 @@ public:
 	             TimeId begin,
 	             TimeId end,
 	             std::vector<ActiveBar>* out) const;
+	// snapshot reconstructs complete logical records from immutable Vault blobs.
+	Status snapshot(std::vector<StockTimeBlock>* blocks,
+	                std::vector<ActiveBar>* bars) const;
 
 private:
 	struct Locator {
