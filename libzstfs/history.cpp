@@ -2539,13 +2539,37 @@ static uint64_t NextRuntimeMarketId() {
 
 History::History(Frequency frequency,
 			 const Calendar& calendar,
-			 const std::string& market_path)
+			 const std::string& market_path,
+			 const Actions& actions,
+			 const std::function<Status()>& publish_manifest,
+			 const Status& initial_status)
 	: frequency_(frequency),
 	  calendar_(calendar),
-	  active_(new ActiveStore(frequency, calendar, FrequencyPath(market_path, frequency))),
-	  staging_(new StagingStore(frequency, calendar, FrequencyPath(market_path, frequency))),
-	  vault_(new VaultStore(frequency, calendar, FrequencyPath(market_path, frequency),
-		NextRuntimeMarketId())) {
+	  actions_(actions),
+	  publish_manifest_(publish_manifest),
+	  status_(initial_status),
+	  active_(),
+	  staging_(),
+	  vault_() {
+	// Manifest validation precedes store construction. A failed open retains a
+	// History shell so the existing accessor remains source compatible, but all
+	// operations return the original CorruptData or I/O status.
+	if (!status_.ok()) {
+		return;
+	}
+	const std::string frequency_path = FrequencyPath(market_path, frequency);
+	if (frequency_path.empty()) {
+		status_ = Status::Error(ErrorCode::IoError, "cannot create frequency directory");
+		return;
+	}
+	active_.reset(new ActiveStore(frequency, calendar, frequency_path));
+	staging_.reset(new StagingStore(frequency, calendar, frequency_path));
+	vault_.reset(new VaultStore(frequency, calendar, frequency_path,
+		NextRuntimeMarketId()));
+}
+
+Status History::status() const {
+	return status_;
 }
 
 History::~History() {
@@ -2556,6 +2580,9 @@ Frequency History::frequency() const {
 }
 
 Status History::put(const Bar& bar) {
+	if (!status_.ok()) {
+		return status_;
+	}
 	if (bar.frequency != frequency_ || bar.symbol_id == kInvalidSymbolId ||
 		!ValidState(bar.state) || !ValidBar(BlockBar{bar.state, bar.open, bar.high,
 		bar.low, bar.close, bar.volume})) {
@@ -2578,10 +2605,17 @@ Status History::put(const Bar& bar) {
 	if (!status.ok()) {
 		return status;
 	}
-	return active_->flush_if_needed();
+	status = active_->flush();
+	if (!status.ok()) {
+		return status;
+	}
+	return publish_manifest_ ? publish_manifest_() : Status::Ok();
 }
 
 Status History::put(const std::vector<Bar>& bars) {
+	if (!status_.ok()) {
+		return status_;
+	}
 	std::vector<ResolvedBar> resolved;
 	std::set<std::pair<SymbolId, TimeId> > seen;
 	resolved.reserve(bars.size());
@@ -2616,12 +2650,19 @@ Status History::put(const std::vector<Bar>& bars) {
 			return status;
 		}
 	}
-	return active_->flush_if_needed();
+	Status status = active_->flush();
+	if (!status.ok()) {
+		return status;
+	}
+	return publish_manifest_ ? publish_manifest_() : Status::Ok();
 }
 
 Status History::get(SymbolId symbol_id,
 			    const std::string& local_time,
 			    Bar* out) const {
+	if (!status_.ok()) {
+		return status_;
+	}
 	if (out == NULL || symbol_id == kInvalidSymbolId) {
 		return Status::Error(ErrorCode::InvalidArgument, "history read output and symbol are required");
 	}
@@ -2690,11 +2731,11 @@ Status History::get(const std::vector<SymbolId>& symbol_ids,
 			    const std::string& end,
 			    AdjustMode adjust_mode,
 			    std::vector<Bar>* out) const {
+	if (!status_.ok()) {
+		return status_;
+	}
 	if (out == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "history range output is required");
-	}
-	if (adjust_mode != AdjustMode::Raw) {
-		return Status::Error(ErrorCode::NotImplemented, "adjusted history reads are not implemented");
 	}
 	TimeId begin_time_id = 0;
 	TimeId ignored_block_id = 0;
@@ -2772,6 +2813,10 @@ Status History::get(const std::vector<SymbolId>& symbol_ids,
 			active_bar.bar.state, active_bar.bar.open,
 			active_bar.bar.high, active_bar.bar.low,
 			active_bar.bar.close, active_bar.bar.volume};
+		status = actions_.adjust(active_bar.symbol_id, local_time, adjust_mode, &bar);
+		if (!status.ok()) {
+			return status;
+		}
 		out->push_back(bar);
 	}
 	return corrupt ? Status::Error(ErrorCode::CorruptData,
@@ -2779,14 +2824,28 @@ Status History::get(const std::vector<SymbolId>& symbol_ids,
 }
 
 Status History::flush() {
-	return active_->flush();
+	if (!status_.ok()) {
+		return status_;
+	}
+	Status status = active_->flush();
+	if (!status.ok()) {
+		return status;
+	}
+	return publish_manifest_ ? publish_manifest_() : Status::Ok();
 }
 
 Status History::seal_before(const std::string& local_time) {
+	if (!status_.ok()) {
+		return status_;
+	}
 	TimeId time_id = 0;
 	TimeId ignored_block_id = 0;
 	BlockOff ignored_block_offset = 0;
-	Status status = ResolveTime(calendar_, frequency_, local_time,
+	Status status = active_->flush();
+	if (!status.ok()) {
+		return status;
+	}
+	status = ResolveTime(calendar_, frequency_, local_time,
 						&time_id, &ignored_block_id, &ignored_block_offset);
 	if (!status.ok()) {
 		return status;
@@ -2801,7 +2860,11 @@ Status History::seal_before(const std::string& local_time) {
 	if (!status.ok()) {
 		return status;
 	}
-	return active_->remove_before(time_id);
+	status = active_->remove_before(time_id);
+	if (!status.ok()) {
+		return status;
+	}
+	return publish_manifest_ ? publish_manifest_() : Status::Ok();
 }
 
 // =============================================================================
@@ -3209,6 +3272,13 @@ Status CompactVault(const std::string& market_path,
 	}
 	*stats = {};
 	const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+	// Compaction changes two immutable stores as one offline operation. Opening
+	// Market first verifies the published input generation; sync below exposes the
+	// replacement files only after both store publications have completed.
+	Market market("offline-compaction", market_path, market_type);
+	if (!market.status().ok()) {
+		return market.status();
+	}
 	Calendar calendar(market_type);
 	TimeId cutoff = 0;
 	TimeId unused_block = 0;
@@ -3494,6 +3564,10 @@ Status CompactVault(const std::string& market_path,
 		}
 	}
 	RemoveCompactionTree(build_root);
+	if (!status.ok()) {
+		return status;
+	}
+	status = market.sync();
 	if (!status.ok()) {
 		return status;
 	}

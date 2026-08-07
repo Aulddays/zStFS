@@ -5,7 +5,11 @@
 
 #include <assert.h>
 
+#include <dirent.h>
+#include <errno.h>
 #include <fstream>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <string>
 #include <vector>
 
@@ -29,8 +33,48 @@ void ExpectOk(const zstfs::Status& status) {
 	assert(status.ok());
 }
 
+void RemoveTree(const std::string& path) {
+	DIR* directory = opendir(path.c_str());
+	if (directory == NULL) {
+		assert(errno == ENOENT);
+		return;
+	}
+	for (dirent* entry = readdir(directory); entry != NULL; entry = readdir(directory)) {
+		const std::string name(entry->d_name);
+		if (name == "." || name == "..") {
+			continue;
+		}
+		const std::string child = path + "/" + name;
+		struct stat metadata = {};
+		assert(stat(child.c_str(), &metadata) == 0);
+		if (S_ISDIR(metadata.st_mode)) {
+			RemoveTree(child);
+		} else {
+			assert(unlink(child.c_str()) == 0);
+		}
+	}
+	closedir(directory);
+	assert(rmdir(path.c_str()) == 0);
+}
+
+class ScopedTreeRemoval {
+public:
+	explicit ScopedTreeRemoval(const std::string& path) : path_(path) {
+	}
+
+	~ScopedTreeRemoval() {
+		RemoveTree(path_);
+	}
+
+private:
+	std::string path_;
+};
+
 int main() {
-	zstfs::Market market("test-market", "/tmp/zstfs-test-market", "CNA");
+	const std::string market_path = "/tmp/zstfs-test-market";
+	RemoveTree(market_path);
+	ScopedTreeRemoval cleanup(market_path);
+	zstfs::Market market("test-market", market_path, "CNA");
 	assert(market.type() == "CNA");
 
 	const std::string markets_path = "/tmp/zstfs-markets-test.conf";

@@ -7,6 +7,7 @@
 
 #include <condition_variable>
 #include <cstddef>
+#include <functional>
 #include <cstdint>
 #include <map>
 #include <mutex>

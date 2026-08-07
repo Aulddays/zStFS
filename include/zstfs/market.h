@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -50,6 +51,14 @@ public:
 	const std::string& name() const;
 	const std::string& path() const;
 	const std::string& type() const;
+	// status reports whether the on-disk market generation was accepted during
+	// construction. A non-OK status means no history or action mutation may use
+	// the market state.
+	Status status() const;
+	// sync publishes the complete current file set as a new manifest generation.
+	// History and Actions mutations publish automatically; maintenance code calls
+	// this after writing a fully prepared replacement store while the daemon is stopped.
+	Status sync();
 
 	Symbols& symbols();
 	const Symbols& symbols() const;
@@ -67,6 +76,13 @@ private:
 	std::unique_ptr<Actions> actions_;
 	std::unique_ptr<History> daily_history_;
 	std::unique_ptr<History> hourly_history_;
+	Status status_;
+	uint64_t manifest_generation_;
+	bool manifest_loaded_;
+
+	Status initialize_storage();
+	Status load_or_bootstrap_manifest();
+	Status publish_manifest();
 };
 
 // Symbols owns all Symbol records for one Market, including the stable ID map
@@ -106,10 +122,33 @@ public:
 	           std::vector<Action>* out) const;
 	Status update(ActionId id, const Action& action);
 	Status remove(ActionId id);
+	// adjust transforms a raw bar to the requested corporate-action basis.
+	// Raw actions remain the only persistent representation; the ordered
+	// in-memory anchors are rebuilt whenever the action set changes.
+	Status adjust(SymbolId symbol_id,
+	              const std::string& local_time,
+	              AdjustMode mode,
+	              Bar* bar) const;
+	Status status() const;
 
 private:
+	friend class Market;
+
+	Status configure_persistence(const std::string& file_path,
+	                             const std::function<Status()>& publish_manifest);
+	Status load();
+	Status save(const std::map<ActionId, Action>& actions,
+	            ActionId next_id) const;
+	Status persist(const std::map<ActionId, Action>& actions,
+	               ActionId next_id);
+	void rebuild_anchors();
+
 	std::map<ActionId, Action> by_id_;
 	ActionId next_id_;
+	std::map<SymbolId, std::vector<Action> > anchors_;
+	std::string path_;
+	std::function<Status()> publish_manifest_;
+	Status status_;
 };
 
 // History manages one frequency of market data. Market owns one daily and one
@@ -119,6 +158,7 @@ public:
 	~History();
 
 	Frequency frequency() const;
+	Status status() const;
 	Status put(const Bar& bar);
 	Status put(const std::vector<Bar>& bars);
 	Status get(SymbolId symbol_id, const std::string& local_time, Bar* out) const;
@@ -139,10 +179,16 @@ private:
 	friend class Market;
 	History(Frequency frequency,
 	        const Calendar& calendar,
-	        const std::string& market_path);
+	        const std::string& market_path,
+	        const Actions& actions,
+	        const std::function<Status()>& publish_manifest,
+	        const Status& initial_status);
 
 	Frequency frequency_;
 	const Calendar& calendar_;
+	const Actions& actions_;
+	std::function<Status()> publish_manifest_;
+	Status status_;
 	std::unique_ptr<ActiveStore> active_;
 	std::unique_ptr<StagingStore> staging_;
 	std::unique_ptr<VaultStore> vault_;
