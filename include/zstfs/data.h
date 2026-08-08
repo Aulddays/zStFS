@@ -105,6 +105,10 @@ struct Symbol {
 
 struct Action {
 	ActionId id;
+	// external_event_key identifies one source event across retries and
+	// corrections. It is unique within its Symbol and remains stable while the
+	// event representation changes; id is the library-owned physical key.
+	std::string external_event_key;
 	SymbolId symbol_id;
 	std::string effective_date;
 	ActionType type;

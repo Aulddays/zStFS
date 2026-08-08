@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "zstfs/data.h"
@@ -18,6 +19,7 @@ class History;
 class ActiveStore;
 class StagingStore;
 class VaultStore;
+class Markets;
 
 // VaultCompactionStats reports the stable operational totals produced by one
 // offline compaction. Elapsed time is observational; the byte and block counts
@@ -30,11 +32,11 @@ struct VaultCompactionStats {
 	uint64_t elapsed_milliseconds;
 };
 
-// CompactVault rebuilds one frequency's immutable Vault from the existing Vault
-// and the Staging records strictly before cutoff_local_time. The caller runs it
-// while the market daemon is stopped because publication replaces store files.
-Status CompactVault(const std::string& market_path,
-                    const std::string& market_type,
+// CompactVault rebuilds one configured market's immutable Vault from existing
+// Vault and Staging records strictly before cutoff_local_time. The caller runs
+// it while all writers are stopped because publication replaces store files.
+Status CompactVault(const std::string& root_path,
+                    const std::string& market_name,
                     Frequency frequency,
                     const std::string& cutoff_local_time,
                     VaultCompactionStats* stats);
@@ -43,9 +45,6 @@ Status CompactVault(const std::string& market_path,
 // to symbols, corporate actions, and independent daily/hourly histories.
 class Market {
 public:
-	Market(const std::string& name,
-	       const std::string& path,
-	       const std::string& type);
 	~Market();
 
 	const std::string& name() const;
@@ -68,6 +67,12 @@ public:
 	const History& history(Frequency frequency) const;
 
 private:
+	friend class Markets;
+
+	Market(const std::string& name,
+	       const std::string& path,
+	       const std::string& type);
+
 	std::string name_;
 	std::string path_;
 	std::string type_;
@@ -100,13 +105,27 @@ public:
 	Status update(SymbolId id, const Symbol& symbol);
 	Status remove(SymbolId id);
 	Status list(std::vector<Symbol>* out) const;
-	Status load(const std::string& file_path);
-	Status save(const std::string& file_path) const;
 
 private:
+	friend class Market;
+
+	Status configure_persistence(const std::string& file_path,
+	                             const std::function<Status()>& publish_manifest,
+	                             bool* created);
+	Status load();
+	Status save(const std::map<SymbolId, Symbol>& symbols,
+	            const std::map<std::string, SymbolId>& codes,
+	            SymbolId next_id) const;
+	Status persist(const std::map<SymbolId, Symbol>& symbols,
+	               const std::map<std::string, SymbolId>& codes,
+	               SymbolId next_id);
+
 	std::map<SymbolId, Symbol> by_id_;
 	std::map<std::string, SymbolId> by_code_;
 	SymbolId next_id_;
+	std::string path_;
+	std::function<Status()> publish_manifest_;
+	Status status_;
 };
 
 // Actions owns the dated corporate-action records for one Market. Its records
@@ -115,13 +134,16 @@ class Actions {
 public:
 	Actions();
 
-	Status add(const Action& action, ActionId* out_id);
+	// upsert accepts a source event keyed by Action::external_event_key. A retry
+	// is a no-op; a changed representation with the same key replaces one action.
+	Status upsert(const Action& action);
 	Status get(SymbolId symbol_id,
 	           const std::string& begin,
 	           const std::string& end,
 	           std::vector<Action>* out) const;
-	Status update(ActionId id, const Action& action);
-	Status remove(ActionId id);
+	// remove retracts a source event by its symbol and external key. Removing an
+	// already absent key succeeds so source reconciliation can be retried safely.
+	Status remove(SymbolId symbol_id, const std::string& external_event_key);
 	// adjust transforms a raw bar to the requested corporate-action basis.
 	// Raw actions remain the only persistent representation; the ordered
 	// in-memory anchors are rebuilt whenever the action set changes.
@@ -144,6 +166,7 @@ private:
 	void rebuild_anchors();
 
 	std::map<ActionId, Action> by_id_;
+	std::map<std::pair<SymbolId, std::string>, ActionId> by_external_event_key_;
 	ActionId next_id_;
 	std::map<SymbolId, std::vector<Action> > anchors_;
 	std::string path_;
@@ -194,17 +217,23 @@ private:
 	std::unique_ptr<VaultStore> vault_;
 };
 
-// Markets owns the statically configured Market instances for one process.
-// Its configuration file contains one comma-separated name,type,path entry per
-// line, allowing several market instances to share the same market type.
+// Markets is the root-level zStFS entry point. It reads root/markets.conf once
+// and owns every configured Market and its library-managed storage directory.
 class Markets {
 public:
-	Status load(const std::string& file_path);
+	explicit Markets(const std::string& root_path);
+
+	const std::string& root_path() const;
+	Status status() const;
 	Status get(const std::string& name, Market** out);
 	Status get(const std::string& name, const Market** out) const;
 
 private:
+	Status load_configuration();
+
+	std::string root_path_;
 	std::map<std::string, std::unique_ptr<Market> > by_name_;
+	Status status_;
 };
 
 }  // namespace zstfs

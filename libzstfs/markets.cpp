@@ -1,8 +1,22 @@
+// markets.cpp
+//
+// Owns the root-level configuration boundary for zStFS. The caller supplies a
+// root directory and its fixed markets.conf file; this module creates every
+// market below that root and never lets caller-provided paths select storage.
+
 #include "zstfs/market.h"
 
+#include <cerrno>
+#include <cctype>
 #include <fstream>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 namespace zstfs {
+
+// =============================================================================
+// Root Configuration Parsing
+// markets.conf is intentionally a small immutable startup contract: name,type.
 
 static std::string Trim(const std::string& value) {
 	std::string::size_type begin = value.find_first_not_of(" \t\r\n");
@@ -13,28 +27,68 @@ static std::string Trim(const std::string& value) {
 	return value.substr(begin, end - begin + 1);
 }
 
-static bool ParseMarketLine(const std::string& line,
-                     std::string* name,
-                     std::string* type,
-                     std::string* path) {
-	std::string::size_type first = line.find(',');
-	if (first == std::string::npos) {
+static bool ValidMarketName(const std::string& name) {
+	if (name.empty() || name == "." || name == "..") {
 		return false;
 	}
-	std::string::size_type second = line.find(',', first + 1);
-	if (second == std::string::npos || line.find(',', second + 1) != std::string::npos) {
-		return false;
+	for (std::string::const_iterator it = name.begin(); it != name.end(); ++it) {
+		const unsigned char value = static_cast<unsigned char>(*it);
+		if (!std::isalnum(value) && *it != '_' && *it != '-') {
+			return false;
+		}
 	}
-	*name = Trim(line.substr(0, first));
-	*type = Trim(line.substr(first + 1, second - first - 1));
-	*path = Trim(line.substr(second + 1));
-	return !name->empty() && !type->empty() && !path->empty();
+	return true;
 }
 
-Status Markets::load(const std::string& file_path) {
-	std::ifstream input(file_path.c_str());
+static bool ParseMarketLine(const std::string& line, std::string* name,
+	std::string* type) {
+	const std::string::size_type separator = line.find(',');
+	if (separator == std::string::npos || line.find(',', separator + 1) != std::string::npos) {
+		return false;
+	}
+	*name = Trim(line.substr(0, separator));
+	*type = Trim(line.substr(separator + 1));
+	return ValidMarketName(*name) && !type->empty();
+}
+
+// =============================================================================
+// Root Lifecycle
+// The root and markets.conf belong to the application; market subdirectories
+// are owned exclusively by this library after configuration has been accepted.
+
+Markets::Markets(const std::string& root_path)
+	: root_path_(root_path), by_name_(), status_(Status::Ok()) {
+	status_ = load_configuration();
+}
+
+const std::string& Markets::root_path() const {
+	return root_path_;
+}
+
+Status Markets::status() const {
+	return status_;
+}
+
+Status Markets::load_configuration() {
+	if (root_path_.empty()) {
+		return Status::Error(ErrorCode::InvalidArgument, "zstfs root path is required");
+	}
+	struct stat metadata = {};
+	if (stat(root_path_.c_str(), &metadata) != 0 || !S_ISDIR(metadata.st_mode)) {
+		return Status::Error(ErrorCode::IoError, "zstfs root path is not a directory");
+	}
+	const std::string markets_path = root_path_ + "/markets";
+	if (mkdir(markets_path.c_str(), 0755) != 0 && errno != EEXIST) {
+		return Status::Error(ErrorCode::IoError, "cannot create markets directory");
+	}
+	if (stat(markets_path.c_str(), &metadata) != 0 || !S_ISDIR(metadata.st_mode)) {
+		return Status::Error(ErrorCode::IoError, "markets path is not a directory");
+	}
+
+	const std::string config_path = root_path_ + "/markets.conf";
+	std::ifstream input(config_path.c_str());
 	if (!input) {
-		return Status::Error(ErrorCode::IoError, "failed to open markets config");
+		return Status::Error(ErrorCode::IoError, "cannot open root markets.conf");
 	}
 
 	std::map<std::string, std::unique_ptr<Market> > loaded;
@@ -48,31 +102,40 @@ Status Markets::load(const std::string& file_path) {
 		}
 		std::string name;
 		std::string type;
-		std::string path;
-		if (!ParseMarketLine(line, &name, &type, &path)) {
+		if (!ParseMarketLine(line, &name, &type)) {
 			return Status::Error(ErrorCode::InvalidArgument,
-			                     "invalid markets config line " +
-			                     std::to_string(line_number));
+				"invalid markets.conf line " + std::to_string(line_number));
 		}
-		if (!loaded.insert(std::make_pair(name,
-				std::unique_ptr<Market>(new Market(name, path, type)))).second) {
+		if (loaded.find(name) != loaded.end()) {
 			return Status::Error(ErrorCode::AlreadyPresent,
-			                     "duplicate market name: " + name);
+				"duplicate market name in markets.conf");
 		}
+		const std::string market_path = root_path_ + "/markets/" + name;
+		std::unique_ptr<Market> market(new Market(name, market_path, type));
+		if (!market->status().ok()) {
+			return market->status();
+		}
+		loaded[name] = std::move(market);
 	}
 	if (!input.eof()) {
-		return Status::Error(ErrorCode::IoError, "failed to read markets config");
+		return Status::Error(ErrorCode::IoError, "cannot read root markets.conf");
 	}
+
 	by_name_.swap(loaded);
 	return Status::Ok();
 }
+
+// =============================================================================
+// Market Lookup
 
 Status Markets::get(const std::string& name, Market** out) {
 	if (out == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "market output is required");
 	}
-	std::map<std::string, std::unique_ptr<Market> >::iterator found =
-		by_name_.find(name);
+	if (!status_.ok()) {
+		return status_;
+	}
+	std::map<std::string, std::unique_ptr<Market> >::iterator found = by_name_.find(name);
 	if (found == by_name_.end()) {
 		return Status::Error(ErrorCode::NotFound, "market was not found");
 	}
@@ -84,8 +147,10 @@ Status Markets::get(const std::string& name, const Market** out) const {
 	if (out == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "market output is required");
 	}
-	std::map<std::string, std::unique_ptr<Market> >::const_iterator found =
-		by_name_.find(name);
+	if (!status_.ok()) {
+		return status_;
+	}
+	std::map<std::string, std::unique_ptr<Market> >::const_iterator found = by_name_.find(name);
 	if (found == by_name_.end()) {
 		return Status::Error(ErrorCode::NotFound, "market was not found");
 	}

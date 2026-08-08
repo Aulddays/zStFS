@@ -77,12 +77,42 @@ static bool ParseHourlyTime(const std::string& value,
 	return *hour >= 0 && *hour <= 23 && *minute >= 0 && *minute <= 59;
 }
 
+static int LeapYearsBefore(int year) {
+	const int previous_year = year - 1;
+	return previous_year / 4 - previous_year / 100 + previous_year / 400;
+}
+
 static int DaysBeforeYear(int year) {
-	int total = 0;
-	for (int current = 1900; current < year; ++current) {
-		total += IsLeapYear(current) ? 366 : 365;
+	return (year - 1900) * 365 +
+		LeapYearsBefore(year) - LeapYearsBefore(1900);
+}
+
+// Converts an ordinary Gregorian-day offset from 1900-01-01 without walking
+// every elapsed day. Calendar::date uses this after expanding a compact
+// weekday-only TimeId back to its ordinary-day coordinate.
+static bool DateFromOrdinal(int ordinal, DateParts* out) {
+	if (out == NULL || ordinal < 0 || ordinal >= DaysBeforeYear(10000)) {
+		return false;
 	}
-	return total;
+	int lower_year = 1900;
+	int upper_year = 10000;
+	while (lower_year + 1 < upper_year) {
+		const int middle_year = lower_year + (upper_year - lower_year) / 2;
+		if (DaysBeforeYear(middle_year) <= ordinal) {
+			lower_year = middle_year;
+		} else {
+			upper_year = middle_year;
+		}
+	}
+	out->year = lower_year;
+	int day_of_year = ordinal - DaysBeforeYear(lower_year);
+	out->month = 1;
+	while (day_of_year >= DaysInMonth(out->year, out->month)) {
+		day_of_year -= DaysInMonth(out->year, out->month);
+		++out->month;
+	}
+	out->day = day_of_year + 1;
+	return true;
 }
 
 static int DaysBeforeDate(const DateParts& date) {
@@ -210,26 +240,11 @@ Status Calendar::date(TimeId value, std::string* out) const {
 		return Status::Error(ErrorCode::InvalidArgument,
 		                     "daily time identifier is required");
 	}
-	int ordinal = 0;
-	int remaining = static_cast<int>(time_day(value));
-	while (remaining > 0) {
-		++ordinal;
-		if (!IsWeekendOrdinal(ordinal)) {
-			--remaining;
-		}
-	}
-	DateParts date_parts = {1900, 1, 1};
-	while (ordinal > 0) {
-		++date_parts.day;
-		if (date_parts.day > DaysInMonth(date_parts.year, date_parts.month)) {
-			date_parts.day = 1;
-			++date_parts.month;
-			if (date_parts.month > 12) {
-				date_parts.month = 1;
-				++date_parts.year;
-			}
-		}
-		--ordinal;
+	const int compact_day_number = static_cast<int>(time_day(value));
+	const int ordinal = (compact_day_number / 5) * 7 + compact_day_number % 5;
+	DateParts date_parts = {};
+	if (!DateFromOrdinal(ordinal, &date_parts)) {
+		return Status::Error(ErrorCode::Conflict, "time identifier is outside the calendar range");
 	}
 	char buffer[9];
 	std::snprintf(buffer, sizeof(buffer), "%04d%02d%02d",

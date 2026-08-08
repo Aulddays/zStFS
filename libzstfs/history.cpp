@@ -2125,27 +2125,86 @@ Status VaultStore::ingest(const std::vector<StockTimeBlock>& blocks,
 	if (!status_.ok()) {
 		return status_;
 	}
+	const TimeId block_day_length = frequency_ == Frequency::Daily
+		? kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	// A compaction batch carries bars for many complete blocks. Route them once
+	// so each pending Vault block validates only its own local positions.
+	std::map<std::pair<SymbolId, TimeId>, std::vector<ActiveBar> > bars_by_block;
+	for (size_t i = 0; i < bars.size(); ++i) {
+		const TimeId day = time_day(bars[i].time_id);
+		const TimeId block_id = daily_bar_id(day - day % block_day_length);
+		bars_by_block[std::make_pair(bars[i].symbol_id, block_id)].push_back(bars[i]);
+	}
+
 	std::map<SymbolId, std::vector<VaultPendingBlock> > by_symbol;
+	const std::vector<ActiveBar> empty_bars;
 	for (size_t i = 0; i < blocks.size(); ++i) {
+		const std::pair<SymbolId, TimeId> key(blocks[i].key.symbol_id,
+			blocks[i].key.time_block_id);
+		std::map<std::pair<SymbolId, TimeId>, std::vector<ActiveBar> >::const_iterator found =
+			bars_by_block.find(key);
+		const std::vector<ActiveBar>& block_bars = found == bars_by_block.end()
+			? empty_bars : found->second;
 		VaultPendingBlock pending;
-		Status status = MakeVaultPendingBlock(calendar_, frequency_, blocks[i], bars, &pending);
+		Status status = MakeVaultPendingBlock(calendar_, frequency_, blocks[i], block_bars, &pending);
 		if (!status.ok()) {
 			return status;
 		}
 		by_symbol[blocks[i].key.symbol_id].push_back(pending);
 	}
 	std::vector<Locator> added;
+	const auto append_blob = [&](const std::vector<VaultPendingBlock>& group,
+								const std::vector<uint8_t>& blob) -> Status {
+		const std::string segment_path = VaultSegmentPath(path_, current_segment_id_);
+		std::ifstream existing(segment_path.c_str(), std::ios::binary | std::ios::ate);
+		uint64_t segment_size = existing ? static_cast<uint64_t>(existing.tellg()) : 0;
+		if (segment_size != 0 && segment_size + blob.size() > kVaultSegmentTargetBytes) {
+			++current_segment_id_;
+			segment_size = 0;
+		}
+		const std::string write_path = VaultSegmentPath(path_, current_segment_id_);
+		std::ofstream output(write_path.c_str(), std::ios::binary | std::ios::app);
+		if (!output) {
+			return Status::Error(ErrorCode::IoError, "cannot append vault segment");
+		}
+		output.write(reinterpret_cast<const char*>(&blob[0]), blob.size());
+		output.flush();
+		if (!output) {
+			return Status::Error(ErrorCode::IoError, "cannot write vault blob");
+		}
+		Locator locator = {};
+		locator.symbol_id = group.front().block.key.symbol_id;
+		locator.first_time_block_id = group.front().block.key.time_block_id;
+		locator.last_time_block_id = group.back().block.key.time_block_id;
+		locator.segment_id = current_segment_id_;
+		locator.blob_offset = segment_size;
+		locator.blob_length = static_cast<uint32_t>(blob.size());
+		added.push_back(locator);
+		return Status::Ok();
+	};
 	for (std::map<SymbolId, std::vector<VaultPendingBlock> >::iterator symbol = by_symbol.begin();
 		 symbol != by_symbol.end(); ++symbol) {
 		std::sort(symbol->second.begin(), symbol->second.end(),
 			[](const VaultPendingBlock& left, const VaultPendingBlock& right) {
 				return left.block.key.time_block_id < right.block.key.time_block_id;
 			});
-		std::vector<VaultPendingBlock> group;
+		std::vector<VaultPendingBlock> group(symbol->second);
+		std::vector<uint8_t> blob;
+		Status status = BuildVaultBlob(frequency_, group, &blob);
+		if (status.ok()) {
+			status = append_blob(group, blob);
+			if (!status.ok()) {
+				return status;
+			}
+			continue;
+		}
+
+		// Oversized symbols retain the existing 16 MiB blob partitioning rule.
+		group.clear();
 		for (size_t i = 0; i < symbol->second.size(); ++i) {
 			group.push_back(symbol->second[i]);
-			std::vector<uint8_t> blob;
-			Status status = BuildVaultBlob(frequency_, group, &blob);
+			blob.clear();
+			status = BuildVaultBlob(frequency_, group, &blob);
 			if (!status.ok()) {
 				if (group.size() == 1) {
 					return status;
@@ -2159,31 +2218,10 @@ Status VaultStore::ingest(const std::vector<StockTimeBlock>& blocks,
 			} else if (i + 1 != symbol->second.size()) {
 				continue;
 			}
-			const std::string segment_path = VaultSegmentPath(path_, current_segment_id_);
-			std::ifstream existing(segment_path.c_str(), std::ios::binary | std::ios::ate);
-			uint64_t segment_size = existing ? static_cast<uint64_t>(existing.tellg()) : 0;
-			if (segment_size != 0 && segment_size + blob.size() > kVaultSegmentTargetBytes) {
-				++current_segment_id_;
-				segment_size = 0;
+			status = append_blob(group, blob);
+			if (!status.ok()) {
+				return status;
 			}
-			const std::string write_path = VaultSegmentPath(path_, current_segment_id_);
-			std::ofstream output(write_path.c_str(), std::ios::binary | std::ios::app);
-			if (!output) {
-				return Status::Error(ErrorCode::IoError, "cannot append vault segment");
-			}
-			output.write(reinterpret_cast<const char*>(&blob[0]), blob.size());
-			output.flush();
-			if (!output) {
-				return Status::Error(ErrorCode::IoError, "cannot write vault blob");
-			}
-			Locator locator = {};
-			locator.symbol_id = symbol->first;
-			locator.first_time_block_id = group.front().block.key.time_block_id;
-			locator.last_time_block_id = group.back().block.key.time_block_id;
-			locator.segment_id = current_segment_id_;
-			locator.blob_offset = segment_size;
-			locator.blob_length = static_cast<uint32_t>(blob.size());
-			added.push_back(locator);
 			group.clear();
 		}
 	}
@@ -3262,32 +3300,37 @@ static Status RestoreCompactedStore(const std::string& frequency_path,
 	return Status::Ok();
 }
 
-Status CompactVault(const std::string& market_path,
-					const std::string& market_type,
+Status CompactVault(const std::string& root_path,
+					const std::string& market_name,
 					Frequency frequency,
 					const std::string& cutoff_local_time,
 					VaultCompactionStats* stats) {
-	if (stats == NULL || market_path.empty() || market_type.empty()) {
-		return Status::Error(ErrorCode::InvalidArgument, "market path, type, and compaction stats are required");
+	if (stats == NULL || root_path.empty() || market_name.empty()) {
+		return Status::Error(ErrorCode::InvalidArgument, "root path, market name, and compaction stats are required");
 	}
 	*stats = {};
 	const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 	// Compaction changes two immutable stores as one offline operation. Opening
-	// Market first verifies the published input generation; sync below exposes the
-	// replacement files only after both store publications have completed.
-	Market market("offline-compaction", market_path, market_type);
-	if (!market.status().ok()) {
-		return market.status();
+	// the configured root verifies the published input generation; sync below
+	// exposes replacement files only after both store publications complete.
+	Markets markets(root_path);
+	if (!markets.status().ok()) {
+		return markets.status();
 	}
-	Calendar calendar(market_type);
-	TimeId cutoff = 0;
-	TimeId unused_block = 0;
-	BlockOff unused_offset = 0;
-	Status status = ResolveTime(calendar, frequency, cutoff_local_time, &cutoff, &unused_block, &unused_offset);
+	Market* market = NULL;
+	Status status = markets.get(market_name, &market);
 	if (!status.ok()) {
 		return status;
 	}
-	const std::string frequency_path = FrequencyPath(market_path, frequency);
+	Calendar calendar(market->type());
+	TimeId cutoff = 0;
+	TimeId unused_block = 0;
+	BlockOff unused_offset = 0;
+	status = ResolveTime(calendar, frequency, cutoff_local_time, &cutoff, &unused_block, &unused_offset);
+	if (!status.ok()) {
+		return status;
+	}
+	const std::string frequency_path = FrequencyPath(market->path(), frequency);
 	if (frequency_path.empty()) {
 		return Status::Error(ErrorCode::IoError, "cannot create frequency directory");
 	}
@@ -3567,7 +3610,7 @@ Status CompactVault(const std::string& market_path,
 	if (!status.ok()) {
 		return status;
 	}
-	status = market.sync();
+	status = market->sync();
 	if (!status.ok()) {
 		return status;
 	}

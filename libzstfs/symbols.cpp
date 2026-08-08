@@ -1,9 +1,19 @@
+// symbols.cpp
+//
+// Owns Symbol metadata and its ZSYM v1 persistence. Every accepted mutation
+// replaces the complete file atomically before the Market publishes a manifest
+// for that file, so the in-memory indexes only describe published metadata.
+
 #include "zstfs/market.h"
 
 #include "serialization.h"
 
+#include <cerrno>
+#include <cstdio>
 #include <fstream>
 #include <iterator>
+
+#include <unistd.h>
 
 namespace zstfs {
 
@@ -30,7 +40,45 @@ static bool AliasIsActive(const SymbolAlias& alias, const std::string& date) {
 }
 
 Symbols::Symbols()
-	: next_id_(kInvalidSymbolId + 1) {
+	: next_id_(kInvalidSymbolId + 1), status_(Status::Ok()) {
+}
+
+// Persistence is configured before a Market exposes its Symbols collection.
+// A new empty file is created immediately so Market can include it in its
+// initial manifest publication.
+Status Symbols::configure_persistence(
+	const std::string& file_path,
+	const std::function<Status()>& publish_manifest,
+	bool* created) {
+	if (created == NULL) {
+		return Status::Error(ErrorCode::InvalidArgument, "created is required");
+	}
+	if (file_path.empty() || !publish_manifest) {
+		return Status::Error(ErrorCode::InvalidArgument,
+		                     "symbols persistence configuration is invalid");
+	}
+
+	path_ = file_path;
+	publish_manifest_ = publish_manifest;
+	*created = false;
+	Status loaded = load();
+	if (loaded.ok()) {
+		status_ = Status::Ok();
+		return status_;
+	}
+	if (loaded.code() != ErrorCode::NotFound) {
+		status_ = loaded;
+		return status_;
+	}
+
+	Status saved = save(by_id_, by_code_, next_id_);
+	if (!saved.ok()) {
+		status_ = saved;
+		return status_;
+	}
+	*created = true;
+	status_ = Status::Ok();
+	return status_;
 }
 
 Status Symbols::add(const Symbol& symbol, SymbolId* out_id) {
@@ -63,15 +111,20 @@ Status Symbols::add(const Symbol& symbol, SymbolId* out_id) {
 
 	Symbol stored = symbol;
 	stored.id = next_id_;
-	by_id_[stored.id] = stored;
-	by_code_[stored.code] = stored.id;
+	std::map<SymbolId, Symbol> candidate_symbols = by_id_;
+	std::map<std::string, SymbolId> candidate_codes = by_code_;
+	candidate_symbols[stored.id] = stored;
+	candidate_codes[stored.code] = stored.id;
 	for (std::vector<SymbolAlias>::const_iterator alias = stored.aliases.begin();
 	     alias != stored.aliases.end(); ++alias) {
-		by_code_[alias->code] = stored.id;
+		candidate_codes[alias->code] = stored.id;
 	}
-	*out_id = stored.id;
-	++next_id_;
-	return Status::Ok();
+
+	Status persisted = persist(candidate_symbols, candidate_codes, next_id_ + 1);
+	if (persisted.ok()) {
+		*out_id = stored.id;
+	}
+	return persisted;
 }
 
 Status Symbols::get(SymbolId id, Symbol* out) const {
@@ -170,30 +223,34 @@ Status Symbols::update(SymbolId id, const Symbol& symbol) {
 			                     "invalid or duplicate symbol alias");
 		}
 	}
-	for (std::map<std::string, SymbolId>::iterator it = by_code_.begin();
-	     it != by_code_.end();) {
+	std::map<SymbolId, Symbol> candidate_symbols = by_id_;
+	std::map<std::string, SymbolId> candidate_codes = by_code_;
+	for (std::map<std::string, SymbolId>::iterator it = candidate_codes.begin();
+	     it != candidate_codes.end();) {
 		if (it->second == id) {
-			by_code_.erase(it++);
+			candidate_codes.erase(it++);
 		} else {
 			++it;
 		}
 	}
-	found->second = stored;
-	by_code_[stored.code] = id;
+	candidate_symbols[id] = stored;
+	candidate_codes[stored.code] = id;
 	for (std::vector<SymbolAlias>::const_iterator alias = stored.aliases.begin();
 	     alias != stored.aliases.end(); ++alias) {
-		by_code_[alias->code] = id;
+		candidate_codes[alias->code] = id;
 	}
-	return Status::Ok();
+	return persist(candidate_symbols, candidate_codes, next_id_);
 }
 
 Status Symbols::remove(SymbolId id) {
-	std::map<SymbolId, Symbol>::iterator found = by_id_.find(id);
+	std::map<SymbolId, Symbol>::const_iterator found = by_id_.find(id);
 	if (found == by_id_.end()) {
 		return Status::Error(ErrorCode::NotFound, "symbol was not found");
 	}
-	found->second.state = SymbolState::Retired;
-	return Status::Ok();
+
+	std::map<SymbolId, Symbol> candidate_symbols = by_id_;
+	candidate_symbols[id].state = SymbolState::Retired;
+	return persist(candidate_symbols, by_code_, next_id_);
 }
 
 Status Symbols::list(std::vector<Symbol>* out) const {
@@ -208,7 +265,11 @@ Status Symbols::list(std::vector<Symbol>* out) const {
 	return Status::Ok();
 }
 
-Status Symbols::save(const std::string& file_path) const {
+// save serializes supplied candidate indexes so a failed persistence attempt
+// cannot alter the currently visible Symbols state.
+Status Symbols::save(const std::map<SymbolId, Symbol>& symbols,
+                     const std::map<std::string, SymbolId>& codes,
+                     SymbolId next_id) const {
 	std::vector<uint8_t> data;
 	data.push_back('Z');
 	data.push_back('S');
@@ -216,12 +277,12 @@ Status Symbols::save(const std::string& file_path) const {
 	data.push_back('M');
 	PutU16(&data, kSymbolsVersion);
 	PutU16(&data, 0);
-	PutU32(&data, static_cast<uint32_t>(by_id_.size()));
-	PutU32(&data, static_cast<uint32_t>(by_code_.size()));
-	PutU32(&data, next_id_);
+	PutU32(&data, static_cast<uint32_t>(symbols.size()));
+	PutU32(&data, static_cast<uint32_t>(codes.size()));
+	PutU32(&data, next_id);
 
-	for (std::map<SymbolId, Symbol>::const_iterator it = by_id_.begin();
-	     it != by_id_.end(); ++it) {
+	for (std::map<SymbolId, Symbol>::const_iterator it = symbols.begin();
+	     it != symbols.end(); ++it) {
 		const Symbol& symbol = it->second;
 		std::vector<uint8_t> record;
 		PutU32(&record, symbol.id);
@@ -256,8 +317,8 @@ Status Symbols::save(const std::string& file_path) const {
 		data.insert(data.end(), record.begin(), record.end());
 	}
 
-	for (std::map<std::string, SymbolId>::const_iterator it = by_code_.begin();
-	     it != by_code_.end(); ++it) {
+	for (std::map<std::string, SymbolId>::const_iterator it = codes.begin();
+	     it != codes.end(); ++it) {
 		if (!PutString(&data, it->first)) {
 			return Status::Error(ErrorCode::InvalidArgument,
 			                     "symbol code is too long");
@@ -265,20 +326,53 @@ Status Symbols::save(const std::string& file_path) const {
 		PutU32(&data, it->second);
 	}
 
-	std::ofstream output(file_path.c_str(), std::ios::binary | std::ios::trunc);
+	// The temporary name shares the target directory so rename is an atomic
+	// replacement operation on the file system holding the Market.
+	const std::string temporary = path_ + ".tmp-symbols";
+	std::ofstream output(temporary.c_str(), std::ios::binary | std::ios::trunc);
 	if (!output) {
-		return Status::Error(ErrorCode::IoError, "failed to open symbols file");
+		return Status::Error(ErrorCode::IoError,
+		                     "failed to create symbols temporary file");
 	}
 	output.write(reinterpret_cast<const char*>(&data[0]), data.size());
-	if (!output) {
-		return Status::Error(ErrorCode::IoError, "failed to write symbols file");
+	output.close();
+	if (!output || rename(temporary.c_str(), path_.c_str()) != 0) {
+		unlink(temporary.c_str());
+		return Status::Error(ErrorCode::IoError, "failed to publish symbols file");
 	}
 	return Status::Ok();
 }
 
-Status Symbols::load(const std::string& file_path) {
-	std::ifstream input(file_path.c_str(), std::ios::binary);
+// The manifest is published only after rename has installed the replacement.
+// Candidate indexes become visible only when both persistence steps succeed.
+Status Symbols::persist(const std::map<SymbolId, Symbol>& symbols,
+                        const std::map<std::string, SymbolId>& codes,
+                        SymbolId next_id) {
+	if (path_.empty() || !publish_manifest_) {
+		return Status::Error(ErrorCode::Conflict,
+		                     "symbols persistence is not configured");
+	}
+
+	Status saved = save(symbols, codes, next_id);
+	if (!saved.ok()) {
+		return saved;
+	}
+	Status published = publish_manifest_();
+	if (!published.ok()) {
+		return published;
+	}
+	by_id_ = symbols;
+	by_code_ = codes;
+	next_id_ = next_id;
+	return Status::Ok();
+}
+
+Status Symbols::load() {
+	std::ifstream input(path_.c_str(), std::ios::binary);
 	if (!input) {
+		if (errno == ENOENT) {
+			return Status::Error(ErrorCode::NotFound, "symbols file was not found");
+		}
 		return Status::Error(ErrorCode::IoError, "failed to open symbols file");
 	}
 	std::vector<uint8_t> data((std::istreambuf_iterator<char>(input)),

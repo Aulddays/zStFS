@@ -13,7 +13,7 @@ namespace {
 
 void Usage(const char* program) {
 	std::cerr << "usage: " << program
-		<< " <market-path> <market-type> <daily|hourly> <cutoff-local-time>\n";
+		<< " <root-path> <market-name> <daily|hourly> <cutoff-local-time>\n";
 }
 
 bool ParseFrequency(const std::string& value, zstfs::Frequency* frequency) {

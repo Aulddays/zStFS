@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <dirent.h>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -90,6 +91,39 @@ void RemoveTestDirectory(const std::string& path) {
 	RemoveTree(path);
 }
 
+// MarketFixture models the application-owned root configuration boundary. Each
+// fixture writes the immutable name,type record before opening Markets, which
+// keeps the returned Market valid for all operations in its enclosing scope.
+class MarketFixture {
+public:
+	MarketFixture(const std::string& root_path, const std::string& name,
+		const std::string& type)
+		: name_(name), markets_(), market_(NULL) {
+		std::ofstream config((root_path + "/markets.conf").c_str());
+		assert(config);
+		config << name << "," << type << "\n";
+		config.close();
+
+		markets_.reset(new zstfs::Markets(root_path));
+		ExpectOk(markets_->status());
+		ExpectOk(markets_->get(name_, &market_));
+	}
+
+	zstfs::Market& market() {
+		assert(market_ != NULL);
+		return *market_;
+	}
+
+private:
+	std::string name_;
+	std::unique_ptr<zstfs::Markets> markets_;
+	zstfs::Market* market_;
+};
+
+std::string MarketPath(const std::string& root_path, const std::string& name) {
+	return root_path + "/markets/" + name;
+}
+
 // Builds one complete daily block with a single explicitly present bar. The
 // remaining positions are intentionally Missing so the Vault test exercises
 // its persisted presence bitmap as well as sparse numeric frame locators.
@@ -124,7 +158,8 @@ void TestDailyWriteReadAndRecovery() {
 	const std::string path = MakeTestDirectory();
 	const zstfs::SymbolId symbol_id = 7;
 	{
-		zstfs::Market market("active-test", path, "CNA");
+		MarketFixture fixture(path, "active-test", "CNA");
+		zstfs::Market& market = fixture.market();
 		zstfs::History& history = market.history(zstfs::Frequency::Daily);
 		zstfs::History& hourly = market.history(zstfs::Frequency::Hourly);
 		ExpectOk(hourly.put(BarFor(symbol_id, zstfs::Frequency::Hourly,
@@ -162,12 +197,13 @@ void TestDailyWriteReadAndRecovery() {
 		assert(values[4].state == zstfs::BarState::Missing);
 		ExpectOk(history.flush());
 	}
-	std::ofstream tail((path + "/daily/active.data").c_str(),
+	std::ofstream tail((MarketPath(path, "active-test") + "/daily/active.data").c_str(),
 		std::ios::binary | std::ios::app);
 	tail.write("tail", 4);
 	tail.close();
 	{
-		zstfs::Market market("active-test", path, "CNA");
+		MarketFixture fixture(path, "active-test", "CNA");
+		zstfs::Market& market = fixture.market();
 		zstfs::History& history = market.history(zstfs::Frequency::Daily);
 		zstfs::Bar bar = {};
 		ExpectOk(history.get(symbol_id, "20260804", &bar));
@@ -193,7 +229,8 @@ void TestDailyWriteReadAndRecovery() {
 		assert(bar.close == 10.0);
 	}
 	{
-		zstfs::Market market("active-test", path, "CNA");
+		MarketFixture fixture(path, "active-test", "CNA");
+		zstfs::Market& market = fixture.market();
 		zstfs::Bar bar = {};
 		ExpectOk(market.history(zstfs::Frequency::Daily).get(
 			symbol_id, "20260803", &bar));
@@ -321,7 +358,8 @@ void TestHourlyOrderingAndCanonicalSlots() {
 	const std::string path = MakeTestDirectory();
 	const zstfs::SymbolId symbol_id = 8;
 	{
-		zstfs::Market market("active-hourly", path, "CNA");
+		MarketFixture fixture(path, "active-hourly", "CNA");
+		zstfs::Market& market = fixture.market();
 		zstfs::History& history = market.history(zstfs::Frequency::Hourly);
 		ExpectOk(history.put(BarFor(symbol_id, zstfs::Frequency::Hourly,
 			"20260803-1400", 20.0)));
@@ -351,9 +389,11 @@ void TestVaultPersistenceMergeAndCorruption() {
 		// This fixture uses VaultStore directly to exercise its persistent format.
 		// Market::sync publishes the completed internal write as a valid generation
 		// before the next Market open verifies and consumes it.
-		zstfs::Market bootstrap("vault-bootstrap", path, "CNA");
+		MarketFixture fixture(path, "vault-test", "CNA");
+		zstfs::Market& bootstrap = fixture.market();
 		{
-			zstfs::VaultStore vault(zstfs::Frequency::Daily, calendar, path + "/daily", 1001);
+			zstfs::VaultStore vault(zstfs::Frequency::Daily, calendar,
+				MarketPath(path, "vault-test") + "/daily", 1001);
 			IngestVaultBar(&vault, calendar, corrupt_symbol, "20260805", 12.0);
 			IngestVaultBar(&vault, calendar, corrupt_symbol, "20260803", 10.0);
 			IngestVaultBar(&vault, calendar, corrupt_symbol, "20260804", 11.0);
@@ -367,7 +407,8 @@ void TestVaultPersistenceMergeAndCorruption() {
 		ExpectOk(bootstrap.sync());
 	}
 	{
-		zstfs::Market market("vault-read", path, "CNA");
+		MarketFixture fixture(path, "vault-test", "CNA");
+		zstfs::Market& market = fixture.market();
 		zstfs::History& history = market.history(zstfs::Frequency::Daily);
 		zstfs::Bar bar = {};
 		ExpectOk(history.get(corrupt_symbol, "20260803", &bar));
@@ -405,24 +446,26 @@ void TestVaultPersistenceMergeAndCorruption() {
 	// or Staging value cannot legitimately mask the damaged Vault target. Publish
 	// the intentionally reduced fixture before corrupting a Vault payload in place.
 	{
-		zstfs::Market cleanup("vault-cleanup", path, "CNA");
-		std::remove((path + "/daily/active.data").c_str());
-		std::remove((path + "/daily/staging-index").c_str());
-		std::remove((path + "/daily/staging-pages-0001.seg").c_str());
+		MarketFixture fixture(path, "vault-test", "CNA");
+		zstfs::Market& cleanup = fixture.market();
+		std::remove((MarketPath(path, "vault-test") + "/daily/active.data").c_str());
+		std::remove((MarketPath(path, "vault-test") + "/daily/staging-index").c_str());
+		std::remove((MarketPath(path, "vault-test") + "/daily/staging-pages-0001.seg").c_str());
 		ExpectOk(cleanup.sync());
 	}
 
 	// A fresh runtime namespace cannot reuse the prior compressed cache. Corrupt
 	// one blob and verify a target get exposes no result while range retains the
 	// independently readable symbol in sorted partial output.
-	std::fstream corrupt((path + "/daily/vault-0001.seg").c_str(),
+	std::fstream corrupt((MarketPath(path, "vault-test") + "/daily/vault-0001.seg").c_str(),
 		std::ios::binary | std::ios::in | std::ios::out);
 	assert(corrupt);
 	corrupt.seekp(0);
 	corrupt.write("X", 1);
 	corrupt.close();
 	{
-		zstfs::Market market("vault-corrupt", path, "CNA");
+		MarketFixture fixture(path, "vault-test", "CNA");
+		zstfs::Market& market = fixture.market();
 		zstfs::History& history = market.history(zstfs::Frequency::Daily);
 		zstfs::Bar bar = BarFor(corrupt_symbol, zstfs::Frequency::Daily, "20260805", 999.0);
 		assert(history.get(corrupt_symbol, "20260805", &bar).code() == zstfs::ErrorCode::CorruptData);
@@ -445,7 +488,8 @@ void TestManifestAndActions() {
 	const zstfs::SymbolId symbol_id = 73;
 	const std::string path = MakeTestDirectory();
 	{
-		zstfs::Market market("manifest-actions", path, "CNA");
+		MarketFixture fixture(path, "manifest-actions", "CNA");
+		zstfs::Market& market = fixture.market();
 		ExpectOk(market.status());
 		zstfs::History& history = market.history(zstfs::Frequency::Daily);
 		ExpectOk(history.put(BarFor(symbol_id, zstfs::Frequency::Daily, "20260803", 100.0)));
@@ -453,27 +497,27 @@ void TestManifestAndActions() {
 		ExpectOk(history.put(MissingBar(symbol_id, zstfs::Frequency::Daily, "20260805")));
 
 		zstfs::Action split = {};
+		split.external_event_key = "provider-a:split:20260804:73";
 		split.symbol_id = symbol_id;
 		split.effective_date = "20260804";
 		split.type = zstfs::ActionType::Split;
 		split.factor = 2.0;
-		zstfs::ActionId split_id = zstfs::kInvalidActionId;
-		ExpectOk(market.actions().add(split, &split_id));
+		ExpectOk(market.actions().upsert(split));
 
 		zstfs::Action dividend = {};
+		dividend.external_event_key = "provider-a:cash-dividend:20260805:73";
 		dividend.symbol_id = symbol_id;
 		dividend.effective_date = "20260805";
 		dividend.type = zstfs::ActionType::CashDividend;
 		dividend.cash_value = 5.0;
-		zstfs::ActionId dividend_id = zstfs::kInvalidActionId;
-		ExpectOk(market.actions().add(dividend, &dividend_id));
-		assert(split_id < dividend_id);
+		ExpectOk(market.actions().upsert(dividend));
 
-		std::ofstream temporary((path + "/daily/orphan.tmp-page").c_str());
+		std::ofstream temporary((MarketPath(path, "manifest-actions") + "/daily/orphan.tmp-page").c_str());
 		temporary << "unpublished";
 	}
 	{
-		zstfs::Market market("manifest-actions", path, "CNA");
+		MarketFixture fixture(path, "manifest-actions", "CNA");
+		zstfs::Market& market = fixture.market();
 		ExpectOk(market.status());
 		std::vector<zstfs::Action> actions;
 		ExpectOk(market.actions().get(symbol_id, "20260803", "20260805", &actions));
@@ -488,9 +532,16 @@ void TestManifestAndActions() {
 		ExpectOk(history.get(symbol_id, "20260803", "20260803",
 			zstfs::AdjustMode::Backward, &values));
 		assert(values.size() == 1 && values[0].close == 45.0 && values[0].volume == 200.0);
+
+		zstfs::Action corrected_split = actions[0];
+		corrected_split.factor = 4.0;
+		ExpectOk(market.actions().upsert(corrected_split));
+		ExpectOk(history.get(symbol_id, "20260803", "20260803",
+			zstfs::AdjustMode::Backward, &values));
+		assert(values.size() == 1 && values[0].close == 20.0 && values[0].volume == 400.0);
 		ExpectOk(history.get(symbol_id, "20260804", "20260804",
 			zstfs::AdjustMode::Forward, &values));
-		assert(values.size() == 1 && values[0].close == 120.0 && values[0].volume == 50.0);
+		assert(values.size() == 1 && values[0].close == 240.0 && values[0].volume == 25.0);
 		ExpectOk(history.get(symbol_id, "20260805", "20260805",
 			zstfs::AdjustMode::Backward, &values));
 		assert(values.size() == 1 && values[0].state == zstfs::BarState::Missing &&
@@ -500,26 +551,28 @@ void TestManifestAndActions() {
 
 	const std::string missing_path = MakeTestDirectory();
 	{
-		zstfs::Market market("missing-manifest", missing_path, "CNA");
+		MarketFixture fixture(missing_path, "missing-manifest", "CNA");
+		zstfs::Market& market = fixture.market();
 		ExpectOk(market.status());
 	}
-	assert(unlink((missing_path + "/manifest").c_str()) == 0);
-	zstfs::Market missing("missing-manifest", missing_path, "CNA");
-	assert(missing.status().code() == zstfs::ErrorCode::CorruptData);
+	assert(unlink((MarketPath(missing_path, "missing-manifest") + "/manifest").c_str()) == 0);
+	zstfs::Markets missing_markets(missing_path);
+	assert(missing_markets.status().code() == zstfs::ErrorCode::CorruptData);
 	RemoveTestDirectory(missing_path);
 
 	const std::string corrupt_path = MakeTestDirectory();
 	{
-		zstfs::Market market("corrupt-manifest", corrupt_path, "CNA");
+		MarketFixture fixture(corrupt_path, "corrupt-manifest", "CNA");
+		zstfs::Market& market = fixture.market();
 		ExpectOk(market.status());
 	}
-	std::fstream corrupt((corrupt_path + "/manifest").c_str(),
+	std::fstream corrupt((MarketPath(corrupt_path, "corrupt-manifest") + "/manifest").c_str(),
 		std::ios::in | std::ios::out | std::ios::binary);
 	assert(corrupt);
 	corrupt.write("X", 1);
 	corrupt.close();
-	zstfs::Market corrupt_market("corrupt-manifest", corrupt_path, "CNA");
-	assert(corrupt_market.status().code() == zstfs::ErrorCode::CorruptData);
+	zstfs::Markets corrupt_markets(corrupt_path);
+	assert(corrupt_markets.status().code() == zstfs::ErrorCode::CorruptData);
 	RemoveTestDirectory(corrupt_path);
 }
 
@@ -528,7 +581,8 @@ void TestManifestAndActions() {
 // treating the block timestamp as a coarse retention boundary.
 void PopulateCompactionFixture(const std::string& path) {
 	const zstfs::SymbolId symbol_id = 61;
-	zstfs::Market bootstrap("compaction-bootstrap", path, "CNA");
+	MarketFixture fixture(path, "compaction-test", "CNA");
+	zstfs::Market& bootstrap = fixture.market();
 	ExpectOk(bootstrap.status());
 	zstfs::Calendar calendar("CNA");
 	zstfs::TimeId block_id = 0;
@@ -559,9 +613,11 @@ void PopulateCompactionFixture(const std::string& path) {
 		staged_bars.push_back({symbol_id, time_id, staged.positions[offset]});
 	}
 	{
-		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, path + "/daily");
+		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar,
+			MarketPath(path, "compaction-test") + "/daily");
 		ExpectOk(staging.accept(std::vector<zstfs::StockTimeBlock>(1, staged), staged_bars));
-		zstfs::VaultStore vault(zstfs::Frequency::Daily, calendar, path + "/daily", 991);
+		zstfs::VaultStore vault(zstfs::Frequency::Daily, calendar,
+			MarketPath(path, "compaction-test") + "/daily", 991);
 		IngestVaultBar(&vault, calendar, symbol_id, "20270105", 50.0);
 	}
 	ExpectOk(bootstrap.sync());
@@ -594,8 +650,8 @@ void TestOfflineVaultCompaction() {
 	PopulateCompactionFixture(duplicate_path);
 	zstfs::VaultCompactionStats stats = {};
 	zstfs::VaultCompactionStats duplicate_stats = {};
-	ExpectOk(zstfs::CompactVault(path, "CNA", zstfs::Frequency::Daily, "20260805", &stats));
-	ExpectOk(zstfs::CompactVault(duplicate_path, "CNA", zstfs::Frequency::Daily, "20260805",
+	ExpectOk(zstfs::CompactVault(path, "compaction-test", zstfs::Frequency::Daily, "20260805", &stats));
+	ExpectOk(zstfs::CompactVault(duplicate_path, "compaction-test", zstfs::Frequency::Daily, "20260805",
 		&duplicate_stats));
 	assert(stats.input_blocks >= 2);
 	assert(stats.output_blocks >= 3);
@@ -604,10 +660,11 @@ void TestOfflineVaultCompaction() {
 	assert(stats.output_blocks == duplicate_stats.output_blocks);
 	assert(stats.temporary_bytes == duplicate_stats.temporary_bytes);
 	assert(stats.io_bytes == duplicate_stats.io_bytes);
-	assert(HasBackupDirectory(path + "/daily", "vault."));
-	assert(HasBackupDirectory(path + "/daily", "staging."));
+	assert(HasBackupDirectory(MarketPath(path, "compaction-test") + "/daily", "vault."));
+	assert(HasBackupDirectory(MarketPath(path, "compaction-test") + "/daily", "staging."));
 	{
-		zstfs::Market market("compact-restart", path, "CNA");
+		MarketFixture fixture(path, "compaction-test", "CNA");
+		zstfs::Market& market = fixture.market();
 		zstfs::History& history = market.history(zstfs::Frequency::Daily);
 		zstfs::Bar bar = {};
 		ExpectOk(history.get(symbol_id, "20260803", &bar));

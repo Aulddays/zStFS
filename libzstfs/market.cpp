@@ -98,6 +98,13 @@ Status ListDirectory(const std::string& directory,
 Status CurrentFiles(const std::string& market_path, std::vector<ManifestFile>* files) {
 	files->clear();
 	struct stat metadata = {};
+	const std::string symbols_path = market_path + "/symbols.bin";
+	if (stat(symbols_path.c_str(), &metadata) == 0) {
+		if (!S_ISREG(metadata.st_mode)) {
+			return Status::Error(ErrorCode::CorruptData, "symbols.bin is not a regular file");
+		}
+		files->push_back(ManifestFile{"symbols.bin", static_cast<uint64_t>(metadata.st_size)});
+	}
 	const std::string actions_path = market_path + "/actions.bin";
 	if (stat(actions_path.c_str(), &metadata) == 0) {
 		if (!S_ISREG(metadata.st_mode)) {
@@ -162,7 +169,7 @@ Status ParseManifest(const std::vector<uint8_t>& bytes, uint64_t* generation,
 				[&file](const ManifestFile& other) { return SameManifestName(file, other); }) != files->end()) {
 			return Status::Error(ErrorCode::CorruptData, "invalid manifest file set");
 		}
-		if (file.name != "actions.bin" &&
+		if (file.name != "symbols.bin" && file.name != "actions.bin" &&
 			file.name.compare(0, 6, "daily/") != 0 &&
 			file.name.compare(0, 7, "hourly/") != 0) {
 			return Status::Error(ErrorCode::CorruptData, "manifest contains an unknown file");
@@ -264,15 +271,19 @@ Market::Market(const std::string& name, const std::string& path,
 	symbols_(new Symbols()), actions_(new Actions()), daily_history_(),
 	hourly_history_(), status_(Status::Ok()), manifest_generation_(0),
 	manifest_loaded_(false) {
+	bool symbols_created = false;
 	status_ = initialize_storage();
 	if (status_.ok()) {
 		status_ = load_or_bootstrap_manifest();
 	}
-	if (status_.ok()) {
-		status_ = actions_->configure_persistence(path_ + "/actions.bin",
-			std::bind(&Market::publish_manifest, this));
-	}
 	const std::function<Status()> publish = std::bind(&Market::publish_manifest, this);
+	if (status_.ok()) {
+		status_ = symbols_->configure_persistence(path_ + "/symbols.bin", publish,
+			&symbols_created);
+	}
+	if (status_.ok()) {
+		status_ = actions_->configure_persistence(path_ + "/actions.bin", publish);
+	}
 	daily_history_.reset(new History(Frequency::Daily, *calendar_, path_, *actions_,
 		publish, status_));
 	hourly_history_.reset(new History(Frequency::Hourly, *calendar_, path_, *actions_,
@@ -282,7 +293,7 @@ Market::Market(const std::string& name, const std::string& path,
 			status_ = daily_history_->status();
 		} else if (!hourly_history_->status().ok()) {
 			status_ = hourly_history_->status();
-		} else if (!manifest_loaded_) {
+		} else if (!manifest_loaded_ || symbols_created) {
 			status_ = publish_manifest();
 		}
 	}

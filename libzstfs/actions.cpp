@@ -1,9 +1,11 @@
 // actions.cpp
 //
-// Owns raw corporate actions and their durable ZAC8 representation. Actions
-// are written as one complete replacement file, then the Market publishes a
-// manifest describing that accepted file. Adjustment anchors are derived only
-// in memory so persisted data remains auditable and lossless.
+// Owns raw corporate actions and their durable ZAC8 representation. Stable
+// source event keys make retries, corrections, and withdrawals idempotent;
+// the library maps those keys to private Action IDs. Actions are written as one
+// complete replacement file, then the Market publishes a manifest describing
+// that accepted file. Adjustment anchors are derived only in memory so
+// persisted data remains auditable and lossless.
 
 #include "zstfs/market.h"
 
@@ -11,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -43,7 +46,13 @@ Status Actions::status() const {
 // ZAC8 Persistence
 // ZAC8 retains raw events only; adjustment anchors remain in memory.
 
-static const uint16_t kActionsVersion = 1;
+static const uint16_t kActionsVersion = 2;
+static const std::string::size_type kMaxExternalEventKeyLength = 65535;
+typedef std::pair<SymbolId, std::string> ExternalActionKey;
+
+static ExternalActionKey ActionKey(const Action& action) {
+	return ExternalActionKey(action.symbol_id, action.external_event_key);
+}
 
 static bool ValidActionType(ActionType type) {
 	const int value = static_cast<int>(type);
@@ -52,7 +61,9 @@ static bool ValidActionType(ActionType type) {
 }
 
 static bool ValidAction(const Action& action) {
-	if (action.symbol_id == kInvalidSymbolId || action.effective_date.empty() ||
+	if (action.external_event_key.empty() ||
+		action.external_event_key.size() > kMaxExternalEventKeyLength ||
+		action.symbol_id == kInvalidSymbolId || action.effective_date.empty() ||
 		!ValidActionType(action.type) || !std::isfinite(action.factor) ||
 		!std::isfinite(action.cash_value)) {
 		return false;
@@ -75,6 +86,7 @@ static void PutAction(std::vector<uint8_t>* bytes, const Action& action) {
 	PutDouble(bytes, action.factor);
 	PutDouble(bytes, action.cash_value);
 	PutString(bytes, action.effective_date);
+	PutString(bytes, action.external_event_key);
 }
 
 static bool GetAction(const std::vector<uint8_t>& bytes, size_t* offset, Action* action) {
@@ -88,7 +100,8 @@ static bool GetAction(const std::vector<uint8_t>& bytes, size_t* offset, Action*
 		!GetU16(bytes, offset, &reserved16) || reserved8 != 0 || reserved16 != 0 ||
 		!GetDouble(bytes, offset, &action->factor) ||
 		!GetDouble(bytes, offset, &action->cash_value) ||
-		!GetString(bytes, offset, &action->effective_date)) {
+		!GetString(bytes, offset, &action->effective_date) ||
+		!GetString(bytes, offset, &action->external_event_key)) {
 		return false;
 	}
 	action->id = id;
@@ -99,6 +112,7 @@ static bool GetAction(const std::vector<uint8_t>& bytes, size_t* offset, Action*
 
 Status Actions::load() {
 	by_id_.clear();
+	by_external_event_key_.clear();
 	anchors_.clear();
 	next_id_ = kInvalidActionId + 1;
 	std::ifstream input(path_.c_str(), std::ios::binary);
@@ -125,19 +139,25 @@ Status Actions::load() {
 	offset = 4;
 	if (!GetU16(bytes, &offset, &version) || !GetU16(bytes, &offset, &reserved) ||
 		!GetU32(bytes, &offset, &count) || !GetU32(bytes, &offset, &persisted_next_id) ||
-		version != kActionsVersion || reserved != 0 || persisted_next_id == 0 ||
-		count > bytes.size()) {
+		reserved != 0 || persisted_next_id == 0 || count > bytes.size()) {
 		status_ = Status::Error(ErrorCode::CorruptData, "invalid actions.bin header");
+		return status_;
+	}
+	if (version != kActionsVersion) {
+		status_ = Status::Error(ErrorCode::CorruptData,
+			"unsupported actions.bin version; reimport corporate actions");
 		return status_;
 	}
 	ActionId max_id = kInvalidActionId;
 	for (uint32_t i = 0; i < count; ++i) {
 		Action action = {};
-		if (!GetAction(bytes, &offset, &action) || by_id_.find(action.id) != by_id_.end()) {
+		if (!GetAction(bytes, &offset, &action) || by_id_.find(action.id) != by_id_.end() ||
+			by_external_event_key_.find(ActionKey(action)) != by_external_event_key_.end()) {
 			status_ = Status::Error(ErrorCode::CorruptData, "invalid actions.bin record");
 			return status_;
 		}
 		by_id_[action.id] = action;
+		by_external_event_key_[ActionKey(action)] = action.id;
 		max_id = std::max(max_id, action.id);
 	}
 	if (offset != bytes.size() || persisted_next_id <= max_id) {
@@ -182,6 +202,15 @@ Status Actions::save(const std::map<ActionId, Action>& actions,
 
 Status Actions::persist(const std::map<ActionId, Action>& actions,
 	ActionId next_id) {
+	std::map<ExternalActionKey, ActionId> external_event_keys;
+	for (std::map<ActionId, Action>::const_iterator it = actions.begin();
+		 it != actions.end(); ++it) {
+		if (!ValidAction(it->second) ||
+			external_event_keys.find(ActionKey(it->second)) != external_event_keys.end()) {
+			return Status::Error(ErrorCode::InvalidArgument, "invalid action set");
+		}
+		external_event_keys[ActionKey(it->second)] = it->first;
+	}
 	Status status = save(actions, next_id);
 	if (!status.ok()) {
 		return status;
@@ -193,6 +222,7 @@ Status Actions::persist(const std::map<ActionId, Action>& actions,
 		}
 	}
 	by_id_ = actions;
+	by_external_event_key_ = external_event_keys;
 	next_id_ = next_id;
 	rebuild_anchors();
 	status_ = Status::Ok();
@@ -210,28 +240,47 @@ static bool ActionOrder(const Action& left, const Action& right) {
 	return left.id < right.id;
 }
 
-Status Actions::add(const Action& action, ActionId* out_id) {
+static bool SameAction(const Action& left, const Action& right) {
+	return left.id == right.id &&
+		left.external_event_key == right.external_event_key &&
+		left.symbol_id == right.symbol_id &&
+		left.effective_date == right.effective_date &&
+		left.type == right.type && left.factor == right.factor &&
+		left.cash_value == right.cash_value;
+}
+
+Status Actions::upsert(const Action& action) {
 	if (!status_.ok()) {
 		return status_;
-	}
-	if (out_id == NULL) {
-		return Status::Error(ErrorCode::InvalidArgument, "out_id is required");
 	}
 	if (!ValidAction(action)) {
 		return Status::Error(ErrorCode::InvalidArgument, "invalid action");
 	}
-	if (next_id_ == kInvalidActionId) {
-		return Status::Error(ErrorCode::Conflict, "action identifier space is exhausted");
+	std::map<ExternalActionKey, ActionId>::const_iterator existing =
+		by_external_event_key_.find(ActionKey(action));
+	if (existing == by_external_event_key_.end()) {
+		if (next_id_ == kInvalidActionId) {
+			return Status::Error(ErrorCode::Conflict, "action identifier space is exhausted");
+		}
+		Action stored = action;
+		stored.id = next_id_;
+		std::map<ActionId, Action> candidate = by_id_;
+		candidate[stored.id] = stored;
+		return persist(candidate, next_id_ + 1);
 	}
+
 	Action stored = action;
-	stored.id = next_id_;
+	stored.id = existing->second;
+	std::map<ActionId, Action>::const_iterator current = by_id_.find(stored.id);
+	if (current == by_id_.end()) {
+		return Status::Error(ErrorCode::CorruptData, "action key index is invalid");
+	}
+	if (SameAction(current->second, stored)) {
+		return Status::Ok();
+	}
 	std::map<ActionId, Action> candidate = by_id_;
 	candidate[stored.id] = stored;
-	Status status = persist(candidate, next_id_ + 1);
-	if (status.ok()) {
-		*out_id = stored.id;
-	}
-	return status;
+	return persist(candidate, next_id_);
 }
 
 Status Actions::get(SymbolId symbol_id, const std::string& begin,
@@ -258,33 +307,21 @@ Status Actions::get(SymbolId symbol_id, const std::string& begin,
 	return Status::Ok();
 }
 
-Status Actions::update(ActionId id, const Action& action) {
+Status Actions::remove(SymbolId symbol_id, const std::string& external_event_key) {
 	if (!status_.ok()) {
 		return status_;
 	}
-	if (!ValidAction(action)) {
-		return Status::Error(ErrorCode::InvalidArgument, "invalid action");
+	if (symbol_id == kInvalidSymbolId || external_event_key.empty() ||
+		external_event_key.size() > kMaxExternalEventKeyLength) {
+		return Status::Error(ErrorCode::InvalidArgument, "invalid external action key");
 	}
-	std::map<ActionId, Action>::const_iterator found = by_id_.find(id);
-	if (found == by_id_.end()) {
-		return Status::Error(ErrorCode::NotFound, "action was not found");
-	}
-	Action stored = action;
-	stored.id = id;
-	std::map<ActionId, Action> candidate = by_id_;
-	candidate[id] = stored;
-	return persist(candidate, next_id_);
-}
-
-Status Actions::remove(ActionId id) {
-	if (!status_.ok()) {
-		return status_;
-	}
-	if (by_id_.find(id) == by_id_.end()) {
-		return Status::Error(ErrorCode::NotFound, "action was not found");
+	std::map<ExternalActionKey, ActionId>::const_iterator found =
+		by_external_event_key_.find(ExternalActionKey(symbol_id, external_event_key));
+	if (found == by_external_event_key_.end()) {
+		return Status::Ok();
 	}
 	std::map<ActionId, Action> candidate = by_id_;
-	candidate.erase(id);
+	candidate.erase(found->second);
 	return persist(candidate, next_id_);
 }
 

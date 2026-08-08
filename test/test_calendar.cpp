@@ -34,6 +34,15 @@ int main() {
 	assert(calendar.date(zstfs::daily_bar_id(5), &date).ok());
 	assert(date == "19000108");
 
+	// The inverse weekday coordinate must remain exact across leap years and
+	// long historical ranges because hourly block positioning uses it repeatedly.
+	const char* round_trip_dates[] = {"19000228", "19000301", "20000229", "20260807"};
+	for (size_t index = 0; index < sizeof(round_trip_dates) / sizeof(round_trip_dates[0]); ++index) {
+		assert(calendar.time_id(round_trip_dates[index], &day_time_id).ok());
+		assert(calendar.date(day_time_id, &date).ok());
+		assert(date == round_trip_dates[index]);
+	}
+
 	zstfs::HourSlot slot = 0;
 	assert(calendar.hour_slot("19000101-0939", &slot).ok());
 	assert(slot == 93);
