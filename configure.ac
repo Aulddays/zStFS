@@ -24,5 +24,6 @@ AC_CONFIG_FILES([
 	libzstfs/Makefile
 	test/Makefile
 	makevault/Makefile
+	daemon/Makefile
 ])
 AC_OUTPUT

@@ -6,6 +6,7 @@ libzstfs_a_SOURCES = \
 	calendar.cpp \
 	symbols.cpp \
 	actions.cpp \
+	store.cpp \
 	history.cpp \
 	market.cpp \
 	markets.cpp \
