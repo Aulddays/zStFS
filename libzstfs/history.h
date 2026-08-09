@@ -1,6 +1,6 @@
 // history.h
 //
-// Defines the calendar-addressed block and frame structures used inside
+// Defines the calendar-addressed block and active-store structures used inside
 // History. Public callers only operate on complete Bar records.
 
 #pragma once
@@ -29,15 +29,6 @@ struct BlockKey {
 	TimeId time_block_id;
 };
 
-struct BlockBar {
-	BarState state;
-	double open;
-	double high;
-	double low;
-	double close;
-	double volume;
-};
-
 struct StockTimeBlock {
 	BlockKey key;
 	// One bit identifies whether this symbol has any data on a day in the
@@ -50,41 +41,6 @@ struct StockTimeBlock {
 	std::vector<BlockBar> positions;
 };
 
-// Microblock is one field's sequence from one StockTimeBlock.
-struct Microblock {
-	FieldId field;
-	BlockOff first_offset;
-	std::vector<int64_t> values;
-};
-
-// EncodeFieldFrames turns a block's positions into independent normal runs.
-// Invalid normal values are treated as missing positions and therefore split
-// the output just like an explicit non-normal state.
-Status EncodeFieldFrames(FieldId field,
-                         BlockOff first_offset,
-                         const std::vector<BlockBar>& positions,
-                         const PrecisionProfile& profile,
-                         std::vector<MicroblockFrame>* output);
-
-// State frames cover all positions, including non-normal values, and use a
-// compact run representation independent of numeric quantization.
-Status EncodeStateFrame(BlockOff first_offset,
-                        const std::vector<BlockBar>& positions,
-                        MicroblockFrame* output);
-Status DecodeStateFrame(const MicroblockFrame& frame,
-                        std::vector<BarState>* states);
-
-// A complete block uses one state frame plus independent field frames. The
-// combined decoder restores the OHLC ordering constraints after quantization.
-Status EncodeOhlcvFrames(BlockOff first_offset,
-                         const std::vector<BlockBar>& positions,
-                         const PrecisionProfile& profile,
-                         std::vector<MicroblockFrame>* output);
-Status DecodeOhlcvFrames(BlockOff first_offset,
-                         BlockOff position_count,
-                         const std::vector<MicroblockFrame>& frames,
-                         const PrecisionProfile& profile,
-                         std::vector<BlockBar>* positions);
 
 // ActiveStore keeps mutable positions grouped by block so sealing can hand one
 // complete StockTimeBlock to the next layer. It also owns the low-frequency
@@ -184,7 +140,8 @@ public:
 	             const std::string& frequency_path);
 
 	Status accept(const std::vector<StockTimeBlock>& blocks,
-	              const std::vector<ActiveBar>& bars);
+	              const std::vector<ActiveBar>& bars,
+	              const std::vector<std::vector<uint8_t> >* frame_bytes = NULL);
 	bool contains(SymbolId symbol_id, TimeId time_id) const;
 	Status get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const;
 	Status range(const std::vector<SymbolId>& symbol_ids,
@@ -193,8 +150,11 @@ public:
 	             std::vector<ActiveBar>* out) const;
 	// snapshot exposes complete logical records to the offline compactor without
 	// exposing the persistent Staging page layout outside this implementation.
+	// When requested, frame_bytes is aligned with blocks and contains immutable
+	// BarBlockFrame bytes for direct Vault migration.
 	Status snapshot(std::vector<StockTimeBlock>* blocks,
-	                std::vector<ActiveBar>* bars) const;
+	                std::vector<ActiveBar>* bars,
+	                std::vector<std::vector<uint8_t> >* frame_bytes = NULL) const;
 
 private:
 	struct Locator {
@@ -207,6 +167,7 @@ private:
 	struct Entry {
 		StockTimeBlock block;
 		std::vector<ActiveBar> bars;
+		std::vector<uint8_t> frame_bytes;
 	};
 
 	Status load();
@@ -236,7 +197,8 @@ public:
 	// Appends completed blocks as symbol-ordered ZVB6 blobs and publishes their
 	// locators in the persistent Vault index.
 	Status ingest(const std::vector<StockTimeBlock>& blocks,
-	              const std::vector<ActiveBar>& bars);
+	              const std::vector<ActiveBar>& bars,
+	              const std::vector<std::vector<uint8_t> >* frame_bytes = NULL);
 	bool contains(SymbolId symbol_id, TimeId time_id) const;
 	Status get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const;
 	Status range(const std::vector<SymbolId>& symbol_ids,
@@ -244,8 +206,11 @@ public:
 	             TimeId end,
 	             std::vector<ActiveBar>* out) const;
 	// snapshot reconstructs complete logical records from immutable Vault blobs.
+	// frame_bytes, when requested, is aligned with blocks for byte-preserving
+	// compaction into a replacement Vault generation.
 	Status snapshot(std::vector<StockTimeBlock>* blocks,
-	                std::vector<ActiveBar>* bars) const;
+	                std::vector<ActiveBar>* bars,
+	                std::vector<std::vector<uint8_t> >* frame_bytes = NULL) const;
 
 private:
 	struct Locator {

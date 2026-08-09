@@ -1,16 +1,8 @@
 // history.cpp
 //
-// Implements History's current store lifecycle shells and block-level frame
-// orchestration. A StockTimeBlock is assembled as one state stream plus five
-// independent OHLCV field streams. State covers every BlockOff and determines
-// which offsets may have numeric values; numeric frames cover only contiguous
-// Normal offsets.
+// Implements History's current store lifecycle and persisted BarBlockFrame
+// handling. Active positions remain mutable until staging seals complete blocks.
 //
-// This module owns the policy around the strict numeric codec: invalid Normal
-// input becomes Missing in a complete block, and reconstructed High/Low are
-// constrained against reconstructed Open/Close. codec.cpp owns frame-local
-// quantization, residual algorithms, and the ZMF3 byte format.
-
 #include "history.h"
 
 #include "codec.h"
@@ -39,16 +31,12 @@
 namespace zstfs {
 
 // =============================================================================
-// Block Input Policy and Shared Validation
+// Active-Store Validation
 //
-// Applies the ingestion rules surrounding the strict codec. A complete block
-// owns its state stream; numeric frames exist only for Normal offsets selected
-// by that stream.
+// Validates the complete bar records accepted by History before they enter the
+// mutable active store or its recovery log.
 // =============================================================================
 
-static bool IsNumericField(FieldId field) {
-	return field != FieldId::State && field <= FieldId::Volume;
-}
 
 static bool ValidState(BarState state) {
 	return state >= BarState::Normal && state <= BarState::Missing;
@@ -63,323 +51,6 @@ static bool ValidBar(const BlockBar& bar) {
 		 std::isfinite(bar.volume) && bar.volume >= 0.0 &&
 		 bar.high >= std::max(bar.open, bar.close) &&
 		 bar.low <= std::min(bar.open, bar.close));
-}
-
-static double FieldValue(FieldId field, const BlockBar& bar) {
-	switch (field) {
-	case FieldId::Open:
-		return bar.open;
-	case FieldId::High:
-		return bar.high;
-	case FieldId::Low:
-		return bar.low;
-	case FieldId::Close:
-		return bar.close;
-	case FieldId::Volume:
-		return bar.volume;
-	case FieldId::State:
-		break;
-	}
-	return 0.0;
-}
-
-// =============================================================================
-// Numeric Field Run Assembly
-//
-// Splits one field into fixed-size codec frames. State gaps and invalid input
-// remain gaps at their original BlockOff; they never shift later values.
-// =============================================================================
-
-Status EncodeFieldFrames(FieldId field,
-			 BlockOff first_offset,
-			 const std::vector<BlockBar>& positions,
-			 const PrecisionProfile& profile,
-			 std::vector<MicroblockFrame>* output) {
-	if (output == NULL || !IsNumericField(field) || !ValidPrecisionProfile(profile)) {
-		return Status::Error(ErrorCode::InvalidArgument, "invalid field frame input");
-	}
-	output->clear();
-	std::vector<double> run;
-	BlockOff run_offset = first_offset;
-	for (size_t i = 0; i < positions.size(); ++i) {
-		if (i > static_cast<size_t>(std::numeric_limits<BlockOff>::max() - first_offset)) {
-			return Status::Error(ErrorCode::InvalidArgument, "field offset overflow");
-		}
-		BlockOff current_offset = static_cast<BlockOff>(first_offset + i);
-		if (positions[i].state != BarState::Normal || !ValidBar(positions[i])) {
-			if (!run.empty()) {
-				FrameInput input = {field, run_offset, run};
-				MicroblockFrame frame;
-				Status status = EncodeFrame(input, profile, &frame);
-				if (!status.ok()) {
-					return status;
-				}
-				output->push_back(frame);
-				run.clear();
-			}
-			continue;
-		}
-		if (run.empty()) {
-			run_offset = current_offset;
-		}
-		run.push_back(FieldValue(field, positions[i]));
-		if (run.size() == kMaxFrameSamples) {
-			FrameInput input = {field, run_offset, run};
-			MicroblockFrame frame;
-			Status status = EncodeFrame(input, profile, &frame);
-			if (!status.ok()) {
-				return status;
-			}
-			output->push_back(frame);
-			run.clear();
-		}
-	}
-	if (!run.empty()) {
-		FrameInput input = {field, run_offset, run};
-		MicroblockFrame frame;
-		Status status = EncodeFrame(input, profile, &frame);
-		if (!status.ok()) {
-			return status;
-		}
-		output->push_back(frame);
-	}
-	return Status::Ok();
-}
-
-// =============================================================================
-// State Stream Assembly
-//
-// The state frame covers every block position, including gaps. It is separate
-// from numeric frames because non-Normal positions intentionally have no OHLCV
-// payload and only state can distinguish Missing from other lifecycle states.
-// =============================================================================
-
-Status EncodeStateFrame(BlockOff first_offset,
-			const std::vector<BlockBar>& positions,
-			MicroblockFrame* output) {
-	if (output == NULL || positions.empty()) {
-		return Status::Error(ErrorCode::InvalidArgument, "state frame requires positions");
-	}
-	if (positions.size() > std::numeric_limits<BlockOff>::max() ||
-		positions.size() > static_cast<size_t>(std::numeric_limits<BlockOff>::max() - first_offset)) {
-		return Status::Error(ErrorCode::InvalidArgument, "state frame is too large");
-	}
-	for (size_t i = 0; i < positions.size(); ++i) {
-		if (!ValidState(positions[i].state)) {
-			return Status::Error(ErrorCode::InvalidArgument, "invalid bar state");
-		}
-	}
-
-	output->field = FieldId::State;
-	output->first_offset = first_offset;
-	output->sample_count = static_cast<BlockOff>(positions.size());
-	output->codec_id = kStateRleCodecId;
-	output->predictor_id = 0;
-	output->quantizer_id = 0;
-	output->quantizer_parameters.clear();
-	output->anchor = static_cast<int64_t>(positions[0].state);
-	output->payload.clear();
-	for (size_t i = 0; i < positions.size();) {
-		size_t end = i + 1;
-		while (end < positions.size() &&
-			positions[end].state == positions[i].state &&
-			end - i < std::numeric_limits<uint16_t>::max()) {
-			++end;
-		}
-		PutU16(&output->payload, static_cast<uint16_t>(end - i));
-		PutU8(&output->payload, static_cast<uint8_t>(positions[i].state));
-		i = end;
-	}
-	return Status::Ok();
-}
-
-Status DecodeStateFrame(const MicroblockFrame& frame,
-			std::vector<BarState>* states) {
-	if (states == NULL || frame.field != FieldId::State ||
-		frame.sample_count == 0 || frame.codec_id != kStateRleCodecId ||
-		frame.predictor_id != 0 || frame.quantizer_id != 0 ||
-		!frame.quantizer_parameters.empty() ||
-		!ValidState(static_cast<BarState>(frame.anchor))) {
-		return Status::Error(ErrorCode::CorruptData, "invalid state frame header");
-	}
-	states->clear();
-	states->reserve(frame.sample_count);
-	size_t cursor = 0;
-	while (states->size() < frame.sample_count) {
-		uint16_t run = 0;
-		uint8_t encoded_state = 0;
-		BarState state;
-		if (!GetU16(frame.payload, &cursor, &run) || run == 0 ||
-			!GetU8(frame.payload, &cursor, &encoded_state) ||
-			run > frame.sample_count - states->size()) {
-			return Status::Error(ErrorCode::CorruptData, "invalid state frame payload");
-		}
-		state = static_cast<BarState>(encoded_state);
-		if (!ValidState(state)) {
-			return Status::Error(ErrorCode::CorruptData, "unknown bar state");
-		}
-		for (uint16_t i = 0; i < run; ++i) {
-			states->push_back(state);
-		}
-	}
-	if (cursor != frame.payload.size() || states->empty() ||
-		static_cast<int64_t>((*states)[0]) != frame.anchor) {
-		return Status::Error(ErrorCode::CorruptData, "trailing or inconsistent state frame data");
-	}
-	return Status::Ok();
-}
-
-// =============================================================================
-// OHLCV Block Assembly and Reconstruction
-//
-// A complete block first turns invalid Normal bars into Missing, then emits the
-// state stream plus independent OHLCV field frames. Price fields use half the
-// requested error budget so decode can restore High/Low ordering safely.
-// =============================================================================
-
-Status EncodeOhlcvFrames(BlockOff first_offset,
-			 const std::vector<BlockBar>& positions,
-			 const PrecisionProfile& profile,
-			 std::vector<MicroblockFrame>* output) {
-	if (output == NULL || positions.empty() || !ValidPrecisionProfile(profile) ||
-		positions.size() > std::numeric_limits<BlockOff>::max()) {
-		return Status::Error(ErrorCode::InvalidArgument, "invalid OHLCV frame input");
-	}
-	PrecisionProfile price_profile = profile;
-	price_profile.price_relative_epsilon /= 2.0;
-	if (price_profile.price_relative_epsilon <= 0.0) {
-		return Status::Error(ErrorCode::InvalidArgument, "price precision is out of range");
-	}
-
-	std::vector<BlockBar> sanitized = positions;
-	for (size_t i = 0; i < sanitized.size(); ++i) {
-		if (sanitized[i].state == BarState::Normal && !ValidBar(sanitized[i])) {
-			sanitized[i].state = BarState::Missing;
-			sanitized[i].open = 0.0;
-			sanitized[i].high = 0.0;
-			sanitized[i].low = 0.0;
-			sanitized[i].close = 0.0;
-			sanitized[i].volume = 0.0;
-		}
-	}
-
-	output->clear();
-	MicroblockFrame state_frame;
-	Status status = EncodeStateFrame(first_offset, sanitized, &state_frame);
-	if (!status.ok()) {
-		return status;
-	}
-	output->push_back(state_frame);
-	const FieldId fields[] = {
-		FieldId::Open, FieldId::High, FieldId::Low, FieldId::Close, FieldId::Volume
-	};
-	for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
-		std::vector<MicroblockFrame> field_frames;
-		status = EncodeFieldFrames(fields[i], first_offset, sanitized,
-			fields[i] == FieldId::Volume ? profile : price_profile, &field_frames);
-		if (!status.ok()) {
-			return status;
-		}
-		output->insert(output->end(), field_frames.begin(), field_frames.end());
-	}
-	return Status::Ok();
-}
-
-Status DecodeOhlcvFrames(BlockOff first_offset,
-			 BlockOff position_count,
-			 const std::vector<MicroblockFrame>& frames,
-			 const PrecisionProfile& profile,
-			 std::vector<BlockBar>* positions) {
-	if (positions == NULL || position_count == 0 || !ValidPrecisionProfile(profile)) {
-		return Status::Error(ErrorCode::InvalidArgument, "invalid OHLCV decode input");
-	}
-	const MicroblockFrame* state_frame = NULL;
-	for (size_t i = 0; i < frames.size(); ++i) {
-		if (frames[i].field == FieldId::State) {
-			if (state_frame != NULL || frames[i].first_offset != first_offset ||
-				frames[i].sample_count != position_count) {
-				return Status::Error(ErrorCode::CorruptData, "invalid block state frame");
-			}
-			state_frame = &frames[i];
-		}
-	}
-	if (state_frame == NULL) {
-		return Status::Error(ErrorCode::CorruptData, "missing block state frame");
-	}
-
-	std::vector<BarState> states;
-	Status status = DecodeStateFrame(*state_frame, &states);
-	if (!status.ok()) {
-		return status;
-	}
-	positions->assign(position_count, BlockBar());
-	for (size_t i = 0; i < states.size(); ++i) {
-		(*positions)[i].state = states[i];
-	}
-	std::vector<std::vector<bool> > seen(5,
-		std::vector<bool>(position_count, false));
-	for (size_t frame_index = 0; frame_index < frames.size(); ++frame_index) {
-		const MicroblockFrame& frame = frames[frame_index];
-		if (frame.field == FieldId::State) {
-			continue;
-		}
-		if (!IsNumericField(frame.field) || frame.first_offset < first_offset) {
-			return Status::Error(ErrorCode::CorruptData, "invalid numeric frame offset");
-		}
-		size_t begin = static_cast<size_t>(frame.first_offset - first_offset);
-		if (begin > position_count || frame.sample_count > position_count - begin) {
-			return Status::Error(ErrorCode::CorruptData, "numeric frame exceeds block range");
-		}
-		std::vector<double> values;
-		status = DecodeFrame(frame, profile, &values);
-		if (!status.ok()) {
-			return status;
-		}
-		size_t field_index = static_cast<size_t>(static_cast<uint8_t>(frame.field) -
-			static_cast<uint8_t>(FieldId::Open));
-		for (size_t i = 0; i < values.size(); ++i) {
-			size_t position = begin + i;
-			if ((*positions)[position].state != BarState::Normal ||
-				seen[field_index][position]) {
-				return Status::Error(ErrorCode::CorruptData, "invalid numeric frame ownership");
-			}
-			switch (frame.field) {
-			case FieldId::Open:
-				(*positions)[position].open = values[i];
-				break;
-			case FieldId::High:
-				(*positions)[position].high = values[i];
-				break;
-			case FieldId::Low:
-				(*positions)[position].low = values[i];
-				break;
-			case FieldId::Close:
-				(*positions)[position].close = values[i];
-				break;
-			case FieldId::Volume:
-				(*positions)[position].volume = values[i];
-				break;
-			case FieldId::State:
-				return Status::Error(ErrorCode::CorruptData, "unexpected state frame");
-			}
-			seen[field_index][position] = true;
-		}
-	}
-	for (size_t i = 0; i < positions->size(); ++i) {
-		if ((*positions)[i].state != BarState::Normal) {
-			continue;
-		}
-		for (size_t field = 0; field < seen.size(); ++field) {
-			if (!seen[field][i]) {
-				return Status::Error(ErrorCode::CorruptData, "missing normal field frame");
-			}
-		}
-		(*positions)[i].high = std::max((*positions)[i].high,
-			std::max((*positions)[i].open, (*positions)[i].close));
-		(*positions)[i].low = std::min((*positions)[i].low,
-			std::min((*positions)[i].open, (*positions)[i].close));
-	}
-	return Status::Ok();
 }
 
 
@@ -970,7 +641,7 @@ Status ActiveStore::replay_status() const {
 
 static const size_t kStagingPageTargetBytes = 64 * 1024;
 static const uint64_t kStagingSegmentTargetBytes = 64ULL * 1024 * 1024;
-static const uint8_t kStagingVersion = 1;
+static const uint8_t kStagingVersion = 2;
 static const size_t kStagingPageHeaderBytes = 28;
 
 struct PendingStagingRecord {
@@ -982,6 +653,7 @@ struct PendingStagingRecord {
 struct ParsedStagingRecord {
 	StockTimeBlock block;
 	std::vector<ActiveBar> bars;
+	std::vector<uint8_t> frame_bytes;
 };
 
 static bool PendingStagingOrder(const PendingStagingRecord& left,
@@ -998,8 +670,8 @@ static bool SameBlockBar(const BlockBar& left, const BlockBar& right) {
 
 static PrecisionProfile StagingPrecisionProfile() {
 	PrecisionProfile profile = {};
-	profile.price_relative_epsilon = 5e-4;
-	profile.volume_relative_epsilon = 0.04;
+	profile.price_relative_epsilon = 1e-4;
+	profile.volume_relative_epsilon = 0.01;
 	return profile;
 }
 
@@ -1064,6 +736,7 @@ static Status MakePendingStagingRecord(const Calendar& calendar,
 					       Frequency frequency,
 					       const StockTimeBlock& block,
 					       const std::vector<ActiveBar>& bars,
+					       const std::vector<uint8_t>* frame_bytes,
 					       PendingStagingRecord* output) {
 	if (output == NULL || block.key.symbol_id == kInvalidSymbolId ||
 		block.positions.empty() || block.positions.size() > std::numeric_limits<BlockOff>::max()) {
@@ -1108,19 +781,26 @@ static Status MakePendingStagingRecord(const Calendar& calendar,
 			return Status::Error(ErrorCode::InvalidArgument, "staging block has an unrecorded position");
 		}
 	}
-	std::vector<MicroblockFrame> frames;
-	status = EncodeOhlcvFrames(0, block.positions, StagingPrecisionProfile(), &frames);
-	if (!status.ok()) {
-		return status;
-	}
-	pending.frame_bytes.reserve(frames.size());
-	for (size_t i = 0; i < frames.size(); ++i) {
-		std::vector<uint8_t> frame_bytes;
-		status = SerializeFrame(frames[i], &frame_bytes);
+	if (frame_bytes != NULL) {
+		BarBlockFrame frame = {*frame_bytes};
+		std::vector<BlockBar> decoded;
+		status = DecodeBarBlockFrame(frame, &decoded);
+		if (!status.ok() || decoded.size() != block.positions.size()) {
+			return Status::Error(ErrorCode::CorruptData, "invalid source staging bar block frame");
+		}
+		for (size_t i = 0; i < decoded.size(); ++i) {
+			if (!SameBlockBar(decoded[i], block.positions[i])) {
+				return Status::Error(ErrorCode::CorruptData, "source staging frame does not match record");
+			}
+		}
+		pending.frame_bytes.push_back(*frame_bytes);
+	} else {
+		BarBlockFrame frame;
+		status = EncodeBarBlockFrame(block.positions, &frame);
 		if (!status.ok()) {
 			return status;
 		}
-		pending.frame_bytes.push_back(frame_bytes);
+		pending.frame_bytes.push_back(frame.bytes);
 	}
 	*output = pending;
 	return Status::Ok();
@@ -1235,29 +915,25 @@ static Status ParseStagingPage(const Calendar& calendar,
 		if (!GetU16(bytes, &cursor, &frame_count) || frame_count == 0) {
 			return Status::Error(ErrorCode::CorruptData, "staging record has no frames");
 		}
-		std::vector<MicroblockFrame> frames;
-		frames.reserve(frame_count);
-		for (uint16_t frame_index = 0; frame_index < frame_count; ++frame_index) {
-			uint32_t offset = 0;
-			uint32_t length = 0;
-			if (!GetU32(bytes, &cursor, &offset) || !GetU32(bytes, &cursor, &length) ||
-				offset > payload_size || length > payload_size - offset) {
-				return Status::Error(ErrorCode::CorruptData, "invalid staging frame locator");
-			}
-			std::vector<uint8_t> frame_bytes(bytes.begin() + payload_start + offset,
-				bytes.begin() + payload_start + offset + length);
-			MicroblockFrame frame;
-			Status status = ParseFrame(frame_bytes, &frame);
-			if (!status.ok()) {
-				return status;
-			}
-			frames.push_back(frame);
+		if (frame_count != 1) {
+			return Status::Error(ErrorCode::CorruptData, "staging record must contain one bar block frame");
 		}
+		uint32_t offset = 0;
+		uint32_t length = 0;
+		if (!GetU32(bytes, &cursor, &offset) || !GetU32(bytes, &cursor, &length) ||
+			offset > payload_size || length > payload_size - offset) {
+			return Status::Error(ErrorCode::CorruptData, "invalid staging frame locator");
+		}
+		BarBlockFrame frame;
+		frame.bytes.assign(bytes.begin() + payload_start + offset,
+			bytes.begin() + payload_start + offset + length);
 		std::vector<BlockBar> positions;
-		Status status = DecodeOhlcvFrames(0, position_count, frames, StagingPrecisionProfile(),
-			&positions);
+		Status status = DecodeBarBlockFrame(frame, &positions);
 		if (!status.ok()) {
 			return status;
+		}
+		if (positions.size() != position_count) {
+			return Status::Error(ErrorCode::CorruptData, "staging bar block position count mismatch");
 		}
 		std::vector<TimeId> time_ids;
 		status = StagingTimeIds(calendar, frequency, block_id, position_count, &time_ids);
@@ -1269,6 +945,7 @@ static Status ParseStagingPage(const Calendar& calendar,
 		parsed.block.key.time_block_id = block_id;
 		parsed.block.day_presence = day_presence;
 		parsed.block.positions = positions;
+		parsed.frame_bytes = frame.bytes;
 		for (size_t offset = 0; offset < positions.size(); ++offset) {
 			if ((present[offset / 8] & static_cast<uint8_t>(1U << (offset % 8))) != 0) {
 				ActiveBar bar = {symbol_id, time_ids[offset], positions[offset]};
@@ -1374,7 +1051,8 @@ Status StagingStore::load() {
 			next_page_id_ = std::max(next_page_id_, page_id + 1);
 			current_segment_id_ = std::max(current_segment_id_, locator->second.segment_id);
 			Entry entry = {parsed[locator->second.record_index].block,
-				parsed[locator->second.record_index].bars};
+				parsed[locator->second.record_index].bars,
+				parsed[locator->second.record_index].frame_bytes};
 			entries_[locator->first] = entry;
 		}
 		if (persisted_index_valid) {
@@ -1437,7 +1115,7 @@ Status StagingStore::load() {
 				Locator locator = {segment_id, static_cast<uint64_t>(offset),
 					static_cast<uint32_t>(page_length), static_cast<uint32_t>(record)};
 				index_[key] = locator;
-				Entry entry = {parsed[record].block, parsed[record].bars};
+				Entry entry = {parsed[record].block, parsed[record].bars, parsed[record].frame_bytes};
 				entries_[key] = entry;
 			}
 			next_page_id_ = std::max(next_page_id_, page_id + 1);
@@ -1501,9 +1179,13 @@ Status StagingStore::write_index() const {
 }
 
 Status StagingStore::accept(const std::vector<StockTimeBlock>& blocks,
-				    const std::vector<ActiveBar>& bars) {
+				    const std::vector<ActiveBar>& bars,
+				    const std::vector<std::vector<uint8_t> >* frame_bytes) {
 	if (!status_.ok()) {
 		return status_;
+	}
+	if (frame_bytes != NULL && frame_bytes->size() != blocks.size()) {
+		return Status::Error(ErrorCode::InvalidArgument, "staging frame bytes do not match blocks");
 	}
 	std::set<std::pair<TimeId, SymbolId> > batch_keys;
 	std::vector<PendingStagingRecord> pending;
@@ -1517,7 +1199,9 @@ Status StagingStore::accept(const std::vector<StockTimeBlock>& blocks,
 			continue;
 		}
 		PendingStagingRecord record;
-		Status status = MakePendingStagingRecord(calendar_, frequency_, blocks[i], bars, &record);
+		const std::vector<uint8_t>* source_frame = frame_bytes == NULL || (*frame_bytes)[i].empty() ?
+			NULL : &(*frame_bytes)[i];
+		Status status = MakePendingStagingRecord(calendar_, frequency_, blocks[i], bars, source_frame, &record);
 		if (!status.ok()) {
 			return status;
 		}
@@ -1585,7 +1269,7 @@ Status StagingStore::accept(const std::vector<StockTimeBlock>& blocks,
 			Locator locator = {current_segment_id_, offset, static_cast<uint32_t>(page_bytes.size()),
 				static_cast<uint32_t>(record)};
 			index_[key] = locator;
-			Entry entry = {parsed[record].block, parsed[record].bars};
+			Entry entry = {parsed[record].block, parsed[record].bars, parsed[record].frame_bytes};
 			entries_[key] = entry;
 		}
 		++next_page_id_;
@@ -1656,7 +1340,8 @@ Status StagingStore::range(const std::vector<SymbolId>& symbol_ids,
 }
 
 Status StagingStore::snapshot(std::vector<StockTimeBlock>* blocks,
-								 std::vector<ActiveBar>* bars) const {
+								 std::vector<ActiveBar>* bars,
+								 std::vector<std::vector<uint8_t> >* frame_bytes) const {
 	if (blocks == NULL || bars == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "staging snapshot outputs are required");
 	}
@@ -1665,9 +1350,15 @@ Status StagingStore::snapshot(std::vector<StockTimeBlock>* blocks,
 	}
 	blocks->clear();
 	bars->clear();
+	if (frame_bytes != NULL) {
+		frame_bytes->clear();
+	}
 	for (std::map<std::pair<TimeId, SymbolId>, Entry>::const_iterator entry = entries_.begin();
 		 entry != entries_.end(); ++entry) {
 		blocks->push_back(entry->second.block);
+		if (frame_bytes != NULL) {
+			frame_bytes->push_back(entry->second.frame_bytes);
+		}
 		bars->insert(bars->end(), entry->second.bars.begin(), entry->second.bars.end());
 	}
 	std::sort(bars->begin(), bars->end(), ActiveBarOrder);
@@ -1683,7 +1374,7 @@ Status StagingStore::snapshot(std::vector<StockTimeBlock>* blocks,
 // ZVB6 only supplies durable framing and selective disk locations.
 // =============================================================================
 
-static const uint8_t kVaultVersion = 1;
+static const uint8_t kVaultVersion = 2;
 static const size_t kVaultBlobMaxBytes = 16 * 1024 * 1024;
 static const uint64_t kVaultSegmentTargetBytes = 256ULL * 1024 * 1024;
 static const size_t kCompressedFrameCacheBytes = 32 * 1024 * 1024;
@@ -1692,7 +1383,7 @@ static const size_t kDecodedFieldCacheBytes = 16 * 1024 * 1024;
 struct VaultPendingBlock {
 	StockTimeBlock block;
 	std::vector<uint8_t> present;
-	std::vector<MicroblockFrame> frames;
+	std::vector<uint8_t> frame_bytes;
 };
 
 struct VaultBlockDirectory {
@@ -1860,56 +1551,11 @@ static bool GetDecodedCache(uint64_t runtime_market_id,
 	return false;
 }
 
-static void SerializeVaultFrame(const MicroblockFrame& frame, std::vector<uint8_t>* bytes) {
-	PutU8(bytes, static_cast<uint8_t>(frame.field));
-	PutU16(bytes, frame.first_offset);
-	PutU16(bytes, frame.sample_count);
-	PutU8(bytes, frame.codec_id);
-	PutU8(bytes, frame.predictor_id);
-	PutU8(bytes, frame.quantizer_id);
-	PutU16(bytes, static_cast<uint16_t>(frame.quantizer_parameters.size()));
-	PutU64(bytes, static_cast<uint64_t>(frame.anchor));
-	PutU32(bytes, static_cast<uint32_t>(frame.payload.size()));
-	bytes->insert(bytes->end(), frame.quantizer_parameters.begin(), frame.quantizer_parameters.end());
-	bytes->insert(bytes->end(), frame.payload.begin(), frame.payload.end());
-}
-
-static bool ParseVaultFrame(const std::vector<uint8_t>& bytes,
-						 size_t offset,
-						 size_t length,
-						 MicroblockFrame* frame) {
-	if (frame == NULL || offset > bytes.size() || length > bytes.size() - offset) {
-		return false;
-	}
-	const size_t end = offset + length;
-	uint8_t field = 0;
-	uint16_t parameter_length = 0;
-	uint64_t anchor = 0;
-	uint32_t payload_length = 0;
-	if (!GetU8(bytes, &offset, &field) || !GetU16(bytes, &offset, &frame->first_offset) ||
-		!GetU16(bytes, &offset, &frame->sample_count) || !GetU8(bytes, &offset, &frame->codec_id) ||
-		!GetU8(bytes, &offset, &frame->predictor_id) || !GetU8(bytes, &offset, &frame->quantizer_id) ||
-		!GetU16(bytes, &offset, &parameter_length) || !GetU64(bytes, &offset, &anchor) ||
-		!GetU32(bytes, &offset, &payload_length) || field > static_cast<uint8_t>(FieldId::Volume) ||
-		offset > end || parameter_length > end - offset) {
-		return false;
-	}
-	frame->field = static_cast<FieldId>(field);
-	frame->anchor = static_cast<int64_t>(anchor);
-	frame->quantizer_parameters.assign(bytes.begin() + offset,
-		bytes.begin() + offset + parameter_length);
-	offset += parameter_length;
-	if (payload_length > end - offset || offset + payload_length != end) {
-		return false;
-	}
-	frame->payload.assign(bytes.begin() + offset, bytes.begin() + end);
-	return true;
-}
-
 static Status MakeVaultPendingBlock(const Calendar& calendar,
 							Frequency frequency,
 							const StockTimeBlock& block,
 							const std::vector<ActiveBar>& bars,
+							const std::vector<uint8_t>* frame_bytes,
 							VaultPendingBlock* output) {
 	if (output == NULL || block.key.symbol_id == kInvalidSymbolId || block.positions.empty()) {
 		return Status::Error(ErrorCode::InvalidArgument, "invalid vault block");
@@ -1942,7 +1588,27 @@ static Status MakeVaultPendingBlock(const Calendar& calendar,
 		}
 		output->present[index / 8] |= bit;
 	}
-	return EncodeOhlcvFrames(0, block.positions, StagingPrecisionProfile(), &output->frames);
+	if (frame_bytes != NULL) {
+		BarBlockFrame frame = {*frame_bytes};
+		std::vector<BlockBar> decoded;
+		status = DecodeBarBlockFrame(frame, &decoded);
+		if (!status.ok() || decoded.size() != block.positions.size()) {
+			return Status::Error(ErrorCode::CorruptData, "invalid source bar block frame");
+		}
+		for (size_t i = 0; i < decoded.size(); ++i) {
+			if (!SameBlockBar(decoded[i], block.positions[i])) {
+				return Status::Error(ErrorCode::CorruptData, "source bar block frame does not match record");
+			}
+		}
+		output->frame_bytes = *frame_bytes;
+		return Status::Ok();
+	}
+	BarBlockFrame frame;
+	status = EncodeBarBlockFrame(block.positions, &frame);
+	if (status.ok()) {
+		output->frame_bytes.swap(frame.bytes);
+	}
+	return status;
 }
 
 static Status BuildVaultBlob(Frequency frequency,
@@ -1965,18 +1631,18 @@ static Status BuildVaultBlob(Frequency frequency,
 		block_entry.position_count = static_cast<BlockOff>(blocks[i].block.positions.size());
 		block_entry.present_length = static_cast<uint16_t>(blocks[i].present.size());
 		block_directory.push_back(block_entry);
-		for (size_t j = 0; j < blocks[i].frames.size(); ++j) {
-			std::vector<uint8_t> frame;
-			SerializeVaultFrame(blocks[i].frames[j], &frame);
-			VaultFrameDirectory frame_entry = {};
-			frame_entry.field = blocks[i].frames[j].field;
-			frame_entry.time_block_id = blocks[i].block.key.time_block_id;
-			frame_entry.first_offset = blocks[i].frames[j].first_offset;
-			frame_entry.sample_count = blocks[i].frames[j].sample_count;
-			frame_entry.frame_length = static_cast<uint32_t>(frame.size());
-			frame_directory.push_back(frame_entry);
-			frame_bytes.push_back(frame);
+		if (blocks[i].frame_bytes.empty() ||
+			blocks[i].frame_bytes.size() > std::numeric_limits<uint32_t>::max()) {
+			return Status::Error(ErrorCode::InvalidArgument, "invalid vault bar block frame");
 		}
+		VaultFrameDirectory frame_entry = {};
+		frame_entry.field = FieldId::State;
+		frame_entry.time_block_id = blocks[i].block.key.time_block_id;
+		frame_entry.first_offset = 0;
+		frame_entry.sample_count = block_entry.position_count;
+		frame_entry.frame_length = static_cast<uint32_t>(blocks[i].frame_bytes.size());
+		frame_directory.push_back(frame_entry);
+		frame_bytes.push_back(blocks[i].frame_bytes);
 	}
 	const size_t header_bytes = 32 + block_directory.size() * 20 + frame_directory.size() * 17;
 	if (header_bytes > std::numeric_limits<uint32_t>::max()) {
@@ -2121,9 +1787,13 @@ Status VaultStore::write_index() const {
 }
 
 Status VaultStore::ingest(const std::vector<StockTimeBlock>& blocks,
-					  const std::vector<ActiveBar>& bars) {
+					  const std::vector<ActiveBar>& bars,
+					  const std::vector<std::vector<uint8_t> >* frame_bytes) {
 	if (!status_.ok()) {
 		return status_;
+	}
+	if (frame_bytes != NULL && frame_bytes->size() != blocks.size()) {
+		return Status::Error(ErrorCode::InvalidArgument, "vault frame bytes do not match blocks");
 	}
 	const TimeId block_day_length = frequency_ == Frequency::Daily
 		? kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
@@ -2146,7 +1816,9 @@ Status VaultStore::ingest(const std::vector<StockTimeBlock>& blocks,
 		const std::vector<ActiveBar>& block_bars = found == bars_by_block.end()
 			? empty_bars : found->second;
 		VaultPendingBlock pending;
-		Status status = MakeVaultPendingBlock(calendar_, frequency_, blocks[i], block_bars, &pending);
+		const std::vector<uint8_t>* source_frame = frame_bytes == NULL || (*frame_bytes)[i].empty() ?
+			NULL : &(*frame_bytes)[i];
+		Status status = MakeVaultPendingBlock(calendar_, frequency_, blocks[i], block_bars, source_frame, &pending);
 		if (!status.ok()) {
 			return status;
 		}
@@ -2265,8 +1937,10 @@ static Status DecodeVaultBlock(const Calendar& calendar,
 						   const std::vector<uint8_t>& bytes,
 						   SymbolId symbol_id,
 						   TimeId wanted_block_id,
-						   std::vector<ActiveBar>* output) {
-	if (GetDecodedCache(runtime_market_id, frequency, segment_id, blob_offset, wanted_block_id, output)) {
+						   std::vector<ActiveBar>* output,
+						   std::vector<uint8_t>* frame_bytes) {
+	if (frame_bytes == NULL &&
+		GetDecodedCache(runtime_market_id, frequency, segment_id, blob_offset, wanted_block_id, output)) {
 		return Status::Ok();
 	}
 	size_t offset = 0;
@@ -2331,24 +2005,30 @@ static Status DecodeVaultBlock(const Calendar& calendar,
 	if (block == NULL) {
 		return Status::Error(ErrorCode::NotFound, "vault block was not found");
 	}
-	std::vector<MicroblockFrame> decoded_frames;
+	const VaultFrameDirectory* frame_directory = NULL;
 	for (size_t i = 0; i < frames.size(); ++i) {
 		if (frames[i].time_block_id != wanted_block_id) {
 			continue;
 		}
-		MicroblockFrame frame;
-		if (!ParseVaultFrame(bytes, frames[i].frame_offset, frames[i].frame_length, &frame) ||
-			frame.field != frames[i].field || frame.first_offset != frames[i].first_offset ||
-			frame.sample_count != frames[i].sample_count) {
-			return Status::Error(ErrorCode::CorruptData, "invalid vault frame payload");
+		if (frame_directory != NULL || frames[i].field != FieldId::State ||
+			frames[i].first_offset != 0 || frames[i].sample_count != block->position_count) {
+			return Status::Error(ErrorCode::CorruptData, "invalid vault bar block locator");
 		}
-		decoded_frames.push_back(frame);
+		frame_directory = &frames[i];
 	}
+	if (frame_directory == NULL) {
+		return Status::Error(ErrorCode::CorruptData, "vault block has no bar block frame");
+	}
+	BarBlockFrame frame;
+	frame.bytes.assign(bytes.begin() + frame_directory->frame_offset,
+		bytes.begin() + frame_directory->frame_offset + frame_directory->frame_length);
 	std::vector<BlockBar> positions;
-	Status status = DecodeOhlcvFrames(0, block->position_count, decoded_frames,
-		StagingPrecisionProfile(), &positions);
-	if (!status.ok()) {
+	Status status = DecodeBarBlockFrame(frame, &positions);
+	if (!status.ok() || positions.size() != block->position_count) {
 		return Status::Error(ErrorCode::CorruptData, "cannot decode vault block");
+	}
+	if (frame_bytes != NULL) {
+		*frame_bytes = frame.bytes;
 	}
 	std::vector<TimeId> time_ids;
 	status = StagingTimeIds(calendar, frequency, wanted_block_id, block->position_count, &time_ids);
@@ -2402,7 +2082,7 @@ Status VaultStore::get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const 
 			(time_day(time_id) % kDailyTimeBlockDayLength);
 		const TimeId block_id = daily_bar_id(block_day);
 		status = DecodeVaultBlock(calendar_, frequency_, runtime_market_id_, locator.segment_id,
-			locator.blob_offset, bytes, symbol_id, block_id, &bars);
+			locator.blob_offset, bytes, symbol_id, block_id, &bars, NULL);
 		if (!status.ok()) {
 			if (status.code() == ErrorCode::NotFound) {
 				continue;
@@ -2450,7 +2130,7 @@ Status VaultStore::range(const std::vector<SymbolId>& symbol_ids,
 			 block_id = daily_bar_id(time_day(block_id) + 64)) {
 			std::vector<ActiveBar> bars;
 			status = DecodeVaultBlock(calendar_, frequency_, runtime_market_id_, locator.segment_id,
-				locator.blob_offset, bytes, locator.symbol_id, block_id, &bars);
+				locator.blob_offset, bytes, locator.symbol_id, block_id, &bars, NULL);
 			if (!status.ok()) {
 				if (status.code() != ErrorCode::NotFound) {
 					corrupt = true;
@@ -2536,7 +2216,8 @@ static Status BlocksFromBars(const Calendar& calendar,
 }
 
 Status VaultStore::snapshot(std::vector<StockTimeBlock>* blocks,
-							  std::vector<ActiveBar>* bars) const {
+							  std::vector<ActiveBar>* bars,
+							  std::vector<std::vector<uint8_t> >* frame_bytes) const {
 	if (blocks == NULL || bars == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "vault snapshot outputs are required");
 	}
@@ -2553,7 +2234,51 @@ Status VaultStore::snapshot(std::vector<StockTimeBlock>* blocks,
 	if (!status.ok()) {
 		return status;
 	}
-	return BlocksFromBars(calendar_, frequency_, *bars, blocks);
+	status = BlocksFromBars(calendar_, frequency_, *bars, blocks);
+	if (!status.ok() || frame_bytes == NULL) {
+		return status;
+	}
+
+	frame_bytes->clear();
+	std::map<std::pair<TimeId, SymbolId>, std::vector<uint8_t> > frames_by_block;
+	for (size_t i = 0; i < index_.size(); ++i) {
+		const Locator& locator = index_[i];
+		std::vector<uint8_t> bytes;
+		status = ReadVaultBlob(path_, runtime_market_id_, frequency_, locator.segment_id,
+			locator.blob_offset, locator.blob_length, &bytes);
+		if (!status.ok()) {
+			return status;
+		}
+		for (TimeId block_id = locator.first_time_block_id;
+			 block_id <= locator.last_time_block_id;
+			 block_id = daily_bar_id(time_day(block_id) + kDailyTimeBlockDayLength)) {
+			std::vector<ActiveBar> decoded;
+			std::vector<uint8_t> frame;
+			status = DecodeVaultBlock(calendar_, frequency_, runtime_market_id_, locator.segment_id,
+				locator.blob_offset, bytes, locator.symbol_id, block_id, &decoded, &frame);
+			if (!status.ok()) {
+				if (status.code() == ErrorCode::NotFound) {
+					continue;
+				}
+				return status;
+			}
+			const std::pair<TimeId, SymbolId> key(block_id, locator.symbol_id);
+			if (!frames_by_block.insert(std::make_pair(key, frame)).second) {
+				return Status::Error(ErrorCode::CorruptData, "duplicate vault block frame");
+			}
+		}
+	}
+	for (size_t i = 0; i < blocks->size(); ++i) {
+		const std::pair<TimeId, SymbolId> key((*blocks)[i].key.time_block_id,
+			(*blocks)[i].key.symbol_id);
+		std::map<std::pair<TimeId, SymbolId>, std::vector<uint8_t> >::const_iterator found =
+			frames_by_block.find(key);
+		if (found == frames_by_block.end()) {
+			return Status::Error(ErrorCode::CorruptData, "vault block frame is missing");
+		}
+		frame_bytes->push_back(found->second);
+	}
+	return Status::Ok();
 }
 
 static std::string FrequencyPath(const std::string& market_path, Frequency frequency) {
@@ -3324,9 +3049,9 @@ Status CompactVault(const std::string& root_path,
 	}
 	Calendar calendar(market->type());
 	TimeId cutoff = 0;
-	TimeId unused_block = 0;
+	TimeId cutoff_block = 0;
 	BlockOff unused_offset = 0;
-	status = ResolveTime(calendar, frequency, cutoff_local_time, &cutoff, &unused_block, &unused_offset);
+	status = ResolveTime(calendar, frequency, cutoff_local_time, &cutoff, &cutoff_block, &unused_offset);
 	if (!status.ok()) {
 		return status;
 	}
@@ -3338,17 +3063,32 @@ Status CompactVault(const std::string& root_path,
 	VaultStore old_vault(frequency, calendar, frequency_path, NextRuntimeMarketId());
 	std::vector<StockTimeBlock> staging_blocks;
 	std::vector<ActiveBar> staging_bars;
+	std::vector<std::vector<uint8_t> > staging_frames;
 	std::vector<StockTimeBlock> vault_blocks;
 	std::vector<ActiveBar> vault_bars;
-	status = old_staging.snapshot(&staging_blocks, &staging_bars);
+	std::vector<std::vector<uint8_t> > vault_frames;
+	status = old_staging.snapshot(&staging_blocks, &staging_bars, &staging_frames);
 	if (!status.ok()) {
 		return status;
 	}
-	status = old_vault.snapshot(&vault_blocks, &vault_bars);
+	status = old_vault.snapshot(&vault_blocks, &vault_bars, &vault_frames);
 	if (!status.ok()) {
 		return status;
 	}
 	stats->input_blocks = staging_blocks.size() + vault_blocks.size();
+	if (staging_frames.size() != staging_blocks.size() || vault_frames.size() != vault_blocks.size()) {
+		return Status::Error(ErrorCode::CorruptData, "compaction frames do not match logical blocks");
+	}
+	std::map<std::pair<SymbolId, TimeId>, std::vector<uint8_t> > staging_frames_by_block;
+	std::map<std::pair<SymbolId, TimeId>, std::vector<uint8_t> > vault_frames_by_block;
+	for (size_t i = 0; i < staging_blocks.size(); ++i) {
+		staging_frames_by_block[std::make_pair(staging_blocks[i].key.symbol_id,
+			staging_blocks[i].key.time_block_id)] = staging_frames[i];
+	}
+	for (size_t i = 0; i < vault_blocks.size(); ++i) {
+		vault_frames_by_block[std::make_pair(vault_blocks[i].key.symbol_id,
+			vault_blocks[i].key.time_block_id)] = vault_frames[i];
+	}
 	std::map<std::pair<SymbolId, TimeId>, std::vector<ActiveBar> > staging_by_block;
 	std::map<std::pair<SymbolId, TimeId>, std::vector<ActiveBar> > vault_by_block;
 	for (size_t i = 0; i < staging_bars.size(); ++i) {
@@ -3418,28 +3158,16 @@ Status CompactVault(const std::string& root_path,
 		if (bars == staging_by_block.end()) {
 			continue;
 		}
-		std::vector<ActiveBar> old_bars;
-		std::vector<ActiveBar> new_bars;
-		for (size_t j = 0; j < bars->second.size(); ++j) {
-			(bars->second[j].time_id < cutoff ? old_bars : new_bars).push_back(bars->second[j]);
-		}
-		if (!old_bars.empty()) {
-			CompactionRecord record;
-			status = BuildCompactionPart(calendar, frequency, staging_blocks[i], old_bars,
-				CompactionDestination::Vault, CompactionSource::Staging, &record);
-			if (!status.ok() || !(status = append_record(record)).ok()) {
-				RemoveCompactionTree(build_root);
-				return status;
-			}
-		}
-		if (!new_bars.empty()) {
-			CompactionRecord record;
-			status = BuildCompactionPart(calendar, frequency, staging_blocks[i], new_bars,
-				CompactionDestination::Staging, CompactionSource::Staging, &record);
-			if (!status.ok() || !(status = append_record(record)).ok()) {
-				RemoveCompactionTree(build_root);
-				return status;
-			}
+		// A BarBlockFrame is immutable. The cutoff block itself stays in Staging
+		// so the compactor never splits one frame between store ownership layers.
+		CompactionRecord record;
+		const CompactionDestination destination = staging_blocks[i].key.time_block_id < cutoff_block ?
+			CompactionDestination::Vault : CompactionDestination::Staging;
+		status = BuildCompactionPart(calendar, frequency, staging_blocks[i], bars->second,
+			destination, CompactionSource::Staging, &record);
+		if (!status.ok() || !(status = append_record(record)).ok()) {
+			RemoveCompactionTree(build_root);
+			return status;
 		}
 	}
 	if (!batch.empty()) {
@@ -3474,24 +3202,28 @@ Status CompactVault(const std::string& root_path,
 	}
 	std::vector<StockTimeBlock> vault_batch;
 	std::vector<ActiveBar> vault_batch_bars;
+	std::vector<std::vector<uint8_t> > vault_batch_frames;
 	std::vector<StockTimeBlock> staging_batch;
 	std::vector<ActiveBar> staging_batch_bars;
+	std::vector<std::vector<uint8_t> > staging_batch_frames;
 	const auto flush_output = [&](CompactionDestination destination) -> Status {
 		if (destination == CompactionDestination::Vault) {
 			if (vault_batch.empty()) {
 				return Status::Ok();
 			}
-			Status flush_status = new_vault.ingest(vault_batch, vault_batch_bars);
+			Status flush_status = new_vault.ingest(vault_batch, vault_batch_bars, &vault_batch_frames);
 			vault_batch.clear();
 			vault_batch_bars.clear();
+			vault_batch_frames.clear();
 			return flush_status;
 		}
 		if (staging_batch.empty()) {
 			return Status::Ok();
 		}
-		Status flush_status = new_staging.accept(staging_batch, staging_batch_bars);
+		Status flush_status = new_staging.accept(staging_batch, staging_batch_bars, &staging_batch_frames);
 		staging_batch.clear();
 		staging_batch_bars.clear();
+		staging_batch_frames.clear();
 		return flush_status;
 	};
 	CompactionDestination last_destination = CompactionDestination::Vault;
@@ -3548,9 +3280,27 @@ Status CompactVault(const std::string& root_path,
 		if (destination == CompactionDestination::Vault) {
 			vault_batch.push_back(chosen.block);
 			vault_batch_bars.insert(vault_batch_bars.end(), chosen.bars.begin(), chosen.bars.end());
+			const std::map<std::pair<SymbolId, TimeId>, std::vector<uint8_t> >& source_frames =
+				chosen.source == CompactionSource::Staging ? staging_frames_by_block : vault_frames_by_block;
+			std::map<std::pair<SymbolId, TimeId>, std::vector<uint8_t> >::const_iterator frame =
+				source_frames.find(std::make_pair(symbol_id, block_id));
+			if (frame == source_frames.end()) {
+				RemoveCompactionTree(build_root);
+				return Status::Error(ErrorCode::CorruptData, "missing source bar block frame");
+			}
+			vault_batch_frames.push_back(frame->second);
 		} else {
 			staging_batch.push_back(chosen.block);
 			staging_batch_bars.insert(staging_batch_bars.end(), chosen.bars.begin(), chosen.bars.end());
+			const std::map<std::pair<SymbolId, TimeId>, std::vector<uint8_t> >& source_frames =
+				chosen.source == CompactionSource::Staging ? staging_frames_by_block : vault_frames_by_block;
+			std::map<std::pair<SymbolId, TimeId>, std::vector<uint8_t> >::const_iterator frame =
+				source_frames.find(std::make_pair(symbol_id, block_id));
+			if (frame == source_frames.end()) {
+				RemoveCompactionTree(build_root);
+				return Status::Error(ErrorCode::CorruptData, "missing retained source bar block frame");
+			}
+			staging_batch_frames.push_back(frame->second);
 		}
 		++stats->output_blocks;
 	}

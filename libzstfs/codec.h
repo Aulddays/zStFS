@@ -1,63 +1,40 @@
 // codec.h
 //
-// Declares the private M3 frame types and codec operations. Numeric frames are
-// self-describing so callers can encode or decode a short field run independently.
+// Declares the private persisted BarBlockFrame codec. Complete OHLCV samples
+// remain together because readers reconstruct every bar as one unit.
 
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
 #include <vector>
 
 #include "zstfs/data.h"
 #include "zstfs/status.h"
-#include "calendar.h"
 
 namespace zstfs {
 
-// State frames use the same historical RLE wire id as numeric residual frames.
-// Keeping this value named in the codec boundary prevents state orchestration
-// from depending on an undocumented numeric literal.
-static const uint8_t kStateRleCodecId = 1;
-static const size_t kMaxFrameSamples = 32;
-
-// MicroblockFrame is the independently decodable encoded part of a field.
-// Its header carries the field, location, predictor, quantizer, and anchor.
-struct MicroblockFrame {
-	FieldId field;
-	BlockOff first_offset;
-	BlockOff sample_count;
-	uint8_t codec_id;
-	uint8_t predictor_id;
-	uint8_t quantizer_id;
-	std::vector<uint8_t> quantizer_parameters;
-	int64_t anchor;
-	std::vector<uint8_t> payload;
+// BlockBar is the complete state and raw OHLCV payload at one calendar position.
+// BarBlockFrame keeps all five values together because an OHLC sample is always
+// reconstructed as a unit by range reads and by the relational predictors.
+struct BlockBar {
+	BarState state;
+	double open;
+	double high;
+	double low;
+	double close;
+	double volume;
 };
 
-// FrameInput is one contiguous run of normal values for one numeric field.
-struct FrameInput {
-	FieldId field;
-	BlockOff first_offset;
-	std::vector<double> values;
+struct BarBlockFrame {
+	std::vector<uint8_t> bytes;
 };
 
-// Precision validation is shared by OHLCV orchestration and numeric encoding.
-bool ValidPrecisionProfile(const PrecisionProfile& profile);
-
-// EncodeFrame quantizes and residual-encodes one normal field run.
-Status EncodeFrame(const FrameInput& input,
-			   const PrecisionProfile& profile,
-			   MicroblockFrame* output);
-
-// DecodeFrame validates a frame and reconstructs its numeric values.
-Status DecodeFrame(const MicroblockFrame& frame,
-			   const PrecisionProfile& profile,
-			   std::vector<double>* values);
-
-// Frame wire format is little-endian and length-delimited. The enclosing page
-// or blob remains responsible for integrity checks such as checksums.
-Status SerializeFrame(const MicroblockFrame& frame, std::vector<uint8_t>* bytes);
-Status ParseFrame(const std::vector<uint8_t>& bytes, MicroblockFrame* frame);
+// BarBlockFrame is the current immutable block format. Its fixed quantization
+// rules are part of the persisted format: price relative error is 1e-4 and
+// volume relative error is 0.01. The returned frame bytes are self-describing.
+Status EncodeBarBlockFrame(const std::vector<BlockBar>& positions,
+					   BarBlockFrame* output);
+Status DecodeBarBlockFrame(const BarBlockFrame& frame,
+					   std::vector<BlockBar>* positions);
 
 }  // namespace zstfs

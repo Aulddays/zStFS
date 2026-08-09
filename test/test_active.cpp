@@ -6,9 +6,11 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <dirent.h>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -28,6 +30,10 @@ void ExpectOk(const zstfs::Status& status) {
 			status.message().c_str());
 	}
 	assert(status.ok());
+}
+
+bool CloseEnough(double actual, double expected) {
+	return std::abs(actual - expected) <= std::abs(expected) * 1e-4 + 1e-12;
 }
 
 zstfs::Bar BarFor(zstfs::SymbolId symbol_id,
@@ -184,7 +190,7 @@ void TestDailyWriteReadAndRecovery() {
 		zstfs::Bar bar = {};
 		assert(history.get(symbol_id, "20260807", &bar).code() == zstfs::ErrorCode::NotFound);
 		ExpectOk(history.get(symbol_id, "20260803", &bar));
-		assert(bar.close == 11.0);
+		assert(CloseEnough(bar.close, 11.0));
 		ExpectOk(history.put(MissingBar(symbol_id, zstfs::Frequency::Daily, "20260807")));
 		ExpectOk(history.get(symbol_id, "20260807", &bar));
 		assert(bar.state == zstfs::BarState::Missing);
@@ -207,7 +213,7 @@ void TestDailyWriteReadAndRecovery() {
 		zstfs::History& history = market.history(zstfs::Frequency::Daily);
 		zstfs::Bar bar = {};
 		ExpectOk(history.get(symbol_id, "20260804", &bar));
-		assert(bar.close == 12.0);
+		assert(CloseEnough(bar.close, 12.0));
 		ExpectOk(history.get(symbol_id, "20260807", &bar));
 		assert(bar.state == zstfs::BarState::Missing);
 		ExpectOk(history.put(BarFor(symbol_id, zstfs::Frequency::Daily,
@@ -223,10 +229,10 @@ void TestDailyWriteReadAndRecovery() {
 		assert(history.put(late_batch).code() == zstfs::ErrorCode::AlreadyPresent);
 		assert(history.get(symbol_id, "20260811", &bar).code() == zstfs::ErrorCode::NotFound);
 		ExpectOk(history.get(symbol_id, "20260803", &bar));
-		assert(bar.close == 11.0);
+		assert(CloseEnough(bar.close, 11.0));
 		zstfs::History& hourly = market.history(zstfs::Frequency::Hourly);
 		ExpectOk(hourly.get(symbol_id, "20260803-0930", &bar));
-		assert(bar.close == 10.0);
+		assert(CloseEnough(bar.close, 10.0));
 	}
 	{
 		MarketFixture fixture(path, "active-test", "CNA");
@@ -234,13 +240,13 @@ void TestDailyWriteReadAndRecovery() {
 		zstfs::Bar bar = {};
 		ExpectOk(market.history(zstfs::Frequency::Daily).get(
 			symbol_id, "20260803", &bar));
-		assert(bar.close == 11.0);
+		assert(CloseEnough(bar.close, 11.0));
 		ExpectOk(market.history(zstfs::Frequency::Daily).get(
 			symbol_id, "20260810", &bar));
-		assert(bar.close == 16.0);
+		assert(CloseEnough(bar.close, 16.0));
 		ExpectOk(market.history(zstfs::Frequency::Hourly).get(
 			symbol_id, "20260803-0930", &bar));
-		assert(bar.close == 10.0);
+		assert(CloseEnough(bar.close, 10.0));
 	}
 	RemoveTestDirectory(path);
 }
@@ -368,7 +374,7 @@ void TestHourlyOrderingAndCanonicalSlots() {
 		zstfs::Bar bar = {};
 		ExpectOk(history.get(symbol_id, "20260803-0930", &bar));
 		assert(bar.local_time == "20260803-0930");
-		assert(bar.close == 19.0);
+		assert(CloseEnough(bar.close, 19.0));
 		std::vector<zstfs::Bar> values;
 		ExpectOk(history.get(symbol_id, "20260803-0930", "20260803-1400",
 			zstfs::AdjustMode::Raw, &values));
@@ -402,7 +408,7 @@ void TestVaultPersistenceMergeAndCorruption() {
 			ExpectOk(calendar.time_id("20260803", &time_id));
 			zstfs::BlockBar bar = {};
 			ExpectOk(vault.get(corrupt_symbol, time_id, &bar));
-			assert(bar.close == 10.0);
+			assert(CloseEnough(bar.close, 10.0));
 		}
 		ExpectOk(bootstrap.sync());
 	}
@@ -412,7 +418,7 @@ void TestVaultPersistenceMergeAndCorruption() {
 		zstfs::History& history = market.history(zstfs::Frequency::Daily);
 		zstfs::Bar bar = {};
 		ExpectOk(history.get(corrupt_symbol, "20260803", &bar));
-		assert(bar.close == 10.0);
+		assert(CloseEnough(bar.close, 10.0));
 
 		// Active data is newer than Vault data for the same logical key.
 		ExpectOk(history.put(BarFor(corrupt_symbol, zstfs::Frequency::Daily,
@@ -420,7 +426,7 @@ void TestVaultPersistenceMergeAndCorruption() {
 		bar = BarFor(corrupt_symbol, zstfs::Frequency::Daily, "20260803", 999.0);
 		assert(history.get(corrupt_symbol, "20260803", &bar).code() ==
 			zstfs::ErrorCode::CorruptData);
-		assert(bar.close == 999.0);
+		assert(CloseEnough(bar.close, 999.0));
 
 		// Once sealed, Staging remains newer than the underlying Vault value.
 		ExpectOk(history.put(BarFor(corrupt_symbol, zstfs::Frequency::Daily,
@@ -429,7 +435,7 @@ void TestVaultPersistenceMergeAndCorruption() {
 		bar = BarFor(corrupt_symbol, zstfs::Frequency::Daily, "20260804", 999.0);
 		assert(history.get(corrupt_symbol, "20260804", &bar).code() ==
 			zstfs::ErrorCode::CorruptData);
-		assert(bar.close == 999.0);
+		assert(CloseEnough(bar.close, 999.0));
 		std::vector<zstfs::Bar> values;
 		std::vector<zstfs::SymbolId> symbols;
 		symbols.push_back(intact_symbol);
@@ -437,9 +443,9 @@ void TestVaultPersistenceMergeAndCorruption() {
 		assert(history.get(symbols, "20260803", "20260804",
 			zstfs::AdjustMode::Raw, &values).code() == zstfs::ErrorCode::CorruptData);
 		assert(values.size() == 3);
-		assert(values[0].symbol_id == corrupt_symbol && values[0].close == 30.0);
-		assert(values[1].symbol_id == intact_symbol && values[1].close == 20.0);
-		assert(values[2].symbol_id == corrupt_symbol && values[2].close == 40.0);
+		assert(values[0].symbol_id == corrupt_symbol && CloseEnough(values[0].close, 30.0));
+		assert(values[1].symbol_id == intact_symbol && CloseEnough(values[1].close, 20.0));
+		assert(values[2].symbol_id == corrupt_symbol && CloseEnough(values[2].close, 40.0));
 	}
 
 	// Keep only the immutable layer for the corruption phase, so a newer Active
@@ -469,7 +475,7 @@ void TestVaultPersistenceMergeAndCorruption() {
 		zstfs::History& history = market.history(zstfs::Frequency::Daily);
 		zstfs::Bar bar = BarFor(corrupt_symbol, zstfs::Frequency::Daily, "20260805", 999.0);
 		assert(history.get(corrupt_symbol, "20260805", &bar).code() == zstfs::ErrorCode::CorruptData);
-		assert(bar.close == 999.0);
+		assert(CloseEnough(bar.close, 999.0));
 		std::vector<zstfs::Bar> values;
 		std::vector<zstfs::SymbolId> symbols;
 		symbols.push_back(corrupt_symbol);
@@ -477,9 +483,9 @@ void TestVaultPersistenceMergeAndCorruption() {
 		assert(history.get(symbols, "20260803", "20260805",
 			zstfs::AdjustMode::Raw, &values).code() == zstfs::ErrorCode::CorruptData);
 		assert(values.size() == 3);
-		assert(values[0].symbol_id == corrupt_symbol && values[0].close == 10.0);
-		assert(values[1].symbol_id == intact_symbol && values[1].close == 20.0);
-		assert(values[2].symbol_id == corrupt_symbol && values[2].close == 11.0);
+		assert(values[0].symbol_id == corrupt_symbol && CloseEnough(values[0].close, 10.0));
+		assert(values[1].symbol_id == intact_symbol && CloseEnough(values[1].close, 20.0));
+		assert(values[2].symbol_id == corrupt_symbol && CloseEnough(values[2].close, 11.0));
 	}
 	RemoveTestDirectory(path);
 }
@@ -528,7 +534,7 @@ void TestManifestAndActions() {
 		std::vector<zstfs::Bar> values;
 		ExpectOk(history.get(symbol_id, "20260803", "20260803",
 			zstfs::AdjustMode::Raw, &values));
-		assert(values.size() == 1 && values[0].close == 100.0);
+		assert(values.size() == 1 && CloseEnough(values[0].close, 100.0));
 		ExpectOk(history.get(symbol_id, "20260803", "20260803",
 			zstfs::AdjustMode::Backward, &values));
 		assert(values.size() == 1 && values[0].close == 45.0 && values[0].volume == 200.0);
@@ -577,8 +583,8 @@ void TestManifestAndActions() {
 }
 
 // Creates one block that crosses the cutoff and an unrelated newer Vault block.
-// The fixture makes the compactor exercise logical block splitting rather than
-// treating the block timestamp as a coarse retention boundary.
+// The fixture verifies that the compactor retains the cutoff block intact rather
+// than treating individual bar times as a coarse retention boundary.
 void PopulateCompactionFixture(const std::string& path) {
 	const zstfs::SymbolId symbol_id = 61;
 	MarketFixture fixture(path, "compaction-test", "CNA");
@@ -648,13 +654,37 @@ void TestOfflineVaultCompaction() {
 	const zstfs::SymbolId symbol_id = 61;
 	PopulateCompactionFixture(path);
 	PopulateCompactionFixture(duplicate_path);
+	zstfs::Calendar calendar("CNA");
+	const std::string frequency_path = MarketPath(path, "compaction-test") + "/daily";
+	std::map<std::pair<zstfs::SymbolId, zstfs::TimeId>, std::vector<uint8_t> > original_frames;
+	{
+		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, frequency_path);
+		zstfs::VaultStore vault(zstfs::Frequency::Daily, calendar, frequency_path, 992);
+		std::vector<zstfs::StockTimeBlock> blocks;
+		std::vector<zstfs::ActiveBar> bars;
+		std::vector<std::vector<uint8_t> > frames;
+		ExpectOk(staging.snapshot(&blocks, &bars, &frames));
+		assert(blocks.size() == frames.size());
+		for (size_t i = 0; i < blocks.size(); ++i) {
+			assert(original_frames.insert(std::make_pair(
+				std::make_pair(blocks[i].key.symbol_id, blocks[i].key.time_block_id), frames[i])).second);
+		}
+		ExpectOk(vault.snapshot(&blocks, &bars, &frames));
+		assert(blocks.size() == frames.size());
+		for (size_t i = 0; i < blocks.size(); ++i) {
+			assert(original_frames.insert(std::make_pair(
+				std::make_pair(blocks[i].key.symbol_id, blocks[i].key.time_block_id), frames[i])).second);
+		}
+	}
 	zstfs::VaultCompactionStats stats = {};
 	zstfs::VaultCompactionStats duplicate_stats = {};
 	ExpectOk(zstfs::CompactVault(path, "compaction-test", zstfs::Frequency::Daily, "20260805", &stats));
 	ExpectOk(zstfs::CompactVault(duplicate_path, "compaction-test", zstfs::Frequency::Daily, "20260805",
 		&duplicate_stats));
 	assert(stats.input_blocks >= 2);
-	assert(stats.output_blocks >= 3);
+	// Compaction preserves complete BarBlockFrame ownership and never splits
+	// the cutoff block, so it cannot create an extra partial output block.
+	assert(stats.output_blocks >= 2);
 	assert(stats.temporary_bytes > 0 && stats.io_bytes > stats.temporary_bytes);
 	assert(stats.input_blocks == duplicate_stats.input_blocks);
 	assert(stats.output_blocks == duplicate_stats.output_blocks);
@@ -663,18 +693,53 @@ void TestOfflineVaultCompaction() {
 	assert(HasBackupDirectory(MarketPath(path, "compaction-test") + "/daily", "vault."));
 	assert(HasBackupDirectory(MarketPath(path, "compaction-test") + "/daily", "staging."));
 	{
+		zstfs::VaultStore vault(zstfs::Frequency::Daily, calendar, frequency_path, 993);
+		std::vector<zstfs::StockTimeBlock> blocks;
+		std::vector<zstfs::ActiveBar> bars;
+		std::vector<std::vector<uint8_t> > frames;
+		ExpectOk(vault.snapshot(&blocks, &bars, &frames));
+		assert(blocks.size() == frames.size());
+		for (size_t i = 0; i < blocks.size(); ++i) {
+			const std::pair<zstfs::SymbolId, zstfs::TimeId> key(
+				blocks[i].key.symbol_id, blocks[i].key.time_block_id);
+			std::map<std::pair<zstfs::SymbolId, zstfs::TimeId>, std::vector<uint8_t> >::const_iterator original =
+				original_frames.find(key);
+			assert(original != original_frames.end());
+			assert(frames[i] == original->second);
+		}
+	}
+	{
 		MarketFixture fixture(path, "compaction-test", "CNA");
 		zstfs::Market& market = fixture.market();
 		zstfs::History& history = market.history(zstfs::Frequency::Daily);
 		zstfs::Bar bar = {};
 		ExpectOk(history.get(symbol_id, "20260803", &bar));
-		assert(bar.close == 10.0);
+		assert(CloseEnough(bar.close, 10.0));
 		ExpectOk(history.get(symbol_id, "20260804", &bar));
 		assert(bar.state == zstfs::BarState::Missing);
 		ExpectOk(history.get(symbol_id, "20260806", &bar));
-		assert(bar.close == 20.0);
+		assert(CloseEnough(bar.close, 20.0));
 		ExpectOk(history.get(symbol_id, "20270105", &bar));
-		assert(bar.close == 50.0);
+		assert(CloseEnough(bar.close, 50.0));
+	}
+	zstfs::VaultCompactionStats second_stats = {};
+	ExpectOk(zstfs::CompactVault(path, "compaction-test", zstfs::Frequency::Daily, "20270105", &second_stats));
+	{
+		zstfs::VaultStore vault(zstfs::Frequency::Daily, calendar, frequency_path, 994);
+		std::vector<zstfs::StockTimeBlock> blocks;
+		std::vector<zstfs::ActiveBar> bars;
+		std::vector<std::vector<uint8_t> > frames;
+		ExpectOk(vault.snapshot(&blocks, &bars, &frames));
+		assert(blocks.size() == original_frames.size());
+		assert(blocks.size() == frames.size());
+		for (size_t i = 0; i < blocks.size(); ++i) {
+			const std::pair<zstfs::SymbolId, zstfs::TimeId> key(
+				blocks[i].key.symbol_id, blocks[i].key.time_block_id);
+			std::map<std::pair<zstfs::SymbolId, zstfs::TimeId>, std::vector<uint8_t> >::const_iterator original =
+				original_frames.find(key);
+			assert(original != original_frames.end());
+			assert(frames[i] == original->second);
+		}
 	}
 	RemoveTestDirectory(path);
 	RemoveTestDirectory(duplicate_path);

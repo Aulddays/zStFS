@@ -10,7 +10,7 @@
 namespace zstfs {
 
 // Persistent zStFS files use little-endian fixed-width integers, IEEE-754
-// binary64 values, and uint16_t-length-prefixed strings. Individual formats
+// binary32 and binary64 values, and uint16_t-length-prefixed strings. Individual formats
 // retain ownership of their record layouts and validation; these primitives
 // only encode shared field representations.
 
@@ -104,8 +104,25 @@ inline bool GetU64(const std::vector<uint8_t>& data, size_t* offset, uint64_t* o
 #if !defined(_MSC_VER)
 static_assert(__BYTE_ORDER__ == __FLOAT_WORD_ORDER__, "Unsupported float endianess");
 #endif
+static_assert(sizeof(float) == sizeof(uint32_t) && std::numeric_limits<float>::is_iec559,
+	"Unsupported float format");
 static_assert(sizeof(double) == sizeof(uint64_t) && std::numeric_limits<double>::is_iec559,
 	"Unsupported double format");
+
+inline void PutFloat(std::vector<uint8_t>* out, float value) {
+	uint32_t bits = 0;
+	std::memcpy(&bits, &value, sizeof(bits));
+	PutU32(out, bits);
+}
+
+inline bool GetFloat(const std::vector<uint8_t>& data, size_t* offset, float* out) {
+	uint32_t bits = 0;
+	if (!GetU32(data, offset, &bits)) {
+		return false;
+	}
+	std::memcpy(out, &bits, sizeof(bits));
+	return true;
+}
 
 inline void PutDouble(std::vector<uint8_t>* out, double value) {
 	uint64_t bits = 0;
