@@ -376,6 +376,32 @@ std::string StateName(zstfs::BarState state) {
 	return "unknown";
 }
 
+json SymbolJson(const zstfs::Symbol& symbol) {
+	json result = {
+		{"id", symbol.id},
+		{"code", symbol.code},
+		{"name", symbol.name},
+		{"security_type", symbol.security_type},
+		{"industry", symbol.industry},
+		{"list_date", symbol.list_date},
+		{"delist_date", symbol.delist_date},
+		{"share_capital", symbol.share_capital},
+		{"tradable_share", symbol.tradable_share},
+		{"volume_unit", symbol.volume_unit},
+		{"state", symbol.state == zstfs::SymbolState::Active ? "active" : "retired"}
+	};
+	json aliases = json::array();
+	for (size_t i = 0; i < symbol.aliases.size(); ++i) {
+		aliases.push_back({
+			{"code", symbol.aliases[i].code},
+			{"begin_date", symbol.aliases[i].begin_date},
+			{"end_date", symbol.aliases[i].end_date}
+		});
+	}
+	result["aliases"] = aliases;
+	return result;
+}
+
 json BarJson(const zstfs::Bar& bar) {
 	json result = {
 		{"symbol_id", bar.symbol_id},
@@ -412,27 +438,96 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		json result;
 		result["symbols"] = json::array();
 		for (size_t i = 0; i < symbols.size(); ++i) {
-			result["symbols"].push_back({
-				{"id", symbols[i].id},
-				{"code", symbols[i].code},
-				{"name", symbols[i].name},
-				{"state", symbols[i].state == zstfs::SymbolState::Active ? "active" : "retired"}
-			});
+			result["symbols"].push_back(SymbolJson(symbols[i]));
 		}
 		return OkJson(result.dump());
 	}
 
+	if (parts.size() == 5 && parts[3] == "symbols" && request.method == "GET") {
+		const std::string& code = parts[4];
+		zstfs::Symbol symbol = {};
+		status = market->symbols().find(code, &symbol);
+		if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
+		return OkJson(json{{"symbol", SymbolJson(symbol)}}.dump());
+	}
+
 	if (parts.size() == 4 && parts[3] == "symbols" && request.method == "POST") {
+		// Symbols upsert accepts a single object or an array. Both paths go
+		// through the batch mechanism so a single-record write still behaves
+		// atomically; the difference is only whether changed/unchanged counts
+		// are returned alongside the id.
 		json payload;
 		try { payload = json::parse(request.body); }
 		catch (const std::exception& error) { return ErrorResponse(400, std::string("invalid JSON: ") + error.what()); }
-		zstfs::Symbol symbol = {};
-		std::string error;
-		if (!ParseSymbol(payload, &symbol, &error)) return ErrorResponse(400, error);
-		zstfs::SymbolId id = 0;
-		status = market->symbols().add(symbol, &id);
+		json items;
+		bool single = false;
+		if (payload.is_array()) {
+			items = payload;
+		} else if (payload.is_object() && payload.contains("symbols") && payload["symbols"].is_array()) {
+			items = payload["symbols"];
+		} else if (payload.is_object()) {
+			items = json::array({payload});
+			single = true;
+		} else {
+			return ErrorResponse(400, "request body must contain a symbol object or array");
+		}
+		if (items.empty()) return ErrorResponse(400, "request body must contain at least one symbol");
+		status = market->symbols().begin_batch();
 		if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
-		return OkJson(json{{"id", id}}.dump());
+		uint32_t changed_count = 0;
+		uint32_t unchanged_count = 0;
+		zstfs::SymbolId first_id = 0;
+		bool first_changed = false;
+		bool batch_ok = true;
+		std::string batch_error;
+		for (size_t i = 0; i < items.size(); ++i) {
+			zstfs::Symbol symbol = {};
+			std::string perror;
+			if (!ParseSymbol(items[i], &symbol, &perror)) {
+				batch_error = "symbol[" + std::to_string(i) + "]: " + perror;
+				batch_ok = false;
+				break;
+			}
+			bool changed = false;
+			zstfs::SymbolId out_id = 0;
+			zstfs::Status s = market->symbols().upsert(symbol, &out_id, &changed);
+			if (!s.ok()) {
+				batch_error = "symbol[" + std::to_string(i) + "]: " + s.message();
+				batch_ok = false;
+				break;
+			}
+			if (i == 0) {
+				first_id = out_id;
+				first_changed = changed;
+			}
+			if (changed) ++changed_count;
+			else ++unchanged_count;
+		}
+		if (!batch_ok) {
+			market->symbols().abort_batch();
+			return ErrorResponse(400, batch_error);
+		}
+		bool batch_changed = false;
+		status = market->symbols().commit_batch(&batch_changed);
+		if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
+		if (single) {
+			return OkJson(json{{"id", first_id}, {"updated", first_changed}}.dump());
+		}
+		return OkJson(json{
+			{"accepted", items.size()},
+			{"changed", changed_count},
+			{"unchanged", unchanged_count}
+		}.dump());
+	}
+
+	if (parts.size() == 5 && parts[3] == "symbols" && request.method == "DELETE") {
+		const std::string& code = parts[4];
+		zstfs::Symbol symbol = {};
+		status = market->symbols().find(code, &symbol);
+		if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
+		status = market->symbols().remove(symbol.id);
+		if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
+		return OkJson("{\"removed\":true}");
 	}
 
 	if (parts.size() == 4 && parts[3] == "actions") {

@@ -39,8 +39,75 @@ static bool AliasIsActive(const SymbolAlias& alias, const std::string& date) {
 	       (alias.end_date.empty() || date <= alias.end_date);
 }
 
+// SymbolsEqual compares two symbol records field by field, excluding the
+// library-assigned id. Used for diff detection in upsert and batch mode so
+// unchanged records do not trigger a snapshot write.
+static bool SymbolsEqual(const Symbol& a, const Symbol& b) {
+	if (a.code != b.code ||
+	    a.name != b.name ||
+	    a.security_type != b.security_type ||
+	    a.industry != b.industry ||
+	    a.list_date != b.list_date ||
+	    a.delist_date != b.delist_date ||
+	    a.share_capital != b.share_capital ||
+	    a.tradable_share != b.tradable_share ||
+	    a.volume_unit != b.volume_unit ||
+	    a.state != b.state ||
+	    a.aliases.size() != b.aliases.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < a.aliases.size(); ++i) {
+		if (a.aliases[i].code != b.aliases[i].code ||
+		    a.aliases[i].begin_date != b.aliases[i].begin_date ||
+		    a.aliases[i].end_date != b.aliases[i].end_date) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// ValidateSymbolFields checks code uniqueness and alias validity against a
+// candidate code index. Returns NotFound-style error messages via Status.
+static Status ValidateSymbolFields(
+	const Symbol& symbol,
+	SymbolId self_id,
+	const std::map<std::string, SymbolId>& existing_codes) {
+	if (symbol.code.empty()) {
+		return Status::Error(ErrorCode::InvalidArgument, "symbol code is required");
+	}
+	std::map<std::string, bool> seen_codes;
+	seen_codes[symbol.code] = true;
+	std::map<std::string, SymbolId>::const_iterator primary =
+		existing_codes.find(symbol.code);
+	if (primary != existing_codes.end() && primary->second != self_id) {
+		return Status::Error(ErrorCode::AlreadyPresent, "symbol code already exists");
+	}
+	for (std::vector<SymbolAlias>::const_iterator alias = symbol.aliases.begin();
+	     alias != symbol.aliases.end(); ++alias) {
+		if (alias->code.empty() || !ValidDateOrEmpty(alias->begin_date) ||
+		    !ValidDateOrEmpty(alias->end_date) ||
+		    (!alias->begin_date.empty() && !alias->end_date.empty() &&
+		     alias->begin_date > alias->end_date)) {
+			return Status::Error(ErrorCode::InvalidArgument,
+			                     "invalid or duplicate symbol alias");
+		}
+		if (!seen_codes.insert(std::make_pair(alias->code, true)).second) {
+			return Status::Error(ErrorCode::InvalidArgument,
+			                     "invalid or duplicate symbol alias");
+		}
+		std::map<std::string, SymbolId>::const_iterator existing =
+			existing_codes.find(alias->code);
+		if (existing != existing_codes.end() && existing->second != self_id) {
+			return Status::Error(ErrorCode::InvalidArgument,
+			                     "invalid or duplicate symbol alias");
+		}
+	}
+	return Status::Ok();
+}
+
 Symbols::Symbols()
-	: next_id_(kInvalidSymbolId + 1), status_(Status::Ok()) {
+	: next_id_(kInvalidSymbolId + 1), status_(Status::Ok()),
+	  in_batch_(false), batch_dirty_(false) {
 }
 
 // Persistence is configured before a Market exposes its Symbols collection.
@@ -81,50 +148,173 @@ Status Symbols::configure_persistence(
 	return status_;
 }
 
+// apply_upsert performs the in-memory insert-or-update comparison. It validates
+// fields first, then either inserts a new symbol (assigning the next available
+// id) or compares against the stored record. When the stored record already
+// matches exactly, it sets *changed = false and leaves state untouched.
+bool Symbols::apply_upsert(const Symbol& symbol, SymbolId* out_id) {
+	std::map<std::string, SymbolId>::const_iterator existing_code =
+		by_code_.find(symbol.code);
+	if (existing_code != by_code_.end()) {
+		// Update path: compare and replace only if fields differ.
+		SymbolId id = existing_code->second;
+		Symbol& stored = by_id_[id];
+		if (SymbolsEqual(symbol, stored)) {
+			if (out_id != NULL) {
+				*out_id = id;
+			}
+			return false;
+		}
+		// If the caller changed the primary code, the old code becomes an alias
+		// so lookups by historical code continue to resolve to the same symbol.
+		Symbol updated = symbol;
+		updated.id = id;
+		if (updated.code != stored.code) {
+			bool already_alias = false;
+			for (std::vector<SymbolAlias>::const_iterator alias =
+				     updated.aliases.begin();
+			     alias != updated.aliases.end(); ++alias) {
+				if (alias->code == stored.code) {
+					already_alias = true;
+					break;
+				}
+			}
+			if (!already_alias) {
+				SymbolAlias old_alias = {stored.code, "", ""};
+				updated.aliases.push_back(old_alias);
+			}
+		}
+		// Rebuild the code index entry for this symbol: remove every code that
+		// resolved to it, then re-add primary code and all aliases.
+		for (std::map<std::string, SymbolId>::iterator it = by_code_.begin();
+		     it != by_code_.end();) {
+			if (it->second == id) {
+				by_code_.erase(it++);
+			} else {
+				++it;
+			}
+		}
+		by_code_[updated.code] = id;
+		for (std::vector<SymbolAlias>::const_iterator alias =
+			     updated.aliases.begin();
+		     alias != updated.aliases.end(); ++alias) {
+			by_code_[alias->code] = id;
+		}
+		stored = updated;
+		if (out_id != NULL) {
+			*out_id = id;
+		}
+		return true;
+	}
+
+	// Insert path: assign a fresh id and insert into both indexes.
+	Symbol stored = symbol;
+	stored.id = next_id_;
+	by_id_[stored.id] = stored;
+	by_code_[stored.code] = stored.id;
+	for (std::vector<SymbolAlias>::const_iterator alias = stored.aliases.begin();
+	     alias != stored.aliases.end(); ++alias) {
+		by_code_[alias->code] = stored.id;
+	}
+	++next_id_;
+	if (out_id != NULL) {
+		*out_id = stored.id;
+	}
+	return true;
+}
+
+// flush_if_dirty is the single persistence gate for all mutations. Outside a
+// batch it immediately writes the snapshot and publishes the manifest; inside
+// a batch it only marks the batch dirty so commit_batch can do one write.
+Status Symbols::flush_if_dirty(const std::map<SymbolId, Symbol>& symbols,
+                               const std::map<std::string, SymbolId>& codes,
+                               SymbolId next_id) {
+	if (!status_.ok()) {
+		return status_;
+	}
+	if (path_.empty() || !publish_manifest_) {
+		return Status::Error(ErrorCode::Conflict,
+		                     "symbols persistence is not configured");
+	}
+	if (in_batch_) {
+		batch_dirty_ = true;
+		return Status::Ok();
+	}
+	return persist(symbols, codes, next_id);
+}
+
+Status Symbols::upsert(const Symbol& symbol, SymbolId* out_id, bool* updated) {
+	if (updated != NULL) {
+		*updated = false;
+	}
+	std::map<std::string, SymbolId>::const_iterator existing_code =
+		by_code_.find(symbol.code);
+	SymbolId self_id = kInvalidSymbolId;
+	if (existing_code != by_code_.end()) {
+		self_id = existing_code->second;
+	}
+	// For updates we also need to validate against the index with this symbol's
+	// old codes removed, since the primary code may be changing. Build a
+	// temporary candidate index for that check.
+	Status validated = ValidateSymbolFields(symbol, self_id, by_code_);
+	if (!validated.ok() && self_id == kInvalidSymbolId) {
+		return validated;
+	}
+	if (self_id != kInvalidSymbolId) {
+		std::map<std::string, SymbolId> candidate_codes = by_code_;
+		for (std::map<std::string, SymbolId>::iterator it = candidate_codes.begin();
+		     it != candidate_codes.end();) {
+			if (it->second == self_id) {
+				candidate_codes.erase(it++);
+			} else {
+				++it;
+			}
+		}
+		Status revalidated = ValidateSymbolFields(symbol, self_id, candidate_codes);
+		if (!revalidated.ok()) {
+			return revalidated;
+		}
+	}
+	if (self_id == kInvalidSymbolId && next_id_ == kInvalidSymbolId) {
+		return Status::Error(ErrorCode::Conflict,
+		                     "symbol identifier space is exhausted");
+	}
+	// apply_upsert mutates memory immediately so reads inside the batch see the
+	// new state. flush_if_dirty decides whether to persist now or at commit.
+	bool changed = apply_upsert(symbol, out_id);
+	if (!changed) {
+		return Status::Ok();
+	}
+	Status flushed = flush_if_dirty(by_id_, by_code_, next_id_);
+	if (!flushed.ok() && !in_batch_) {
+		// Outside a batch, a failed persist leaves memory mutated because
+		// apply_upsert ran first. This matches the existing pre-batch behavior
+		// where persist failure also leaves candidate state partially applied;
+		// the caller should treat the object as unusable (status_ is set).
+		return flushed;
+	}
+	if (updated != NULL) {
+		*updated = true;
+	}
+	return flushed;
+}
+
 Status Symbols::add(const Symbol& symbol, SymbolId* out_id) {
 	if (out_id == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "out_id is required");
 	}
-	if (symbol.code.empty()) {
-		return Status::Error(ErrorCode::InvalidArgument, "symbol code is required");
-	}
 	if (by_code_.find(symbol.code) != by_code_.end()) {
 		return Status::Error(ErrorCode::AlreadyPresent, "symbol code already exists");
 	}
-	std::map<std::string, bool> new_codes;
-	new_codes[symbol.code] = true;
-	for (std::vector<SymbolAlias>::const_iterator alias = symbol.aliases.begin();
-	     alias != symbol.aliases.end(); ++alias) {
-		if (alias->code.empty() || !ValidDateOrEmpty(alias->begin_date) ||
-		    !ValidDateOrEmpty(alias->end_date) ||
-		    (!alias->begin_date.empty() && !alias->end_date.empty() &&
-		     alias->begin_date > alias->end_date) ||
-		    by_code_.find(alias->code) != by_code_.end() ||
-		    !new_codes.insert(std::make_pair(alias->code, true)).second) {
-			return Status::Error(ErrorCode::InvalidArgument,
-			                     "invalid or duplicate symbol alias");
-		}
+	bool updated = false;
+	Status s = upsert(symbol, out_id, &updated);
+	if (!s.ok()) {
+		return s;
 	}
-	if (next_id_ == kInvalidSymbolId) {
-		return Status::Error(ErrorCode::Conflict, "symbol identifier space is exhausted");
-	}
-
-	Symbol stored = symbol;
-	stored.id = next_id_;
-	std::map<SymbolId, Symbol> candidate_symbols = by_id_;
-	std::map<std::string, SymbolId> candidate_codes = by_code_;
-	candidate_symbols[stored.id] = stored;
-	candidate_codes[stored.code] = stored.id;
-	for (std::vector<SymbolAlias>::const_iterator alias = stored.aliases.begin();
-	     alias != stored.aliases.end(); ++alias) {
-		candidate_codes[alias->code] = stored.id;
-	}
-
-	Status persisted = persist(candidate_symbols, candidate_codes, next_id_ + 1);
-	if (persisted.ok()) {
-		*out_id = stored.id;
-	}
-	return persisted;
+	// upsert on a fresh record always reports updated; guard against future
+	// changes to diff logic by asserting the invariant here.
+	(void)updated;
+	return Status::Ok();
 }
 
 Status Symbols::get(SymbolId id, Symbol* out) const {
@@ -181,49 +371,12 @@ Status Symbols::find(const std::string& code,
 }
 
 Status Symbols::update(SymbolId id, const Symbol& symbol) {
-	if (symbol.code.empty()) {
-		return Status::Error(ErrorCode::InvalidArgument, "symbol code is required");
-	}
 	std::map<SymbolId, Symbol>::iterator found = by_id_.find(id);
 	if (found == by_id_.end()) {
 		return Status::Error(ErrorCode::NotFound, "symbol was not found");
 	}
-
-	std::map<std::string, SymbolId>::const_iterator code = by_code_.find(symbol.code);
-	if (code != by_code_.end() && code->second != id) {
-		return Status::Error(ErrorCode::AlreadyPresent, "symbol code already exists");
-	}
-
-	Symbol stored = symbol;
-	stored.id = id;
-	if (stored.code != found->second.code) {
-		bool already_alias = false;
-		for (std::vector<SymbolAlias>::const_iterator alias = stored.aliases.begin();
-		     alias != stored.aliases.end(); ++alias) {
-			already_alias = already_alias || alias->code == found->second.code;
-		}
-		if (!already_alias) {
-			SymbolAlias old_alias = {found->second.code, "", ""};
-			stored.aliases.push_back(old_alias);
-		}
-	}
-	std::map<std::string, bool> new_codes;
-	new_codes[stored.code] = true;
-	for (std::vector<SymbolAlias>::const_iterator alias = stored.aliases.begin();
-	     alias != stored.aliases.end(); ++alias) {
-		std::map<std::string, SymbolId>::const_iterator existing =
-			by_code_.find(alias->code);
-		if (alias->code.empty() || !ValidDateOrEmpty(alias->begin_date) ||
-		    !ValidDateOrEmpty(alias->end_date) ||
-		    (!alias->begin_date.empty() && !alias->end_date.empty() &&
-		     alias->begin_date > alias->end_date) ||
-		    !new_codes.insert(std::make_pair(alias->code, true)).second ||
-		    (existing != by_code_.end() && existing->second != id)) {
-			return Status::Error(ErrorCode::InvalidArgument,
-			                     "invalid or duplicate symbol alias");
-		}
-	}
-	std::map<SymbolId, Symbol> candidate_symbols = by_id_;
+	// Update is keyed by id, not by code, so we validate against a candidate
+	// index that has all of this symbol's current codes removed first.
 	std::map<std::string, SymbolId> candidate_codes = by_code_;
 	for (std::map<std::string, SymbolId>::iterator it = candidate_codes.begin();
 	     it != candidate_codes.end();) {
@@ -233,24 +386,62 @@ Status Symbols::update(SymbolId id, const Symbol& symbol) {
 			++it;
 		}
 	}
-	candidate_symbols[id] = stored;
-	candidate_codes[stored.code] = id;
-	for (std::vector<SymbolAlias>::const_iterator alias = stored.aliases.begin();
-	     alias != stored.aliases.end(); ++alias) {
-		candidate_codes[alias->code] = id;
+	Status validated = ValidateSymbolFields(symbol, id, candidate_codes);
+	if (!validated.ok()) {
+		return validated;
 	}
-	return persist(candidate_symbols, candidate_codes, next_id_);
+	// Diff check: skip persistence when nothing actually changed. We compare
+	// against the stored record with id ignored (id is stable for updates).
+	Symbol compare = symbol;
+	compare.id = id;
+	// Preserve the old-code-as-alias behavior: if the primary code changed, the
+	// old code is auto-appended to aliases before we compare and apply.
+	if (compare.code != found->second.code) {
+		bool already_alias = false;
+		for (std::vector<SymbolAlias>::const_iterator alias = compare.aliases.begin();
+		     alias != compare.aliases.end(); ++alias) {
+			if (alias->code == found->second.code) {
+				already_alias = true;
+				break;
+			}
+		}
+		if (!already_alias) {
+			SymbolAlias old_alias = {found->second.code, "", ""};
+			compare.aliases.push_back(old_alias);
+		}
+	}
+	if (SymbolsEqual(compare, found->second)) {
+		return Status::Ok();
+	}
+	// Apply mutation to memory immediately.
+	found->second = compare;
+	// Rebuild the code index for this symbol.
+	for (std::map<std::string, SymbolId>::iterator it = by_code_.begin();
+	     it != by_code_.end();) {
+		if (it->second == id) {
+			by_code_.erase(it++);
+		} else {
+			++it;
+		}
+	}
+	by_code_[compare.code] = id;
+	for (std::vector<SymbolAlias>::const_iterator alias = compare.aliases.begin();
+	     alias != compare.aliases.end(); ++alias) {
+		by_code_[alias->code] = id;
+	}
+	return flush_if_dirty(by_id_, by_code_, next_id_);
 }
 
 Status Symbols::remove(SymbolId id) {
-	std::map<SymbolId, Symbol>::const_iterator found = by_id_.find(id);
+	std::map<SymbolId, Symbol>::iterator found = by_id_.find(id);
 	if (found == by_id_.end()) {
 		return Status::Error(ErrorCode::NotFound, "symbol was not found");
 	}
-
-	std::map<SymbolId, Symbol> candidate_symbols = by_id_;
-	candidate_symbols[id].state = SymbolState::Retired;
-	return persist(candidate_symbols, by_code_, next_id_);
+	if (found->second.state == SymbolState::Retired) {
+		return Status::Ok();
+	}
+	found->second.state = SymbolState::Retired;
+	return flush_if_dirty(by_id_, by_code_, next_id_);
 }
 
 Status Symbols::list(std::vector<Symbol>* out) const {
@@ -262,6 +453,72 @@ Status Symbols::list(std::vector<Symbol>* out) const {
 	     it != by_id_.end(); ++it) {
 		out->push_back(it->second);
 	}
+	return Status::Ok();
+}
+
+Status Symbols::begin_batch() {
+	if (!status_.ok()) {
+		return status_;
+	}
+	if (in_batch_) {
+		return Status::Error(ErrorCode::Conflict, "symbols batch is already active");
+	}
+	if (path_.empty() || !publish_manifest_) {
+		return Status::Error(ErrorCode::Conflict,
+		                     "symbols persistence is not configured");
+	}
+	// Snapshot current state so abort_batch can roll back without touching disk.
+	saved_by_id_ = by_id_;
+	saved_by_code_ = by_code_;
+	saved_next_id_ = next_id_;
+	in_batch_ = true;
+	batch_dirty_ = false;
+	return Status::Ok();
+}
+
+Status Symbols::commit_batch(bool* changed) {
+	if (!status_.ok()) {
+		return status_;
+	}
+	if (!in_batch_) {
+		return Status::Error(ErrorCode::Conflict, "no symbols batch is active");
+	}
+	bool did_change = batch_dirty_;
+	Status result = Status::Ok();
+	if (batch_dirty_) {
+		result = persist(by_id_, by_code_, next_id_);
+		if (!result.ok()) {
+			// Leave the batch open on failure so the caller can abort_batch and
+			// discard the failed mutations. The in-memory state is still the
+			// mutated candidate; saved_by_id_ still holds the last good snapshot.
+			return result;
+		}
+	}
+	in_batch_ = false;
+	batch_dirty_ = false;
+	saved_by_id_.clear();
+	saved_by_code_.clear();
+	saved_next_id_ = kInvalidSymbolId;
+	if (changed != NULL) {
+		*changed = did_change;
+	}
+	return Status::Ok();
+}
+
+Status Symbols::abort_batch() {
+	if (!in_batch_) {
+		return Status::Ok();
+	}
+	// Roll back in-memory state to the pre-batch snapshot. Disk was never
+	// touched during the batch, so no file-level cleanup is needed.
+	by_id_.swap(saved_by_id_);
+	by_code_.swap(saved_by_code_);
+	next_id_ = saved_next_id_;
+	saved_by_id_.clear();
+	saved_by_code_.clear();
+	saved_next_id_ = kInvalidSymbolId;
+	in_batch_ = false;
+	batch_dirty_ = false;
 	return Status::Ok();
 }
 

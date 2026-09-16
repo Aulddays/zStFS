@@ -92,19 +92,47 @@ private:
 
 // Symbols owns all Symbol records for one Market, including the stable ID map
 // and the external code lookup index.
+//
+// Mutation modes:
+// - Immediate (default): each upsert/add/update/remove persists synchronously.
+// - Batched: begin_batch() defers persistence until commit_batch(). During a
+//   batch, mutations stay in memory; commit_batch writes the full snapshot once
+//   and publishes one manifest generation. If no record actually changed during
+//   the batch, commit_batch is a no-op and nothing is written.
+//
+// upsert(code-based) is the preferred single-entry mutation: it creates a new
+// symbol when the code is unknown, updates it when any field differs from the
+// stored record, and does nothing when every field already matches.
 class Symbols {
 public:
 	Symbols();
 
+	// upsert inserts or updates one symbol keyed by symbol.code. Returns the
+	// resolved SymbolId via out_id when provided. Returns Ok but sets
+	// *updated = false when the stored record already matches exactly.
+	Status upsert(const Symbol& symbol, SymbolId* out_id, bool* updated);
+	// add inserts a new symbol. Prefer upsert for idempotent ingestion.
 	Status add(const Symbol& symbol, SymbolId* out_id);
 	Status get(SymbolId id, Symbol* out) const;
 	Status find(const std::string& code, Symbol* out) const;
 	Status find(const std::string& code,
 	            const std::string& date,
 	            Symbol* out) const;
+	// update replaces an existing symbol by id. Prefer upsert for idempotent
+	// ingestion; update is useful when the caller already holds a SymbolId.
 	Status update(SymbolId id, const Symbol& symbol);
 	Status remove(SymbolId id);
 	Status list(std::vector<Symbol>* out) const;
+
+	// begin_batch enters deferred-persistence mode. Nested batches are not
+	// supported; calling begin_batch while a batch is active returns Conflict.
+	Status begin_batch();
+	// commit_batch flushes one snapshot if anything changed during the batch and
+	// ends the batch. Returns Ok with *changed = false when nothing changed.
+	Status commit_batch(bool* changed);
+	// abort_batch discards all in-batch mutations and restores the last
+	// persisted state. Safe to call when no batch is active (no-op).
+	Status abort_batch();
 
 private:
 	friend class Market;
@@ -119,6 +147,15 @@ private:
 	Status persist(const std::map<SymbolId, Symbol>& symbols,
 	               const std::map<std::string, SymbolId>& codes,
 	               SymbolId next_id);
+	// apply_upsert performs the in-memory insert-or-update comparison. Returns
+	// true when the stored state actually changed; false when the record already
+	// matched field-by-field. Does not touch disk.
+	bool apply_upsert(const Symbol& symbol, SymbolId* out_id);
+	// flush_if_dirty persists candidate state outside of a batch. Inside a
+	// batch, it records that a change has been observed and returns immediately.
+	Status flush_if_dirty(const std::map<SymbolId, Symbol>& symbols,
+	                      const std::map<std::string, SymbolId>& codes,
+	                      SymbolId next_id);
 
 	std::map<SymbolId, Symbol> by_id_;
 	std::map<std::string, SymbolId> by_code_;
@@ -126,6 +163,13 @@ private:
 	std::string path_;
 	std::function<Status()> publish_manifest_;
 	Status status_;
+
+	bool in_batch_;
+	bool batch_dirty_;
+	// Pre-batch snapshot used by abort_batch to roll back in-memory state.
+	std::map<SymbolId, Symbol> saved_by_id_;
+	std::map<std::string, SymbolId> saved_by_code_;
+	SymbolId saved_next_id_;
 };
 
 // Actions owns the dated corporate-action records for one Market. Its records

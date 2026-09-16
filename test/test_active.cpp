@@ -745,6 +745,153 @@ void TestOfflineVaultCompaction() {
 	RemoveTestDirectory(duplicate_path);
 }
 
+void TestSymbolUpsertAndBatch() {
+	const std::string path = MakeTestDirectory();
+	{
+		MarketFixture fixture(path, "sym-test", "CNA");
+		zstfs::Market& market = fixture.market();
+		zstfs::Symbols& syms = market.symbols();
+
+		// --- Upsert insert path ---
+		zstfs::Symbol s1 = {};
+		s1.code = "000001";
+		s1.name = "Ping An Bank";
+		s1.security_type = "stock";
+		s1.industry = "finance";
+		s1.list_date = "19910403";
+		s1.volume_unit = 100;
+		s1.state = zstfs::SymbolState::Active;
+		zstfs::SymbolId id1 = 0;
+		bool updated = false;
+		ExpectOk(syms.upsert(s1, &id1, &updated));
+		assert(updated);
+		assert(id1 != zstfs::kInvalidSymbolId);
+
+		// --- Upsert no-op when identical ---
+		zstfs::Symbol s1b = s1;
+		bool updated2 = true;
+		zstfs::SymbolId id1b = 0;
+		ExpectOk(syms.upsert(s1b, &id1b, &updated2));
+		assert(!updated2);
+		assert(id1b == id1);
+
+		// --- Upsert update path (field change) ---
+		zstfs::Symbol s1c = s1;
+		s1c.name = "Ping An Bank Co., Ltd.";
+		bool updated3 = false;
+		ExpectOk(syms.upsert(s1c, NULL, &updated3));
+		assert(updated3);
+		zstfs::Symbol fetched = {};
+		ExpectOk(syms.get(id1, &fetched));
+		assert(fetched.name == "Ping An Bank Co., Ltd.");
+
+		// --- Add second symbol for batch tests ---
+		zstfs::Symbol s2 = {};
+		s2.code = "000002";
+		s2.name = "Vanke";
+		s2.security_type = "stock";
+		s2.industry = "realestate";
+		s2.state = zstfs::SymbolState::Active;
+		zstfs::SymbolId id2 = 0;
+		ExpectOk(syms.add(s2, &id2));
+		assert(id2 != id1);
+
+		// --- Batch: no changes means no write ---
+		ExpectOk(syms.begin_batch());
+		bool batch_changed = true;
+		ExpectOk(syms.commit_batch(&batch_changed));
+		assert(!batch_changed);
+
+		// --- Batch: multiple upserts, only one commit ---
+		ExpectOk(syms.begin_batch());
+		zstfs::Symbol s3 = {};
+		s3.code = "000003";
+		s3.name = "New Stock";
+		s3.state = zstfs::SymbolState::Active;
+		bool b_up1 = false;
+		ExpectOk(syms.upsert(s3, NULL, &b_up1));
+		assert(b_up1);
+
+		// Update s1 name again (second change in same batch)
+		zstfs::Symbol s1d = s1c;
+		s1d.name = "PAB";
+		bool b_up2 = false;
+		ExpectOk(syms.upsert(s1d, NULL, &b_up2));
+		assert(b_up2);
+
+		// Upsert with no actual change
+		zstfs::Symbol s2dup = s2;
+		bool b_up3 = true;
+		ExpectOk(syms.upsert(s2dup, NULL, &b_up3));
+		assert(!b_up3);
+
+		bool batch_changed2 = false;
+		ExpectOk(syms.commit_batch(&batch_changed2));
+		assert(batch_changed2);
+
+		// Verify both changes are visible
+		zstfs::Symbol f3 = {};
+		ExpectOk(syms.find("000003", &f3));
+		assert(f3.name == "New Stock");
+		zstfs::Symbol f1 = {};
+		ExpectOk(syms.find("000001", &f1));
+		assert(f1.name == "PAB");
+
+		// --- Batch abort rolls back in-memory state ---
+		size_t count_before = 0;
+		std::vector<zstfs::Symbol> list_before;
+		ExpectOk(syms.list(&list_before));
+		count_before = list_before.size();
+
+		ExpectOk(syms.begin_batch());
+		zstfs::Symbol s4 = {};
+		s4.code = "000004";
+		s4.name = "To Be Aborted";
+		s4.state = zstfs::SymbolState::Active;
+		ExpectOk(syms.upsert(s4, NULL, NULL));
+		// Visible inside the batch
+		zstfs::Symbol f4 = {};
+		ExpectOk(syms.find("000004", &f4));
+		assert(f4.name == "To Be Aborted");
+
+		ExpectOk(syms.abort_batch());
+		// No longer visible after abort
+		assert(syms.find("000004", &f4).code() == zstfs::ErrorCode::NotFound);
+		std::vector<zstfs::Symbol> list_after;
+		ExpectOk(syms.list(&list_after));
+		assert(list_after.size() == count_before);
+
+		// --- Nested batch rejected ---
+		ExpectOk(syms.begin_batch());
+		assert(syms.begin_batch().code() == zstfs::ErrorCode::Conflict);
+		ExpectOk(syms.abort_batch());
+
+		// --- Remove: idempotent (second remove is no-op) ---
+		ExpectOk(syms.remove(id2));
+		zstfs::Symbol f2 = {};
+		ExpectOk(syms.get(id2, &f2));
+		assert(f2.state == zstfs::SymbolState::Retired);
+		ExpectOk(syms.remove(id2));  // no-op, already retired
+	}
+	// Restart and verify persistence
+	{
+		MarketFixture fixture(path, "sym-test", "CNA");
+		zstfs::Symbols& syms = fixture.market().symbols();
+		zstfs::Symbol f1 = {};
+		ExpectOk(syms.find("000001", &f1));
+		assert(f1.name == "PAB");
+		zstfs::Symbol f3 = {};
+		ExpectOk(syms.find("000003", &f3));
+		assert(f3.name == "New Stock");
+		zstfs::Symbol f2 = {};
+		ExpectOk(syms.find("000002", &f2));
+		assert(f2.state == zstfs::SymbolState::Retired);
+		// Aborted symbol was never persisted
+		assert(syms.find("000004", &f2).code() == zstfs::ErrorCode::NotFound);
+	}
+	RemoveTestDirectory(path);
+}
+
 }  // namespace
 
 int main() {
@@ -755,5 +902,6 @@ int main() {
 	TestVaultPersistenceMergeAndCorruption();
 	TestManifestAndActions();
 	TestOfflineVaultCompaction();
+	TestSymbolUpsertAndBatch();
 	return 0;
 }
