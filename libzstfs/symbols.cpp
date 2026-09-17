@@ -46,13 +46,15 @@ static bool SymbolsEqual(const Symbol& a, const Symbol& b) {
 	if (a.code != b.code ||
 	    a.name != b.name ||
 	    a.security_type != b.security_type ||
+	    a.exchange != b.exchange ||
+	    a.board != b.board ||
 	    a.industry != b.industry ||
 	    a.list_date != b.list_date ||
 	    a.delist_date != b.delist_date ||
 	    a.share_capital != b.share_capital ||
 	    a.tradable_share != b.tradable_share ||
-	    a.volume_unit != b.volume_unit ||
 	    a.state != b.state ||
+	    a.trade_state != b.trade_state ||
 	    a.aliases.size() != b.aliases.size()) {
 		return false;
 	}
@@ -547,15 +549,17 @@ Status Symbols::save(const std::map<SymbolId, Symbol>& symbols,
 		if (!PutString(&record, symbol.code) ||
 		    !PutString(&record, symbol.name) ||
 		    !PutString(&record, symbol.security_type) ||
+		    !PutString(&record, symbol.exchange) ||
+		    !PutString(&record, symbol.board) ||
 		    !PutString(&record, symbol.industry) ||
 		    !PutString(&record, symbol.list_date) ||
-		    !PutString(&record, symbol.delist_date)) {
+		    !PutString(&record, symbol.delist_date) ||
+		    !PutString(&record, symbol.trade_state)) {
 			return Status::Error(ErrorCode::InvalidArgument,
 			                     "symbol field is too long");
 		}
 		PutU64(&record, symbol.share_capital);
 		PutU64(&record, symbol.tradable_share);
-		PutU32(&record, symbol.volume_unit);
 		if (symbol.aliases.size() > std::numeric_limits<uint16_t>::max()) {
 			return Status::Error(ErrorCode::InvalidArgument,
 			                     "too many symbol aliases");
@@ -671,12 +675,14 @@ Status Symbols::load() {
 		    !GetString(record, &record_offset, &symbol.code) ||
 		    !GetString(record, &record_offset, &symbol.name) ||
 		    !GetString(record, &record_offset, &symbol.security_type) ||
+		    !GetString(record, &record_offset, &symbol.exchange) ||
+		    !GetString(record, &record_offset, &symbol.board) ||
 		    !GetString(record, &record_offset, &symbol.industry) ||
 		    !GetString(record, &record_offset, &symbol.list_date) ||
 		    !GetString(record, &record_offset, &symbol.delist_date) ||
+		    !GetString(record, &record_offset, &symbol.trade_state) ||
 		    !GetU64(record, &record_offset, &symbol.share_capital) ||
 		    !GetU64(record, &record_offset, &symbol.tradable_share) ||
-		    !GetU32(record, &record_offset, &symbol.volume_unit) ||
 		    symbol.id == kInvalidSymbolId ||
 		    state > static_cast<uint8_t>(SymbolState::Retired) ||
 		    symbol.code.empty()) {

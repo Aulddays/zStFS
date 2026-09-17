@@ -285,18 +285,31 @@ bool ParseSymbol(const json& object, zstfs::Symbol* symbol, std::string* error) 
 		*error = "code is required";
 		return false;
 	}
+	// null_value returns the fallback when the key is absent or null, otherwise
+	// returns the value. This gives null == absent == default semantics, which
+	// matches the full-replace behavior of upsert.
+	auto null_value = [&object](const char* key, const std::string& def) -> std::string {
+		if (!object.contains(key) || object[key].is_null()) return def;
+		return object.value(key, def);
+	};
+	auto null_num = [&object](const char* key, uint64_t def) -> uint64_t {
+		if (!object.contains(key) || object[key].is_null()) return def;
+		return object.value(key, def);
+	};
 	symbol->id = 0;
 	symbol->code = object["code"].get<std::string>();
-	symbol->name = object.value("name", std::string());
-	symbol->security_type = object.value("security_type", std::string());
-	symbol->industry = object.value("industry", std::string());
-	symbol->list_date = object.value("list_date", std::string());
-	symbol->delist_date = object.value("delist_date", std::string());
-	symbol->share_capital = object.value("share_capital", static_cast<uint64_t>(0));
-	symbol->tradable_share = object.value("tradable_share", static_cast<uint64_t>(0));
-	symbol->volume_unit = object.value("volume_unit", static_cast<uint32_t>(1));
+	symbol->name = null_value("name", std::string());
+	symbol->security_type = null_value("security_type", std::string());
+	symbol->exchange = null_value("exchange", std::string());
+	symbol->board = null_value("board", std::string());
+	symbol->industry = null_value("industry", std::string());
+	symbol->list_date = null_value("list_date", std::string());
+	symbol->delist_date = null_value("delist_date", std::string());
+	symbol->trade_state = null_value("trade_state", std::string());
+	symbol->share_capital = null_num("share_capital", static_cast<uint64_t>(0));
+	symbol->tradable_share = null_num("tradable_share", static_cast<uint64_t>(0));
 	symbol->state = zstfs::SymbolState::Active;
-	if (object.contains("state")) {
+	if (object.contains("state") && !object["state"].is_null()) {
 		if (!object["state"].is_string() || object["state"].get<std::string>() != "active" && object["state"].get<std::string>() != "retired") {
 			*error = "state must be active or retired";
 			return false;
@@ -382,12 +395,14 @@ json SymbolJson(const zstfs::Symbol& symbol) {
 		{"code", symbol.code},
 		{"name", symbol.name},
 		{"security_type", symbol.security_type},
+		{"exchange", symbol.exchange},
+		{"board", symbol.board},
 		{"industry", symbol.industry},
 		{"list_date", symbol.list_date},
 		{"delist_date", symbol.delist_date},
+		{"trade_state", symbol.trade_state},
 		{"share_capital", symbol.share_capital},
 		{"tradable_share", symbol.tradable_share},
-		{"volume_unit", symbol.volume_unit},
 		{"state", symbol.state == zstfs::SymbolState::Active ? "active" : "retired"}
 	};
 	json aliases = json::array();

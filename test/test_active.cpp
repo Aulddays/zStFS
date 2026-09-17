@@ -759,7 +759,6 @@ void TestSymbolUpsertAndBatch() {
 		s1.security_type = "stock";
 		s1.industry = "finance";
 		s1.list_date = "19910403";
-		s1.volume_unit = 100;
 		s1.state = zstfs::SymbolState::Active;
 		zstfs::SymbolId id1 = 0;
 		bool updated = false;

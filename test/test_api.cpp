@@ -27,7 +27,6 @@ static zstfs::Symbol NewSymbol(const std::string& code) {
 	symbol.list_date = "20260803";
 	symbol.share_capital = 1000;
 	symbol.tradable_share = 900;
-	symbol.volume_unit = 1;
 	symbol.state = zstfs::SymbolState::Active;
 	return symbol;
 }

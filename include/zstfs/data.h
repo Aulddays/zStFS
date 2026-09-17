@@ -92,14 +92,16 @@ struct Symbol {
 	SymbolId id;
 	std::string code;
 	std::string name;
-	std::string security_type;
+	std::string security_type;	// index/stock/etf...
+	std::string exchange;	// SH/SZ/BJ...
+	std::string board;	// Main/STAR/ChiNext...
 	std::string industry;
 	std::string list_date;
 	std::string delist_date;
 	uint64_t share_capital;
 	uint64_t tradable_share;
-	uint32_t volume_unit;
 	SymbolState state;
+	std::string trade_state;	// purchase/redeem status
 	std::vector<SymbolAlias> aliases;
 };
 
