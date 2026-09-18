@@ -273,7 +273,7 @@ void TestAutomaticFlush() {
 			1, 60 * 1000);
 		ExpectOk(active.put(9, time_id, block_id, block_offset, bar, false));
 		ExpectOk(active.flush_if_needed());
-		assert(FileSize(threshold_path + "/active.data") == 56);
+		assert(FileSize(threshold_path + "/active.data") == 36);
 	}
 	RemoveTestDirectory(threshold_path);
 
@@ -283,7 +283,7 @@ void TestAutomaticFlush() {
 			1024 * 1024, 5);
 		ExpectOk(active.put(9, time_id, block_id, block_offset, bar, false));
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
-		assert(FileSize(timer_path + "/active.data") == 56);
+		assert(FileSize(timer_path + "/active.data") == 36);
 	}
 	RemoveTestDirectory(timer_path);
 }
@@ -319,7 +319,7 @@ void TestStagingBatchAndIndexRecovery() {
 	zstfs::ActiveBar second_bar = {32, time_id, second};
 
 	{
-		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, frequency_path);
+		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, frequency_path, 10001);
 		std::vector<zstfs::StockTimeBlock> first_batch(1, first_block);
 		std::vector<zstfs::ActiveBar> first_bars(1, first_bar);
 		ExpectOk(staging.accept(first_batch, first_bars));
@@ -340,12 +340,12 @@ void TestStagingBatchAndIndexRecovery() {
 	corrupt_index.write("invalid", 7);
 	corrupt_index.close();
 	{
-		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, frequency_path);
+		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, frequency_path, 10002);
 		zstfs::BlockBar value = {};
 		ExpectOk(staging.get(31, time_id, &value));
-		assert(value.close > 9.9 && value.close < 10.1);
+		assert(value.close > 9.9f && value.close < 10.1f);
 		ExpectOk(staging.get(32, time_id, &value));
-		assert(value.close > 19.9 && value.close < 20.1);
+		assert(value.close > 19.9f && value.close < 20.1f);
 	}
 	std::fstream corrupt_page((frequency_path + "/staging-pages-0001.seg").c_str(),
 		std::ios::binary | std::ios::in | std::ios::out);
@@ -353,7 +353,7 @@ void TestStagingBatchAndIndexRecovery() {
 	corrupt_page.write("X", 1);
 	corrupt_page.close();
 	{
-		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, frequency_path);
+		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, frequency_path, 10003);
 		zstfs::BlockBar value = {};
 		assert(staging.get(31, time_id, &value).code() == zstfs::ErrorCode::CorruptData);
 	}
@@ -620,11 +620,11 @@ void PopulateCompactionFixture(const std::string& path) {
 	}
 	{
 		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar,
-			MarketPath(path, "compaction-test") + "/daily");
+			MarketPath(path, "compaction-test") + "/daily", 20004);
 		ExpectOk(staging.accept(std::vector<zstfs::StockTimeBlock>(1, staged), staged_bars));
 		zstfs::VaultStore vault(zstfs::Frequency::Daily, calendar,
 			MarketPath(path, "compaction-test") + "/daily", 991);
-		IngestVaultBar(&vault, calendar, symbol_id, "20270105", 50.0);
+		IngestVaultBar(&vault, calendar, symbol_id, "20270105", 50.0f);
 	}
 	ExpectOk(bootstrap.sync());
 }
@@ -658,7 +658,7 @@ void TestOfflineVaultCompaction() {
 	const std::string frequency_path = MarketPath(path, "compaction-test") + "/daily";
 	std::map<std::pair<zstfs::SymbolId, zstfs::TimeId>, std::vector<uint8_t> > original_frames;
 	{
-		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, frequency_path);
+		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, frequency_path, 20005);
 		zstfs::VaultStore vault(zstfs::Frequency::Daily, calendar, frequency_path, 992);
 		std::vector<zstfs::StockTimeBlock> blocks;
 		std::vector<zstfs::ActiveBar> bars;

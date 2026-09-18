@@ -18,11 +18,11 @@ namespace zstfs {
 // reconstructed as a unit by range reads and by the relational predictors.
 struct BlockBar {
 	BarState state;
-	double open;
-	double high;
-	double low;
-	double close;
-	double volume;
+	float open;
+	float high;
+	float low;
+	float close;
+	float volume;
 };
 
 struct BarBlockFrame {

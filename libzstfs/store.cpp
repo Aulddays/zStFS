@@ -38,11 +38,11 @@ namespace zstfs {
 // =============================================================================
 
 
-static bool ValidState(BarState state) {
+bool ValidState(BarState state) {
 	return state >= BarState::Normal && state <= BarState::Missing;
 }
 
-static bool ValidBar(const BlockBar& bar) {
+bool ValidBar(const BlockBar& bar) {
 	return bar.state != BarState::Normal ||
 		(std::isfinite(bar.open) && bar.open > 0.0 &&
 		 std::isfinite(bar.high) && bar.high >= 0.0 &&
@@ -63,31 +63,13 @@ static bool ValidBar(const BlockBar& bar) {
 // Active workload; M4 keeps sealed records in the log until persistent Staging exists.
 // =============================================================================
 
-static const uint32_t kActiveRecordMagic = 0x3141545a;  // "ZTA1" in little-endian bytes.
-static const uint8_t kActiveRecordVersion = 1;
-static const size_t kActiveRecordBytes = 56;
-
-struct ActiveRecord {
-	Frequency frequency;
-	SymbolId symbol_id;
-	TimeId time_id;
-	BlockBar bar;
-};
-
-struct ResolvedBar {
-	Bar bar;
-	TimeId time_id;
-	TimeId block_id;
-	BlockOff block_offset;
-};
-
-static BlockBar MissingBlockBar() {
+BlockBar MissingBlockBar() {
 	BlockBar bar = {};
 	bar.state = BarState::Missing;
 	return bar;
 }
 
-static bool SerializeActiveRecord(const ActiveRecord& record,
+bool SerializeActiveRecord(const ActiveRecord& record,
 				  std::vector<uint8_t>* bytes) {
 	if (bytes == NULL || !ValidState(record.bar.state) ||
 		record.symbol_id == kInvalidSymbolId || !ValidBar(record.bar)) {
@@ -101,15 +83,15 @@ static bool SerializeActiveRecord(const ActiveRecord& record,
 	PutU8(bytes, 0);
 	PutU32(bytes, record.symbol_id);
 	PutU32(bytes, record.time_id);
-	PutDouble(bytes, record.bar.open);
-	PutDouble(bytes, record.bar.high);
-	PutDouble(bytes, record.bar.low);
-	PutDouble(bytes, record.bar.close);
-	PutDouble(bytes, record.bar.volume);
+	PutFloat(bytes, record.bar.open);
+	PutFloat(bytes, record.bar.high);
+	PutFloat(bytes, record.bar.low);
+	PutFloat(bytes, record.bar.close);
+	PutFloat(bytes, record.bar.volume);
 	return bytes->size() == kActiveRecordBytes;
 }
 
-static Status ParseActiveRecord(const std::vector<uint8_t>& bytes,
+Status ParseActiveRecord(const std::vector<uint8_t>& bytes,
 				size_t offset,
 				ActiveRecord* record) {
 	if (record == NULL || offset > bytes.size() ||
@@ -129,11 +111,11 @@ static Status ParseActiveRecord(const std::vector<uint8_t>& bytes,
 		!GetU8(data, &cursor, &reserved) ||
 		!GetU32(data, &cursor, &record->symbol_id) ||
 		!GetU32(data, &cursor, &record->time_id) ||
-		!GetDouble(data, &cursor, &record->bar.open) ||
-		!GetDouble(data, &cursor, &record->bar.high) ||
-		!GetDouble(data, &cursor, &record->bar.low) ||
-		!GetDouble(data, &cursor, &record->bar.close) ||
-		!GetDouble(data, &cursor, &record->bar.volume) ||
+		!GetFloat(data, &cursor, &record->bar.open) ||
+		!GetFloat(data, &cursor, &record->bar.high) ||
+		!GetFloat(data, &cursor, &record->bar.low) ||
+		!GetFloat(data, &cursor, &record->bar.close) ||
+		!GetFloat(data, &cursor, &record->bar.volume) ||
 		cursor != data.size() || magic != kActiveRecordMagic ||
 		version != kActiveRecordVersion || reserved != 0 || frequency > 1 ||
 		record->symbol_id == kInvalidSymbolId) {
@@ -147,7 +129,7 @@ static Status ParseActiveRecord(const std::vector<uint8_t>& bytes,
 	return Status::Ok();
 }
 
-static Status ResolveTime(const Calendar& calendar,
+Status ResolveTime(const Calendar& calendar,
 			  Frequency frequency,
 			  const std::string& local_time,
 			  TimeId* time_id,
@@ -179,7 +161,7 @@ static Status ResolveTime(const Calendar& calendar,
 	return calendar.block_offset(frequency, local_time, block_id, block_offset);
 }
 
-static Status LocalTime(const Calendar& calendar,
+Status LocalTime(const Calendar& calendar,
 			    Frequency frequency,
 			    TimeId time_id,
 			    std::string* out) {
@@ -196,7 +178,7 @@ static Status LocalTime(const Calendar& calendar,
 	return calendar.local_time(day_time_id, time_slot(time_id), out);
 }
 
-static bool ActiveBarOrder(const ActiveBar& left, const ActiveBar& right) {
+bool ActiveBarOrder(const ActiveBar& left, const ActiveBar& right) {
 	return left.time_id != right.time_id ? left.time_id < right.time_id :
 		left.symbol_id < right.symbol_id;
 }
@@ -631,12 +613,11 @@ Status ActiveStore::replay_status() const {
 }
 
 // =============================================================================
-// Staging Pages and Index
+// Staging page types and shared cache forward declarations
 //
-// Staging pages are variable-length sequential file records. The 64 KiB target
-// controls aggregation only: a page closes after appending the first complete
-// block that reaches the target, so no padding or special oversized-page format
-// is needed. A separate index maps immutable block keys to page locators.
+// ParsedStagingRecord and PendingStagingRecord are defined here so the shared
+// cache function declarations (below) can reference them. The full cache
+// implementation lives in the vault section further down.
 // =============================================================================
 
 static const size_t kStagingPageTargetBytes = 64 * 1024;
@@ -656,6 +637,28 @@ struct ParsedStagingRecord {
 	std::vector<uint8_t> frame_bytes;
 };
 
+enum class CacheStoreType : uint8_t {
+	Vault = 0,
+	Staging = 1
+};
+static void InsertCompressedCache(CacheStoreType store_type, uint64_t runtime_market_id,
+	Frequency frequency, uint32_t segment_id, uint64_t offset, const std::vector<uint8_t>& bytes);
+static bool GetCompressedCache(CacheStoreType store_type, uint64_t runtime_market_id,
+	Frequency frequency, uint32_t segment_id, uint64_t offset, std::vector<uint8_t>* bytes);
+static void InsertStagingDecodedCache(uint64_t runtime_market_id, Frequency frequency,
+	uint32_t segment_id, uint64_t page_offset, const std::vector<ParsedStagingRecord>& records);
+static bool GetStagingDecodedCache(uint64_t runtime_market_id, Frequency frequency,
+	uint32_t segment_id, uint64_t page_offset, std::vector<ParsedStagingRecord>* records);
+
+// =============================================================================
+// Staging Pages and Index
+//
+// Staging pages are variable-length sequential file records. The 64 KiB target
+// controls aggregation only: a page closes after appending the first complete
+// block that reaches the target, so no padding or special oversized-page format
+// is needed. A separate index maps immutable block keys to page locators.
+// =============================================================================
+
 static bool PendingStagingOrder(const PendingStagingRecord& left,
 					const PendingStagingRecord& right) {
 	return left.block.key.time_block_id != right.block.key.time_block_id ?
@@ -663,7 +666,7 @@ static bool PendingStagingOrder(const PendingStagingRecord& left,
 		left.block.key.symbol_id < right.block.key.symbol_id;
 }
 
-static bool SameBlockBar(const BlockBar& left, const BlockBar& right) {
+bool SameBlockBar(const BlockBar& left, const BlockBar& right) {
 	return left.state == right.state && left.open == right.open && left.high == right.high &&
 		left.low == right.low && left.close == right.close && left.volume == right.volume;
 }
@@ -690,7 +693,7 @@ static bool ReadFile(const std::string& path, std::vector<uint8_t>* bytes) {
 	return input.good() || input.eof();
 }
 
-static Status StagingTimeIds(const Calendar& calendar,
+Status StagingTimeIds(const Calendar& calendar,
 				     Frequency frequency,
 				     TimeId block_id,
 				     BlockOff position_count,
@@ -962,24 +965,56 @@ static Status ParseStagingPage(const Calendar& calendar,
 
 StagingStore::StagingStore(Frequency frequency,
 				   const Calendar& calendar,
-				   const std::string& frequency_path)
+				   const std::string& frequency_path,
+				   uint64_t runtime_market_id)
 	: frequency_(frequency),
 	  calendar_(calendar),
 	  path_(frequency_path),
+	  runtime_market_id_(runtime_market_id),
 	  status_(Status::Ok()),
 	  next_page_id_(1),
 	  current_segment_id_(1) {
 	status_ = load();
 }
 
+Status StagingStore::load_page(uint32_t segment_id, uint64_t page_offset, uint32_t page_length,
+					 std::vector<ParsedStagingRecord>* records) const {
+	// First try the decoded page cache.
+	if (GetStagingDecodedCache(runtime_market_id_, frequency_, segment_id, page_offset, records)) {
+		return Status::Ok();
+	}
+	// Try the compressed cache, then fall back to disk.
+	std::vector<uint8_t> page_bytes;
+	if (!GetCompressedCache(CacheStoreType::Staging, runtime_market_id_, frequency_,
+			segment_id, page_offset, &page_bytes)) {
+		std::ifstream input(StagingSegmentPath(path_, segment_id).c_str(), std::ios::binary);
+		if (!input) {
+			return Status::Error(ErrorCode::IoError, "cannot read staging segment");
+		}
+		input.seekg(static_cast<std::streamoff>(page_offset));
+		page_bytes.assign(page_length, 0);
+		input.read(reinterpret_cast<char*>(&page_bytes[0]), page_length);
+		if (input.gcount() != static_cast<std::streamsize>(page_length)) {
+			return Status::Error(ErrorCode::CorruptData, "truncated staging page");
+		}
+		InsertCompressedCache(CacheStoreType::Staging, runtime_market_id_, frequency_,
+			segment_id, page_offset, page_bytes);
+	}
+	uint32_t page_id = 0;
+	Status status = ParseStagingPage(calendar_, frequency_, page_bytes, records, &page_id);
+	if (!status.ok()) {
+		return status;
+	}
+	InsertStagingDecodedCache(runtime_market_id_, frequency_, segment_id, page_offset, *records);
+	return Status::Ok();
+}
+
 Status StagingStore::load() {
-	entries_.clear();
 	index_.clear();
 	next_page_id_ = 1;
 	current_segment_id_ = 1;
 
-	// A valid index directly locates pages for the M5 in-memory query state.
-	// Pages remain the source of truth when an index must be rebuilt.
+	// Load index first; if valid we skip full segment scan and verify lazily.
 	std::map<std::pair<TimeId, SymbolId>, Locator> persisted_index;
 	bool persisted_index_valid = false;
 	std::vector<uint8_t> index_bytes;
@@ -998,6 +1033,8 @@ Status StagingStore::load() {
 			version == kStagingVersion && stored_frequency == static_cast<uint8_t>(frequency_) &&
 			reserved == 0 && index_bytes.size() == 12 + static_cast<size_t>(count) * 28) {
 			persisted_index_valid = true;
+			uint32_t max_page_id = 0;
+			uint32_t max_segment = 0;
 			for (uint32_t i = 0; i < count; ++i) {
 				uint32_t block_id = 0;
 				uint32_t symbol_id = 0;
@@ -1014,56 +1051,20 @@ Status StagingStore::load() {
 					persisted_index_valid = false;
 					break;
 				}
+				max_segment = std::max(max_segment, locator.segment_id);
+				// We don't know page_id from index alone; set a safe lower bound.
+			}
+			if (persisted_index_valid) {
+				index_ = persisted_index;
+				current_segment_id_ = max_segment == 0 ? 1 : max_segment;
+				// next_page_id_ is only used by accept() to assign new ids; we
+				// recover it on the first full rebuild path below.
+				next_page_id_ = 1;
+				return Status::Ok();
 			}
 		}
 	}
-	if (persisted_index_valid) {
-		std::map<uint32_t, std::vector<uint8_t> > segment_bytes;
-		for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator locator =
-			 persisted_index.begin(); locator != persisted_index.end(); ++locator) {
-			std::map<uint32_t, std::vector<uint8_t> >::iterator segment =
-				segment_bytes.find(locator->second.segment_id);
-			if (segment == segment_bytes.end()) {
-				std::vector<uint8_t> bytes;
-				if (!ReadFile(StagingSegmentPath(path_, locator->second.segment_id), &bytes)) {
-					persisted_index_valid = false;
-					break;
-				}
-				segment = segment_bytes.insert(std::make_pair(locator->second.segment_id, bytes)).first;
-			}
-			if (locator->second.page_offset > segment->second.size() ||
-				locator->second.page_length > segment->second.size() - locator->second.page_offset) {
-				persisted_index_valid = false;
-				break;
-			}
-			const size_t page_offset = static_cast<size_t>(locator->second.page_offset);
-			std::vector<uint8_t> page(segment->second.begin() + page_offset,
-				segment->second.begin() + page_offset + locator->second.page_length);
-			std::vector<ParsedStagingRecord> parsed;
-			uint32_t page_id = 0;
-			Status status = ParseStagingPage(calendar_, frequency_, page, &parsed, &page_id);
-			if (!status.ok() || locator->second.record_index >= parsed.size() ||
-				parsed[locator->second.record_index].block.key.time_block_id != locator->first.first ||
-				parsed[locator->second.record_index].block.key.symbol_id != locator->first.second) {
-				persisted_index_valid = false;
-				break;
-			}
-			next_page_id_ = std::max(next_page_id_, page_id + 1);
-			current_segment_id_ = std::max(current_segment_id_, locator->second.segment_id);
-			Entry entry = {parsed[locator->second.record_index].block,
-				parsed[locator->second.record_index].bars,
-				parsed[locator->second.record_index].frame_bytes};
-			entries_[locator->first] = entry;
-		}
-		if (persisted_index_valid) {
-			index_ = persisted_index;
-			return Status::Ok();
-		}
-		entries_.clear();
-		index_.clear();
-		next_page_id_ = 1;
-		current_segment_id_ = 1;
-	}
+	// Fallback: rebuild index by scanning segment files.
 	for (uint32_t segment_id = 1;; ++segment_id) {
 		const std::string segment_path = StagingSegmentPath(path_, segment_id);
 		struct stat information;
@@ -1115,32 +1116,13 @@ Status StagingStore::load() {
 				Locator locator = {segment_id, static_cast<uint64_t>(offset),
 					static_cast<uint32_t>(page_length), static_cast<uint32_t>(record)};
 				index_[key] = locator;
-				Entry entry = {parsed[record].block, parsed[record].bars, parsed[record].frame_bytes};
-				entries_[key] = entry;
 			}
 			next_page_id_ = std::max(next_page_id_, page_id + 1);
 			offset += page_length;
 		}
 		current_segment_id_ = segment_id;
 	}
-	if (persisted_index_valid && persisted_index.size() == index_.size()) {
-		std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator expected =
-			persisted_index.begin();
-		std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator actual = index_.begin();
-		for (; expected != persisted_index.end(); ++expected, ++actual) {
-			if (expected->first != actual->first ||
-				expected->second.segment_id != actual->second.segment_id ||
-				expected->second.page_offset != actual->second.page_offset ||
-				expected->second.page_length != actual->second.page_length ||
-				expected->second.record_index != actual->second.record_index) {
-				persisted_index_valid = false;
-				break;
-			}
-		}
-	} else {
-		persisted_index_valid = false;
-	}
-	return persisted_index_valid ? Status::Ok() : write_index();
+	return write_index();
 }
 
 Status StagingStore::write_index() const {
@@ -1269,8 +1251,16 @@ Status StagingStore::accept(const std::vector<StockTimeBlock>& blocks,
 			Locator locator = {current_segment_id_, offset, static_cast<uint32_t>(page_bytes.size()),
 				static_cast<uint32_t>(record)};
 			index_[key] = locator;
-			Entry entry = {parsed[record].block, parsed[record].bars, parsed[record].frame_bytes};
-			entries_[key] = entry;
+		}
+		// New pages go straight into both caches (write-through).
+		std::vector<ParsedStagingRecord> new_records;
+		uint32_t new_page_id = 0;
+		Status page_status = ParseStagingPage(calendar_, frequency_, page_bytes, &new_records, &new_page_id);
+		if (page_status.ok()) {
+			InsertCompressedCache(CacheStoreType::Staging, runtime_market_id_, frequency_,
+				current_segment_id_, offset, page_bytes);
+			InsertStagingDecodedCache(runtime_market_id_, frequency_, current_segment_id_,
+				offset, new_records);
 		}
 		++next_page_id_;
 	}
@@ -1281,13 +1271,19 @@ bool StagingStore::contains(SymbolId symbol_id, TimeId time_id) const {
 	if (!status_.ok()) {
 		return false;
 	}
-	for (std::map<std::pair<TimeId, SymbolId>, Entry>::const_iterator entry = entries_.begin();
-		 entry != entries_.end(); ++entry) {
-		for (size_t i = 0; i < entry->second.bars.size(); ++i) {
-			if (entry->second.bars[i].symbol_id == symbol_id &&
-				entry->second.bars[i].time_id == time_id) {
-				return true;
-			}
+	// Locate the block+symbol key by scanning index keys. We check the
+	// block's time range against the requested time_id using day arithmetic.
+	const TimeId day = time_day(time_id);
+	const TimeId block_days = frequency_ == Frequency::Daily ?
+		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
+		 it != index_.end(); ++it) {
+		if (it->first.second != symbol_id) {
+			continue;
+		}
+		const TimeId block_start_day = time_day(it->first.first);
+		if (day >= block_start_day && day < block_start_day + block_days) {
+			return true;
 		}
 	}
 	return false;
@@ -1300,15 +1296,37 @@ Status StagingStore::get(SymbolId symbol_id, TimeId time_id, BlockBar* out) cons
 	if (!status_.ok()) {
 		return status_;
 	}
-	for (std::map<std::pair<TimeId, SymbolId>, Entry>::const_iterator entry = entries_.begin();
-		 entry != entries_.end(); ++entry) {
-		for (size_t i = 0; i < entry->second.bars.size(); ++i) {
-			if (entry->second.bars[i].symbol_id == symbol_id &&
-				entry->second.bars[i].time_id == time_id) {
-				*out = entry->second.bars[i].bar;
+	// Find the matching block in the index by checking each (block_id, symbol_id)
+	// entry's time range.
+	const TimeId day = time_day(time_id);
+	const TimeId block_days = frequency_ == Frequency::Daily ?
+		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
+		 it != index_.end(); ++it) {
+		if (it->first.second != symbol_id) {
+			continue;
+		}
+		const TimeId block_start_day = time_day(it->first.first);
+		if (day < block_start_day || day >= block_start_day + block_days) {
+			continue;
+		}
+		std::vector<ParsedStagingRecord> records;
+		Status status = load_page(it->second.segment_id, it->second.page_offset,
+			it->second.page_length, &records);
+		if (!status.ok()) {
+			return status;
+		}
+		if (it->second.record_index >= records.size()) {
+			return Status::Error(ErrorCode::CorruptData, "staging record index out of range");
+		}
+		const ParsedStagingRecord& record = records[it->second.record_index];
+		for (size_t i = 0; i < record.bars.size(); ++i) {
+			if (record.bars[i].time_id == time_id) {
+				*out = record.bars[i].bar;
 				return Status::Ok();
 			}
 		}
+		break;
 	}
 	return Status::Error(ErrorCode::NotFound, "staged bar was not found");
 }
@@ -1325,13 +1343,31 @@ Status StagingStore::range(const std::vector<SymbolId>& symbol_ids,
 	}
 	std::set<SymbolId> requested(symbol_ids.begin(), symbol_ids.end());
 	out->clear();
-	for (std::map<std::pair<TimeId, SymbolId>, Entry>::const_iterator entry = entries_.begin();
-		 entry != entries_.end(); ++entry) {
-		for (size_t i = 0; i < entry->second.bars.size(); ++i) {
-			const ActiveBar& bar = entry->second.bars[i];
-			if (requested.find(bar.symbol_id) != requested.end() &&
-				bar.time_id >= begin && bar.time_id <= end) {
-				out->push_back(bar);
+	// Walk the index in order. For each matching record, load its page and
+	// collect bars that fall within the requested range.
+	std::set<std::pair<uint32_t, uint64_t> > visited_pages;
+	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
+		 it != index_.end(); ++it) {
+		if (requested.find(it->first.second) == requested.end()) {
+			continue;
+		}
+		const std::pair<uint32_t, uint64_t> page_key(it->second.segment_id, it->second.page_offset);
+		std::vector<ParsedStagingRecord> records;
+		Status status = load_page(it->second.segment_id, it->second.page_offset,
+			it->second.page_length, &records);
+		if (!status.ok()) {
+			return status;
+		}
+		// Only scan the page once even if multiple index entries point at it.
+		if (visited_pages.insert(page_key).second) {
+			for (size_t r = 0; r < records.size(); ++r) {
+				for (size_t i = 0; i < records[r].bars.size(); ++i) {
+					const ActiveBar& bar = records[r].bars[i];
+					if (requested.count(bar.symbol_id) &&
+						bar.time_id >= begin && bar.time_id <= end) {
+						out->push_back(bar);
+					}
+				}
 			}
 		}
 	}
@@ -1353,13 +1389,39 @@ Status StagingStore::snapshot(std::vector<StockTimeBlock>* blocks,
 	if (frame_bytes != NULL) {
 		frame_bytes->clear();
 	}
-	for (std::map<std::pair<TimeId, SymbolId>, Entry>::const_iterator entry = entries_.begin();
-		 entry != entries_.end(); ++entry) {
-		blocks->push_back(entry->second.block);
-		if (frame_bytes != NULL) {
-			frame_bytes->push_back(entry->second.frame_bytes);
+	// Walk index in order; load each page once and extract records in index order.
+	std::set<std::pair<uint32_t, uint64_t> > visited_pages;
+	std::map<std::pair<TimeId, SymbolId>, ParsedStagingRecord> by_key;
+	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
+		 it != index_.end(); ++it) {
+		const std::pair<uint32_t, uint64_t> page_key(it->second.segment_id, it->second.page_offset);
+		if (visited_pages.insert(page_key).second) {
+			std::vector<ParsedStagingRecord> records;
+			Status status = load_page(it->second.segment_id, it->second.page_offset,
+				it->second.page_length, &records);
+			if (!status.ok()) {
+				return status;
+			}
+			for (size_t r = 0; r < records.size(); ++r) {
+				const std::pair<TimeId, SymbolId> key(
+					records[r].block.key.time_block_id, records[r].block.key.symbol_id);
+				by_key.insert(std::make_pair(key, records[r]));
+			}
 		}
-		bars->insert(bars->end(), entry->second.bars.begin(), entry->second.bars.end());
+	}
+	// Emit in index order so snapshot matches index ordering.
+	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
+		 it != index_.end(); ++it) {
+		std::map<std::pair<TimeId, SymbolId>, ParsedStagingRecord>::iterator found =
+			by_key.find(it->first);
+		if (found == by_key.end()) {
+			return Status::Error(ErrorCode::CorruptData, "staging snapshot missing record");
+		}
+		blocks->push_back(found->second.block);
+		if (frame_bytes != NULL) {
+			frame_bytes->push_back(found->second.frame_bytes);
+		}
+		bars->insert(bars->end(), found->second.bars.begin(), found->second.bars.end());
 	}
 	std::sort(bars->begin(), bars->end(), ActiveBarOrder);
 	return Status::Ok();
@@ -1375,10 +1437,48 @@ Status StagingStore::snapshot(std::vector<StockTimeBlock>* blocks,
 // =============================================================================
 
 static const uint8_t kVaultVersion = 2;
-static const size_t kVaultBlobMaxBytes = 16 * 1024 * 1024;
+static const size_t kVaultBlobMaxBytes = 256 * 1024;
 static const uint64_t kVaultSegmentTargetBytes = 256ULL * 1024 * 1024;
-static const size_t kCompressedFrameCacheBytes = 32 * 1024 * 1024;
-static const size_t kDecodedFieldCacheBytes = 16 * 1024 * 1024;
+// Unified page cache shared by Vault and Staging stores. Both stores use the
+// same two-level cache design: compressed raw bytes (blob/page) and decoded
+// in-memory records. A single LRU counter and shared capacity budget keep the
+// replacement policy consistent across layers.
+static const size_t kCompressedCacheBytes = 32 * 1024 * 1024;
+static const size_t kDecodedCacheBytes = 16 * 1024 * 1024;
+
+// CachedPage is the compressed-cache entry: one raw blob (vault) or one raw
+// page (staging), identified by its store type, market, frequency, segment,
+// and byte offset.
+struct CachedPage {
+	CacheStoreType store_type;
+	uint64_t runtime_market_id;
+	Frequency frequency;
+	uint32_t segment_id;
+	uint64_t offset;
+	uint64_t last_use;
+	std::vector<uint8_t> bytes;
+};
+
+// CachedVaultBlock is one decoded block out of a vault blob.
+struct CachedVaultBlock {
+	uint64_t runtime_market_id;
+	Frequency frequency;
+	uint32_t segment_id;
+	uint64_t blob_offset;
+	TimeId time_block_id;
+	uint64_t last_use;
+	std::vector<ActiveBar> bars;
+};
+
+// CachedStagingPage is one fully decoded staging page with all its records.
+struct CachedStagingPage {
+	uint64_t runtime_market_id;
+	Frequency frequency;
+	uint32_t segment_id;
+	uint64_t page_offset;
+	uint64_t last_use;
+	std::vector<ParsedStagingRecord> records;
+};
 
 struct VaultPendingBlock {
 	StockTimeBlock block;
@@ -1403,31 +1503,13 @@ struct VaultFrameDirectory {
 	uint32_t frame_length;
 };
 
-struct CachedVaultBlob {
-	uint64_t runtime_market_id;
-	Frequency frequency;
-	uint32_t segment_id;
-	uint64_t blob_offset;
-	uint64_t last_use;
-	std::vector<uint8_t> bytes;
-};
-
-struct CachedVaultBlock {
-	uint64_t runtime_market_id;
-	Frequency frequency;
-	uint32_t segment_id;
-	uint64_t blob_offset;
-	TimeId time_block_id;
-	uint64_t last_use;
-	std::vector<ActiveBar> bars;
-};
-
-static std::mutex g_vault_cache_mutex;
-static uint64_t g_vault_cache_tick = 0;
+static std::mutex g_cache_mutex;
+static uint64_t g_cache_tick = 0;
 static size_t g_compressed_cache_size = 0;
 static size_t g_decoded_cache_size = 0;
-static std::vector<CachedVaultBlob> g_compressed_cache;
-static std::vector<CachedVaultBlock> g_decoded_cache;
+static std::vector<CachedPage> g_compressed_cache;
+static std::vector<CachedVaultBlock> g_vault_decoded_cache;
+static std::vector<CachedStagingPage> g_staging_decoded_cache;
 
 static std::string VaultSegmentPath(const std::string& path, uint32_t segment_id) {
 	char name[64];
@@ -1449,17 +1531,30 @@ static size_t VaultBarsBytes(const std::vector<ActiveBar>& bars) {
 	return bars.size() * sizeof(ActiveBar);
 }
 
-static void InsertCompressedCache(uint64_t runtime_market_id,
+static size_t StagingPageDecodedBytes(const std::vector<ParsedStagingRecord>& records) {
+	size_t total = 0;
+	for (size_t i = 0; i < records.size(); ++i) {
+		total += records[i].bars.size() * sizeof(ActiveBar) +
+			records[i].block.positions.size() * sizeof(BlockBar) +
+			records[i].frame_bytes.size();
+	}
+	return total;
+}
+
+// --- Compressed cache (shared: vault blobs + staging pages) ---
+
+static void InsertCompressedCache(CacheStoreType store_type,
+						  uint64_t runtime_market_id,
 						  Frequency frequency,
 						  uint32_t segment_id,
-						  uint64_t blob_offset,
+						  uint64_t offset,
 						  const std::vector<uint8_t>& bytes) {
-	if (bytes.size() > kCompressedFrameCacheBytes) {
+	if (bytes.size() > kCompressedCacheBytes) {
 		return;
 	}
-	std::lock_guard<std::mutex> lock(g_vault_cache_mutex);
+	std::lock_guard<std::mutex> lock(g_cache_mutex);
 	while (!g_compressed_cache.empty() &&
-		g_compressed_cache_size + bytes.size() > kCompressedFrameCacheBytes) {
+		g_compressed_cache_size + bytes.size() > kCompressedCacheBytes) {
 		size_t oldest = 0;
 		for (size_t i = 1; i < g_compressed_cache.size(); ++i) {
 			if (g_compressed_cache[i].last_use < g_compressed_cache[oldest].last_use) {
@@ -1469,28 +1564,31 @@ static void InsertCompressedCache(uint64_t runtime_market_id,
 		g_compressed_cache_size -= g_compressed_cache[oldest].bytes.size();
 		g_compressed_cache.erase(g_compressed_cache.begin() + oldest);
 	}
-	CachedVaultBlob entry = {};
+	CachedPage entry = {};
+	entry.store_type = store_type;
 	entry.runtime_market_id = runtime_market_id;
 	entry.frequency = frequency;
 	entry.segment_id = segment_id;
-	entry.blob_offset = blob_offset;
-	entry.last_use = ++g_vault_cache_tick;
+	entry.offset = offset;
+	entry.last_use = ++g_cache_tick;
 	entry.bytes = bytes;
 	g_compressed_cache_size += entry.bytes.size();
 	g_compressed_cache.push_back(entry);
 }
 
-static bool GetCompressedCache(uint64_t runtime_market_id,
-						 Frequency frequency,
-						 uint32_t segment_id,
-						 uint64_t blob_offset,
-						 std::vector<uint8_t>* bytes) {
-	std::lock_guard<std::mutex> lock(g_vault_cache_mutex);
+static bool GetCompressedCache(CacheStoreType store_type,
+						uint64_t runtime_market_id,
+						Frequency frequency,
+						uint32_t segment_id,
+						uint64_t offset,
+						std::vector<uint8_t>* bytes) {
+	std::lock_guard<std::mutex> lock(g_cache_mutex);
 	for (size_t i = 0; i < g_compressed_cache.size(); ++i) {
-		CachedVaultBlob& entry = g_compressed_cache[i];
-		if (entry.runtime_market_id == runtime_market_id && entry.frequency == frequency &&
-			entry.segment_id == segment_id && entry.blob_offset == blob_offset) {
-			entry.last_use = ++g_vault_cache_tick;
+		CachedPage& entry = g_compressed_cache[i];
+		if (entry.store_type == store_type && entry.runtime_market_id == runtime_market_id &&
+			entry.frequency == frequency && entry.segment_id == segment_id &&
+			entry.offset == offset) {
+			entry.last_use = ++g_cache_tick;
 			*bytes = entry.bytes;
 			return true;
 		}
@@ -1498,26 +1596,58 @@ static bool GetCompressedCache(uint64_t runtime_market_id,
 	return false;
 }
 
-static void InsertDecodedCache(uint64_t runtime_market_id,
+// --- Eviction helper for decoded cache: finds oldest among both vault and
+// staging decoded entries, then removes it. Both caches draw from the same
+// capacity budget so they share one LRU clock.
+static void EvictOldestDecodedLocked() {
+	uint64_t oldest_tick = UINT64_MAX;
+	bool is_vault = true;
+	size_t oldest_index = 0;
+	for (size_t i = 0; i < g_vault_decoded_cache.size(); ++i) {
+		if (g_vault_decoded_cache[i].last_use < oldest_tick) {
+			oldest_tick = g_vault_decoded_cache[i].last_use;
+			oldest_index = i;
+			is_vault = true;
+		}
+	}
+	for (size_t i = 0; i < g_staging_decoded_cache.size(); ++i) {
+		if (g_staging_decoded_cache[i].last_use < oldest_tick) {
+			oldest_tick = g_staging_decoded_cache[i].last_use;
+			oldest_index = i;
+			is_vault = false;
+		}
+	}
+	if (is_vault && !g_vault_decoded_cache.empty()) {
+		g_decoded_cache_size -= VaultBarsBytes(g_vault_decoded_cache[oldest_index].bars);
+		g_vault_decoded_cache.erase(g_vault_decoded_cache.begin() + oldest_index);
+	} else if (!is_vault && !g_staging_decoded_cache.empty()) {
+		g_decoded_cache_size -= StagingPageDecodedBytes(g_staging_decoded_cache[oldest_index].records);
+		g_staging_decoded_cache.erase(g_staging_decoded_cache.begin() + oldest_index);
+	}
+}
+
+// --- Vault decoded cache ---
+
+static void InsertVaultDecodedCache(uint64_t runtime_market_id,
 						  Frequency frequency,
 						  uint32_t segment_id,
 						  uint64_t blob_offset,
 						  TimeId time_block_id,
 						  const std::vector<ActiveBar>& bars) {
 	const size_t bytes = VaultBarsBytes(bars);
-	if (bytes > kDecodedFieldCacheBytes) {
+	if (bytes > kDecodedCacheBytes) {
 		return;
 	}
-	std::lock_guard<std::mutex> lock(g_vault_cache_mutex);
-	while (!g_decoded_cache.empty() && g_decoded_cache_size + bytes > kDecodedFieldCacheBytes) {
-		size_t oldest = 0;
-		for (size_t i = 1; i < g_decoded_cache.size(); ++i) {
-			if (g_decoded_cache[i].last_use < g_decoded_cache[oldest].last_use) {
-				oldest = i;
-			}
-		}
-		g_decoded_cache_size -= VaultBarsBytes(g_decoded_cache[oldest].bars);
-		g_decoded_cache.erase(g_decoded_cache.begin() + oldest);
+	std::lock_guard<std::mutex> lock(g_cache_mutex);
+	while (!g_vault_decoded_cache.empty() && !g_staging_decoded_cache.empty() &&
+		g_decoded_cache_size + bytes > kDecodedCacheBytes) {
+		EvictOldestDecodedLocked();
+	}
+	// If one cache is empty but we're still over budget, it means the other
+	// cache alone exceeds the limit. Keep evicting from the non-empty one.
+	while (g_decoded_cache_size + bytes > kDecodedCacheBytes &&
+		(!g_vault_decoded_cache.empty() || !g_staging_decoded_cache.empty())) {
+		EvictOldestDecodedLocked();
 	}
 	CachedVaultBlock entry = {};
 	entry.runtime_market_id = runtime_market_id;
@@ -1525,26 +1655,71 @@ static void InsertDecodedCache(uint64_t runtime_market_id,
 	entry.segment_id = segment_id;
 	entry.blob_offset = blob_offset;
 	entry.time_block_id = time_block_id;
-	entry.last_use = ++g_vault_cache_tick;
+	entry.last_use = ++g_cache_tick;
 	entry.bars = bars;
 	g_decoded_cache_size += bytes;
-	g_decoded_cache.push_back(entry);
+	g_vault_decoded_cache.push_back(entry);
 }
 
-static bool GetDecodedCache(uint64_t runtime_market_id,
+static bool GetVaultDecodedCache(uint64_t runtime_market_id,
 						 Frequency frequency,
 						 uint32_t segment_id,
 						 uint64_t blob_offset,
 						 TimeId time_block_id,
 						 std::vector<ActiveBar>* bars) {
-	std::lock_guard<std::mutex> lock(g_vault_cache_mutex);
-	for (size_t i = 0; i < g_decoded_cache.size(); ++i) {
-		CachedVaultBlock& entry = g_decoded_cache[i];
+	std::lock_guard<std::mutex> lock(g_cache_mutex);
+	for (size_t i = 0; i < g_vault_decoded_cache.size(); ++i) {
+		CachedVaultBlock& entry = g_vault_decoded_cache[i];
 		if (entry.runtime_market_id == runtime_market_id && entry.frequency == frequency &&
 			entry.segment_id == segment_id && entry.blob_offset == blob_offset &&
 			entry.time_block_id == time_block_id) {
-			entry.last_use = ++g_vault_cache_tick;
+			entry.last_use = ++g_cache_tick;
 			*bars = entry.bars;
+			return true;
+		}
+	}
+	return false;
+}
+
+// --- Staging decoded cache ---
+
+static void InsertStagingDecodedCache(uint64_t runtime_market_id,
+							  Frequency frequency,
+							  uint32_t segment_id,
+							  uint64_t page_offset,
+							  const std::vector<ParsedStagingRecord>& records) {
+	const size_t bytes = StagingPageDecodedBytes(records);
+	if (bytes > kDecodedCacheBytes) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(g_cache_mutex);
+	while (g_decoded_cache_size + bytes > kDecodedCacheBytes &&
+		(!g_vault_decoded_cache.empty() || !g_staging_decoded_cache.empty())) {
+		EvictOldestDecodedLocked();
+	}
+	CachedStagingPage entry = {};
+	entry.runtime_market_id = runtime_market_id;
+	entry.frequency = frequency;
+	entry.segment_id = segment_id;
+	entry.page_offset = page_offset;
+	entry.last_use = ++g_cache_tick;
+	entry.records = records;
+	g_decoded_cache_size += bytes;
+	g_staging_decoded_cache.push_back(entry);
+}
+
+static bool GetStagingDecodedCache(uint64_t runtime_market_id,
+							Frequency frequency,
+							uint32_t segment_id,
+							uint64_t page_offset,
+							std::vector<ParsedStagingRecord>* records) {
+	std::lock_guard<std::mutex> lock(g_cache_mutex);
+	for (size_t i = 0; i < g_staging_decoded_cache.size(); ++i) {
+		CachedStagingPage& entry = g_staging_decoded_cache[i];
+		if (entry.runtime_market_id == runtime_market_id && entry.frequency == frequency &&
+			entry.segment_id == segment_id && entry.page_offset == page_offset) {
+			entry.last_use = ++g_cache_tick;
+			*records = entry.records;
 			return true;
 		}
 	}
@@ -1912,7 +2087,8 @@ static Status ReadVaultBlob(const std::string& path,
 						uint64_t blob_offset,
 						uint32_t blob_length,
 						std::vector<uint8_t>* bytes) {
-	if (GetCompressedCache(runtime_market_id, frequency, segment_id, blob_offset, bytes)) {
+	if (GetCompressedCache(CacheStoreType::Vault, runtime_market_id, frequency,
+			segment_id, blob_offset, bytes)) {
 		return Status::Ok();
 	}
 	std::ifstream input(VaultSegmentPath(path, segment_id).c_str(), std::ios::binary);
@@ -1925,7 +2101,8 @@ static Status ReadVaultBlob(const std::string& path,
 	if (input.gcount() != static_cast<std::streamsize>(blob_length)) {
 		return Status::Error(ErrorCode::CorruptData, "truncated vault blob");
 	}
-	InsertCompressedCache(runtime_market_id, frequency, segment_id, blob_offset, *bytes);
+	InsertCompressedCache(CacheStoreType::Vault, runtime_market_id, frequency,
+		segment_id, blob_offset, *bytes);
 	return Status::Ok();
 }
 
@@ -1940,7 +2117,7 @@ static Status DecodeVaultBlock(const Calendar& calendar,
 						   std::vector<ActiveBar>* output,
 						   std::vector<uint8_t>* frame_bytes) {
 	if (frame_bytes == NULL &&
-		GetDecodedCache(runtime_market_id, frequency, segment_id, blob_offset, wanted_block_id, output)) {
+		GetVaultDecodedCache(runtime_market_id, frequency, segment_id, blob_offset, wanted_block_id, output)) {
 		return Status::Ok();
 	}
 	size_t offset = 0;
@@ -2046,7 +2223,7 @@ static Status DecodeVaultBlock(const Calendar& calendar,
 		bar.bar = positions[i];
 		output->push_back(bar);
 	}
-	InsertDecodedCache(runtime_market_id, frequency, segment_id, blob_offset,
+	InsertVaultDecodedCache(runtime_market_id, frequency, segment_id, blob_offset,
 		wanted_block_id, *output);
 	return Status::Ok();
 }
@@ -2154,12 +2331,12 @@ Status VaultStore::range(const std::vector<SymbolId>& symbol_ids,
 // Reconstruct logical blocks from explicit bars when copying an immutable
 // store. The persistent codecs already retain complete positions, but this
 // helper keeps compaction independent from their private blob/page directories.
-static TimeId CompactionBlockDayLength(Frequency frequency) {
+TimeId CompactionBlockDayLength(Frequency frequency) {
 	return frequency == Frequency::Daily ? kDailyTimeBlockDayLength :
 		kHourlyTimeBlockDayLength;
 }
 
-static TimeId CompactionBlockId(Frequency frequency, TimeId time_id) {
+TimeId CompactionBlockId(Frequency frequency, TimeId time_id) {
 	const TimeId length = CompactionBlockDayLength(frequency);
 	return daily_bar_id((time_day(time_id) / length) * length);
 }

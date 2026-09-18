@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -269,13 +270,13 @@ bool ParseBar(const json& object, zstfs::Bar* bar, std::string* error) {
 		return true;
 	}
 	const char* names[] = {"open", "high", "low", "close", "volume"};
-	double* values[] = {&bar->open, &bar->high, &bar->low, &bar->close, &bar->volume};
+	float* values[] = {&bar->open, &bar->high, &bar->low, &bar->close, &bar->volume};
 	for (size_t i = 0; i < 5; ++i) {
 		if (!object.contains(names[i]) || !object[names[i]].is_number()) {
 			*error = std::string(names[i]) + " must be a number";
 			return false;
 		}
-		*values[i] = object[names[i]].get<double>();
+		*values[i] = object[names[i]].get<float>();
 	}
 	return true;
 }
@@ -438,6 +439,21 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 	const std::vector<std::string> parts = PathParts(request.target);
 	if (parts.size() == 2 && parts[0] == "v1" && parts[1] == "health" && request.method == "GET") {
 		return OkJson(json{{"status", "ok"}}.dump());
+	}
+	// /v1/stage triggers a global seal: all markets, both daily and hourly.
+	// Each market computes its own cutoff using its calendar, going back
+	// kStageTradingDaysBack trading days from the system's local date.
+	// The date uses the system's local timezone, formatted as YYYYMMDD.
+	static const int kStageTradingDaysBack = 10;
+	if (parts.size() == 2 && parts[0] == "v1" && parts[1] == "stage" && request.method == "POST") {
+		std::time_t now = std::time(NULL);
+		std::tm* local = std::localtime(&now);
+		char today[16];
+		std::snprintf(today, sizeof(today), "%04d%02d%02d",
+			local->tm_year + 1900, local->tm_mon + 1, local->tm_mday);
+		zstfs::Status status = markets->seal_all_before(today, kStageTradingDaysBack);
+		if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
+		return OkJson(json{{"trading_days_back", kStageTradingDaysBack}}.dump());
 	}
 	if (parts.size() < 3 || parts[0] != "v1" || parts[1] != "markets") {
 		return ErrorResponse(404, "endpoint not found");

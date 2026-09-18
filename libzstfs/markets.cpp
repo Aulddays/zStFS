@@ -6,6 +6,8 @@
 
 #include "zstfs/market.h"
 
+#include "calendar.h"
+
 #include <cerrno>
 #include <cctype>
 #include <fstream>
@@ -156,6 +158,50 @@ Status Markets::get(const std::string& name, const Market** out) const {
 	}
 	*out = found->second.get();
 	return Status::Ok();
+}
+
+Status Markets::seal_all_before(const std::string& today_local, int trading_days_back) {
+	if (!status_.ok()) {
+		return status_;
+	}
+	Status first_error = Status::Ok();
+	for (std::map<std::string, std::unique_ptr<Market> >::iterator it = by_name_.begin();
+		 it != by_name_.end(); ++it) {
+		// Compute the cutoff date using this market's own calendar so different
+		// market types (different holidays / schedules) each get the right
+		// number of trading days back. The cutoff date is the same for both
+		// daily and hourly since they share the daily TimeId coordinate.
+		zstfs::TimeId today_id = 0;
+		Status status = it->second->calendar_.get() == NULL ? Status::Ok() :
+			it->second->calendar_->time_id(today_local, &today_id);
+		if (!status.ok() && first_error.ok()) {
+			first_error = status;
+			continue;
+		}
+		const int today_day = static_cast<int>(time_day(today_id));
+		const int cutoff_day = today_day - trading_days_back;
+		if (cutoff_day < 0 && first_error.ok()) {
+			first_error = Status::Error(ErrorCode::InvalidArgument,
+				"trading days back exceeds calendar range");
+			continue;
+		}
+		std::string cutoff_local;
+		status = it->second->calendar_->date(daily_bar_id(static_cast<TimeId>(cutoff_day)),
+			&cutoff_local);
+		if (!status.ok() && first_error.ok()) {
+			first_error = status;
+			continue;
+		}
+		Status daily_status = it->second->history(Frequency::Daily).seal_before(cutoff_local);
+		if (!daily_status.ok() && first_error.ok()) {
+			first_error = daily_status;
+		}
+		Status hourly_status = it->second->history(Frequency::Hourly).seal_before(cutoff_local);
+		if (!hourly_status.ok() && first_error.ok()) {
+			first_error = hourly_status;
+		}
+	}
+	return first_error;
 }
 
 }  // namespace zstfs

@@ -30,182 +30,6 @@
 
 namespace zstfs {
 
-// =============================================================================
-// Active-Store Validation
-//
-// Validates the complete bar records accepted by History before they enter the
-// mutable active store or its recovery log.
-// =============================================================================
-
-
-static bool ValidState(BarState state) {
-	return state >= BarState::Normal && state <= BarState::Missing;
-}
-
-static bool ValidBar(const BlockBar& bar) {
-	return bar.state != BarState::Normal ||
-		(std::isfinite(bar.open) && bar.open > 0.0 &&
-		 std::isfinite(bar.high) && bar.high >= 0.0 &&
-		 std::isfinite(bar.low) && bar.low >= 0.0 &&
-		 std::isfinite(bar.close) && bar.close > 0.0 &&
-		 std::isfinite(bar.volume) && bar.volume >= 0.0 &&
-		 bar.high >= std::max(bar.open, bar.close) &&
-		 bar.low <= std::min(bar.open, bar.close));
-}
-
-
-// =============================================================================
-// Active Store, Recovery Log, and Public History API
-//
-// Active owns the only mutable copy of a bar. Data is grouped by time block so
-// a completed block can be handed to Staging without reshaping it. The append
-// log records individual accepted positions because random writes are the
-// Active workload; M4 keeps sealed records in the log until persistent Staging exists.
-// =============================================================================
-
-static const uint32_t kActiveRecordMagic = 0x3141545a;  // "ZTA1" in little-endian bytes.
-static const uint8_t kActiveRecordVersion = 1;
-static const size_t kActiveRecordBytes = 56;
-
-struct ActiveRecord {
-	Frequency frequency;
-	SymbolId symbol_id;
-	TimeId time_id;
-	BlockBar bar;
-};
-
-struct ResolvedBar {
-	Bar bar;
-	TimeId time_id;
-	TimeId block_id;
-	BlockOff block_offset;
-};
-
-static BlockBar MissingBlockBar() {
-	BlockBar bar = {};
-	bar.state = BarState::Missing;
-	return bar;
-}
-
-static bool SerializeActiveRecord(const ActiveRecord& record,
-				  std::vector<uint8_t>* bytes) {
-	if (bytes == NULL || !ValidState(record.bar.state) ||
-		record.symbol_id == kInvalidSymbolId || !ValidBar(record.bar)) {
-		return false;
-	}
-	bytes->clear();
-	PutU32(bytes, kActiveRecordMagic);
-	PutU8(bytes, kActiveRecordVersion);
-	PutU8(bytes, static_cast<uint8_t>(record.frequency));
-	PutU8(bytes, static_cast<uint8_t>(record.bar.state));
-	PutU8(bytes, 0);
-	PutU32(bytes, record.symbol_id);
-	PutU32(bytes, record.time_id);
-	PutDouble(bytes, record.bar.open);
-	PutDouble(bytes, record.bar.high);
-	PutDouble(bytes, record.bar.low);
-	PutDouble(bytes, record.bar.close);
-	PutDouble(bytes, record.bar.volume);
-	return bytes->size() == kActiveRecordBytes;
-}
-
-static Status ParseActiveRecord(const std::vector<uint8_t>& bytes,
-				size_t offset,
-				ActiveRecord* record) {
-	if (record == NULL || offset > bytes.size() ||
-		bytes.size() - offset < kActiveRecordBytes) {
-		return Status::Error(ErrorCode::CorruptData, "truncated active record");
-	}
-	std::vector<uint8_t> data(bytes.begin() + offset,
-					  bytes.begin() + offset + kActiveRecordBytes);
-	size_t cursor = 0;
-	uint32_t magic = 0;
-	uint8_t version = 0;
-	uint8_t frequency = 0;
-	uint8_t state = 0;
-	uint8_t reserved = 0;
-	if (!GetU32(data, &cursor, &magic) || !GetU8(data, &cursor, &version) ||
-		!GetU8(data, &cursor, &frequency) || !GetU8(data, &cursor, &state) ||
-		!GetU8(data, &cursor, &reserved) ||
-		!GetU32(data, &cursor, &record->symbol_id) ||
-		!GetU32(data, &cursor, &record->time_id) ||
-		!GetDouble(data, &cursor, &record->bar.open) ||
-		!GetDouble(data, &cursor, &record->bar.high) ||
-		!GetDouble(data, &cursor, &record->bar.low) ||
-		!GetDouble(data, &cursor, &record->bar.close) ||
-		!GetDouble(data, &cursor, &record->bar.volume) ||
-		cursor != data.size() || magic != kActiveRecordMagic ||
-		version != kActiveRecordVersion || reserved != 0 || frequency > 1 ||
-		record->symbol_id == kInvalidSymbolId) {
-		return Status::Error(ErrorCode::CorruptData, "invalid active record header");
-	}
-	record->frequency = static_cast<Frequency>(frequency);
-	record->bar.state = static_cast<BarState>(state);
-	if (!ValidState(record->bar.state) || !ValidBar(record->bar)) {
-		return Status::Error(ErrorCode::CorruptData, "invalid active record values");
-	}
-	return Status::Ok();
-}
-
-static Status ResolveTime(const Calendar& calendar,
-			  Frequency frequency,
-			  const std::string& local_time,
-			  TimeId* time_id,
-			  TimeId* block_id,
-			  BlockOff* block_offset) {
-	if (time_id == NULL || block_id == NULL || block_offset == NULL) {
-		return Status::Error(ErrorCode::InvalidArgument, "time outputs are required");
-	}
-	TimeId day_time_id = 0;
-	Status status = Status::Ok();
-	if (frequency == Frequency::Daily) {
-		status = calendar.time_id(local_time, &day_time_id);
-		if (!status.ok()) {
-			return status;
-		}
-		*time_id = day_time_id;
-	} else {
-		HourSlot slot = 0;
-		status = calendar.time_id(local_time.substr(0, 8), &day_time_id);
-		if (!status.ok()) {
-			return status;
-		}
-		status = calendar.hour_slot(local_time, &slot);
-		if (!status.ok()) {
-			return status;
-		}
-		*time_id = hourly_bar_id(time_day(day_time_id), slot);
-	}
-	return calendar.block_offset(frequency, local_time, block_id, block_offset);
-}
-
-static Status LocalTime(const Calendar& calendar,
-			    Frequency frequency,
-			    TimeId time_id,
-			    std::string* out) {
-	if (out == NULL) {
-		return Status::Error(ErrorCode::InvalidArgument, "local time output is required");
-	}
-	const TimeId day_time_id = daily_bar_id(time_day(time_id));
-	if (frequency == Frequency::Daily) {
-		if (time_slot(time_id) != 0) {
-			return Status::Error(ErrorCode::CorruptData, "daily active record has an hourly slot");
-		}
-		return calendar.date(day_time_id, out);
-	}
-	return calendar.local_time(day_time_id, time_slot(time_id), out);
-}
-
-static bool ActiveBarOrder(const ActiveBar& left, const ActiveBar& right) {
-	return left.time_id != right.time_id ? left.time_id < right.time_id :
-		left.symbol_id < right.symbol_id;
-}
-
-static bool SameBlockBar(const BlockBar& left, const BlockBar& right) {
-	return left.state == right.state && left.open == right.open && left.high == right.high &&
-		left.low == right.low && left.close == right.close && left.volume == right.volume;
-}
-
 static std::string FrequencyPath(const std::string& market_path, Frequency frequency) {
 	const std::string path = market_path + (frequency == Frequency::Daily ? "/daily" : "/hourly");
 	if (mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
@@ -249,10 +73,10 @@ History::History(Frequency frequency,
 		status_ = Status::Error(ErrorCode::IoError, "cannot create frequency directory");
 		return;
 	}
+	const uint64_t runtime_market_id = NextRuntimeMarketId();
 	active_.reset(new ActiveStore(frequency, calendar, frequency_path));
-	staging_.reset(new StagingStore(frequency, calendar, frequency_path));
-	vault_.reset(new VaultStore(frequency, calendar, frequency_path,
-		NextRuntimeMarketId()));
+	staging_.reset(new StagingStore(frequency, calendar, frequency_path, runtime_market_id));
+	vault_.reset(new VaultStore(frequency, calendar, frequency_path, runtime_market_id));
 }
 
 Status History::status() const {
@@ -618,11 +442,11 @@ static Status SerializeCompactionRecord(const CompactionRecord& record,
 			return Status::Error(ErrorCode::InvalidArgument, "invalid block bar in compaction record");
 		}
 		PutU8(bytes, static_cast<uint8_t>(bar.state));
-		PutDouble(bytes, bar.open);
-		PutDouble(bytes, bar.high);
-		PutDouble(bytes, bar.low);
-		PutDouble(bytes, bar.close);
-		PutDouble(bytes, bar.volume);
+		PutFloat(bytes, bar.open);
+		PutFloat(bytes, bar.high);
+		PutFloat(bytes, bar.low);
+		PutFloat(bytes, bar.close);
+		PutFloat(bytes, bar.volume);
 	}
 	PutU32(bytes, static_cast<uint32_t>(record.bars.size()));
 	for (size_t i = 0; i < record.bars.size(); ++i) {
@@ -633,11 +457,11 @@ static Status SerializeCompactionRecord(const CompactionRecord& record,
 		}
 		PutU32(bytes, bar.time_id);
 		PutU8(bytes, static_cast<uint8_t>(bar.bar.state));
-		PutDouble(bytes, bar.bar.open);
-		PutDouble(bytes, bar.bar.high);
-		PutDouble(bytes, bar.bar.low);
-		PutDouble(bytes, bar.bar.close);
-		PutDouble(bytes, bar.bar.volume);
+		PutFloat(bytes, bar.bar.open);
+		PutFloat(bytes, bar.bar.high);
+		PutFloat(bytes, bar.bar.low);
+		PutFloat(bytes, bar.bar.close);
+		PutFloat(bytes, bar.bar.volume);
 	}
 	return Status::Ok();
 }
@@ -671,9 +495,9 @@ static Status ParseCompactionRecord(const std::vector<uint8_t>& bytes,
 	for (uint32_t i = 0; i < positions; ++i) {
 		uint8_t state = 0;
 		BlockBar& bar = record->block.positions[i];
-		if (!GetU8(bytes, &offset, &state) || !GetDouble(bytes, &offset, &bar.open) ||
-			!GetDouble(bytes, &offset, &bar.high) || !GetDouble(bytes, &offset, &bar.low) ||
-			!GetDouble(bytes, &offset, &bar.close) || !GetDouble(bytes, &offset, &bar.volume)) {
+		if (!GetU8(bytes, &offset, &state) || !GetFloat(bytes, &offset, &bar.open) ||
+			!GetFloat(bytes, &offset, &bar.high) || !GetFloat(bytes, &offset, &bar.low) ||
+			!GetFloat(bytes, &offset, &bar.close) || !GetFloat(bytes, &offset, &bar.volume)) {
 			return Status::Error(ErrorCode::CorruptData, "truncated compaction block");
 		}
 		bar.state = static_cast<BarState>(state);
@@ -691,9 +515,9 @@ static Status ParseCompactionRecord(const std::vector<uint8_t>& bytes,
 		uint8_t state = 0;
 		bar.symbol_id = record->block.key.symbol_id;
 		if (!GetU32(bytes, &offset, &bar.time_id) || !GetU8(bytes, &offset, &state) ||
-			!GetDouble(bytes, &offset, &bar.bar.open) || !GetDouble(bytes, &offset, &bar.bar.high) ||
-			!GetDouble(bytes, &offset, &bar.bar.low) || !GetDouble(bytes, &offset, &bar.bar.close) ||
-			!GetDouble(bytes, &offset, &bar.bar.volume)) {
+			!GetFloat(bytes, &offset, &bar.bar.open) || !GetFloat(bytes, &offset, &bar.bar.high) ||
+			!GetFloat(bytes, &offset, &bar.bar.low) || !GetFloat(bytes, &offset, &bar.bar.close) ||
+			!GetFloat(bytes, &offset, &bar.bar.volume)) {
 			return Status::Error(ErrorCode::CorruptData, "truncated compaction explicit bar");
 		}
 		bar.bar.state = static_cast<BarState>(state);
@@ -769,22 +593,6 @@ static Status ReadCompactionRunRecord(CompactionRunReader* reader) {
 	return Status::Ok();
 }
 
-static TimeId CompactionBlockDayLength(Frequency frequency) {
-	return frequency == Frequency::Daily ? kDailyTimeBlockDayLength :
-		kHourlyTimeBlockDayLength;
-}
-
-static TimeId CompactionBlockId(Frequency frequency, TimeId time_id) {
-	const TimeId length = CompactionBlockDayLength(frequency);
-	return daily_bar_id((time_day(time_id) / length) * length);
-}
-
-static Status StagingTimeIds(const Calendar& calendar,
-					 Frequency frequency,
-					 TimeId block_id,
-					 BlockOff position_count,
-					 std::vector<TimeId>* time_ids);
-
 static Status BuildCompactionPart(const Calendar& calendar,
 								  Frequency frequency,
 								  const StockTimeBlock& source,
@@ -825,48 +633,6 @@ static Status BuildCompactionPart(const Calendar& calendar,
 		record->block.day_presence |= static_cast<uint64_t>(1) <<
 			(time_day(bars[i].time_id) - time_day(source.key.time_block_id));
 		record->bars.push_back(bars[i]);
-	}
-	return Status::Ok();
-}
-
-static Status StagingTimeIds(const Calendar& calendar,
-					 Frequency frequency,
-					 TimeId block_id,
-					 BlockOff position_count,
-					 std::vector<TimeId>* time_ids) {
-	if (time_ids == NULL) {
-		return Status::Error(ErrorCode::InvalidArgument, "staging time-id output is required");
-	}
-	time_ids->clear();
-	time_ids->reserve(position_count);
-	const TimeId first_day = time_day(block_id);
-	if (frequency == Frequency::Daily) {
-		for (BlockOff offset = 0; offset < position_count; ++offset) {
-			time_ids->push_back(daily_bar_id(first_day + offset));
-		}
-		return Status::Ok();
-	}
-	for (TimeId day_offset = 0; day_offset < kHourlyTimeBlockDayLength; ++day_offset) {
-		const TimeId day_id = daily_bar_id(first_day + day_offset);
-		std::string date;
-		Status status = calendar.date(day_id, &date);
-		if (!status.ok()) {
-			return status;
-		}
-		std::vector<HourSlot> slots;
-		status = calendar.slots(date, &slots);
-		if (!status.ok()) {
-			return status;
-		}
-		for (size_t slot = 0; slot < slots.size(); ++slot) {
-			if (time_ids->size() == position_count) {
-				return Status::Error(ErrorCode::CorruptData, "hourly staging block is too short");
-			}
-			time_ids->push_back(day_id | slots[slot]);
-		}
-	}
-	if (time_ids->size() != position_count) {
-		return Status::Error(ErrorCode::CorruptData, "hourly staging block length changed");
 	}
 	return Status::Ok();
 }
@@ -1041,7 +807,7 @@ Status CompactVault(const std::string& root_path,
 	if (frequency_path.empty()) {
 		return Status::Error(ErrorCode::IoError, "cannot create frequency directory");
 	}
-	StagingStore old_staging(frequency, calendar, frequency_path);
+	StagingStore old_staging(frequency, calendar, frequency_path, NextRuntimeMarketId());
 	VaultStore old_vault(frequency, calendar, frequency_path, NextRuntimeMarketId());
 	std::vector<StockTimeBlock> staging_blocks;
 	std::vector<ActiveBar> staging_bars;
@@ -1162,7 +928,7 @@ Status CompactVault(const std::string& root_path,
 		runs.push_back(run);
 	}
 	VaultStore new_vault(frequency, calendar, vault_build, NextRuntimeMarketId());
-	StagingStore new_staging(frequency, calendar, staging_build);
+	StagingStore new_staging(frequency, calendar, staging_build, NextRuntimeMarketId());
 	std::vector<CompactionRunReader> readers(runs.size());
 	struct EarlierRun {
 		const std::vector<CompactionRunReader>* readers;

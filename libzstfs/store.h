@@ -130,15 +130,19 @@ private:
 	std::thread flush_timer_;
 };
 
+struct ParsedStagingRecord;
+
 // StagingStore owns immutable complete blocks after Active sealing. Its index
 // is ordered by (time_block_id, symbol_id), while pages retain the encoded
 // frames and the presence bitmap needed to distinguish padded Missing values
-// from explicitly written Missing bars.
+// from explicitly written Missing bars. Page data is loaded on demand through
+// the shared compressed+decoded cache; the index alone is always resident.
 class StagingStore {
 public:
 	StagingStore(Frequency frequency,
 	             const Calendar& calendar,
-	             const std::string& frequency_path);
+	             const std::string& frequency_path,
+	             uint64_t runtime_market_id);
 
 	Status accept(const std::vector<StockTimeBlock>& blocks,
 	              const std::vector<ActiveBar>& bars,
@@ -165,23 +169,21 @@ private:
 		uint32_t record_index;
 	};
 
-	struct Entry {
-		StockTimeBlock block;
-		std::vector<ActiveBar> bars;
-		std::vector<uint8_t> frame_bytes;
-	};
-
 	Status load();
 	Status write_index() const;
+	// Loads and decodes one page, returning its parsed records. Uses the
+	// shared decoded cache (and compressed cache as fallback).
+	Status load_page(uint32_t segment_id, uint64_t page_offset, uint32_t page_length,
+		std::vector<ParsedStagingRecord>* records) const;
 
 	Frequency frequency_;
 	const Calendar& calendar_;
 	std::string path_;
+	uint64_t runtime_market_id_;
 	Status status_;
 	uint32_t next_page_id_;
 	uint32_t current_segment_id_;
 	std::map<std::pair<TimeId, SymbolId>, Locator> index_;
-	std::map<std::pair<TimeId, SymbolId>, Entry> entries_;
 };
 
 // VaultStore holds compacted immutable blocks ordered by symbol history. Its
@@ -234,6 +236,73 @@ private:
 	uint32_t current_segment_id_;
 	std::vector<Locator> index_;
 };
+
+// =============================================================================
+// Shared helpers
+//
+// Utility constants, structs, and functions used by both the store
+// implementation and the History coordination layer. These are internal
+// implementation details, not part of the public API.
+
+// Recovery-log record magic ("ZTA1" in little-endian bytes).
+static const uint32_t kActiveRecordMagic = 0x3141545a;
+static const uint8_t kActiveRecordVersion = 1;
+// Fixed serialized size of one active recovery-log record. Must match the
+// layout written by SerializeActiveRecord() and read by ParseActiveRecord():
+//   magic(4) + version(1) + frequency(1) + state(1) + reserved(1)
+//   + symbol_id(4) + time_id(4) + open(4) + high(4) + low(4) + close(4) + volume(4)
+//   = 36 bytes
+static const size_t kActiveRecordBytes = 36;
+
+// One mutable active-store record before serialization.
+struct ActiveRecord {
+	Frequency frequency;
+	SymbolId symbol_id;
+	TimeId time_id;
+	BlockBar bar;
+};
+
+// A bar fully resolved to its time_id, block_id, and block_offset so callers
+// do not repeatedly look up the calendar.
+struct ResolvedBar {
+	Bar bar;
+	TimeId time_id;
+	TimeId block_id;
+	BlockOff block_offset;
+};
+
+bool ValidState(BarState state);
+bool ValidBar(const BlockBar& bar);
+BlockBar MissingBlockBar();
+
+bool SerializeActiveRecord(const ActiveRecord& record,
+                           std::vector<uint8_t>* bytes);
+Status ParseActiveRecord(const std::vector<uint8_t>& bytes,
+                         size_t offset,
+                         ActiveRecord* record);
+
+Status ResolveTime(const Calendar& calendar,
+                   Frequency frequency,
+                   const std::string& local_time,
+                   TimeId* time_id,
+                   TimeId* block_id,
+                   BlockOff* block_offset);
+Status LocalTime(const Calendar& calendar,
+                 Frequency frequency,
+                 TimeId time_id,
+                 std::string* out);
+
+bool ActiveBarOrder(const ActiveBar& left, const ActiveBar& right);
+bool SameBlockBar(const BlockBar& left, const BlockBar& right);
+
+Status StagingTimeIds(const Calendar& calendar,
+                      Frequency frequency,
+                      TimeId block_id,
+                      BlockOff position_count,
+                      std::vector<TimeId>* out);
+
+TimeId CompactionBlockId(Frequency frequency, TimeId time_id);
+TimeId CompactionBlockDayLength(Frequency frequency);
 
 }  // namespace zstfs
 

@@ -271,6 +271,11 @@ public:
 	Status status() const;
 	Status get(const std::string& name, Market** out);
 	Status get(const std::string& name, const Market** out) const;
+	// seal_all_before computes (today - trading_days_back) using each market's
+	// own calendar, then calls seal_before on that market's daily and hourly
+	// histories. Results are collected per market+frequency so a failure in
+	// one does not stop the rest; the overall status is the first error seen.
+	Status seal_all_before(const std::string& today_local, int trading_days_back);
 
 private:
 	Status load_configuration();

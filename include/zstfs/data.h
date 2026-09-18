@@ -67,11 +67,11 @@ struct Bar {
 	Frequency frequency;
 	std::string local_time;
 	BarState state;
-	double open;
-	double high;
-	double low;
-	double close;
-	double volume;
+	float open;
+	float high;
+	float low;
+	float close;
+	float volume;
 };
 
 // PrecisionProfile controls lossy numeric quantization without exposing the

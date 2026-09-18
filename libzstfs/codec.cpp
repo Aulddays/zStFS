@@ -178,10 +178,11 @@ Status EncodeBarBlockFrame(const std::vector<BlockBar>& input, BarBlockFrame* ou
 	double tick = 0.0;
 	bool raw = false;
 	if (!normal.empty()) {
-		double minimum = positions[normal[0]].low;
+		double minimum = static_cast<double>(positions[normal[0]].low);
 		for (size_t i = 0; i < normal.size(); ++i) {
 			const BlockBar& bar = positions[normal[i]];
-			minimum = std::min(minimum, std::min(std::min(bar.open, bar.high), std::min(bar.low, bar.close)));
+			minimum = std::min(minimum, std::min(std::min(static_cast<double>(bar.open), static_cast<double>(bar.high)),
+				std::min(static_cast<double>(bar.low), static_cast<double>(bar.close))));
 		}
 		stored_anchor = std::nextafter(static_cast<float>(minimum), -std::numeric_limits<float>::infinity());
 		tick = static_cast<double>(stored_anchor) / kBarBlockPriceTickDivisor;
@@ -304,8 +305,8 @@ Status EncodeBarBlockFrame(const std::vector<BlockBar>& input, BarBlockFrame* ou
 	if (raw) {
 		for (size_t i = 0; i < normal.size(); ++i) {
 			const BlockBar& bar = positions[normal[i]];
-			PutDouble(&bytes, bar.open); PutDouble(&bytes, bar.high); PutDouble(&bytes, bar.low);
-			PutDouble(&bytes, bar.close); PutDouble(&bytes, bar.volume);
+			PutFloat(&bytes, bar.open); PutFloat(&bytes, bar.high); PutFloat(&bytes, bar.low);
+			PutFloat(&bytes, bar.close); PutFloat(&bytes, bar.volume);
 		}
 	} else {
 		PutPacked(&bytes, close_codes, close_bits);
@@ -410,14 +411,14 @@ Status DecodeBarBlockFrame(const BarBlockFrame& frame, std::vector<BlockBar>* po
 	const bool has_zero = (flags & kBarBlockHasZeroVolume) != 0;
 	if (raw) {
 		if (close_bits != 0 || open_bits != 0 || high_bits != 0 || low_bits != 0 || volume_bits != 0 || has_zero ||
-			frame.bytes.size() - cursor != normal.size() * 5 * sizeof(double)) {
+			frame.bytes.size() - cursor != normal.size() * 5 * sizeof(float)) {
 			return Status::Error(ErrorCode::CorruptData, "invalid raw bar block frame");
 		}
 		for (size_t i = 0; i < normal.size(); ++i) {
 			BlockBar& bar = (*positions)[normal[i]];
-			if (!GetDouble(frame.bytes, &cursor, &bar.open) || !GetDouble(frame.bytes, &cursor, &bar.high) ||
-				!GetDouble(frame.bytes, &cursor, &bar.low) || !GetDouble(frame.bytes, &cursor, &bar.close) ||
-				!GetDouble(frame.bytes, &cursor, &bar.volume) || !ValidBlockBar(bar)) {
+			if (!GetFloat(frame.bytes, &cursor, &bar.open) || !GetFloat(frame.bytes, &cursor, &bar.high) ||
+				!GetFloat(frame.bytes, &cursor, &bar.low) || !GetFloat(frame.bytes, &cursor, &bar.close) ||
+				!GetFloat(frame.bytes, &cursor, &bar.volume) || !ValidBlockBar(bar)) {
 				return Status::Error(ErrorCode::CorruptData, "invalid raw bar values");
 			}
 		}
@@ -463,7 +464,11 @@ Status DecodeBarBlockFrame(const BarBlockFrame& frame, std::vector<BlockBar>* po
 		const bool zero = has_zero && (zero_volume[i / 8] & static_cast<uint8_t>(1U << (i & 7))) != 0;
 		const double volume = zero ? 0.0 : std::exp((static_cast<double>(minimum_level) +
 			static_cast<double>(volume_codes[volume_index++])) * log_step);
-		bar.open = open; bar.high = high; bar.low = low; bar.close = close; bar.volume = volume;
+		bar.open = static_cast<float>(open);
+		bar.high = static_cast<float>(high);
+		bar.low = static_cast<float>(low);
+		bar.close = static_cast<float>(close);
+		bar.volume = static_cast<float>(volume);
 		if (!ValidBlockBar(bar)) {
 			return Status::Error(ErrorCode::CorruptData, "invalid reconstructed bar");
 		}
