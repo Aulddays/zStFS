@@ -56,10 +56,12 @@ History::History(Frequency frequency,
 			 const std::string& market_path,
 			 const Actions& actions,
 			 const std::function<Status()>& publish_manifest,
-			 const Status& initial_status)
+			 const Status& initial_status,
+			 DataFields fields)
 	: frequency_(frequency),
 	  calendar_(calendar),
 	  actions_(actions),
+	  fields_(fields),
 	  publish_manifest_(publish_manifest),
 	  status_(initial_status),
 	  active_(),
@@ -98,8 +100,26 @@ Status History::put(const Bar& bar) {
 		return status_;
 	}
 	if (bar.frequency != frequency_ || bar.symbol_id == kInvalidSymbolId ||
-		!ValidState(bar.state) || !ValidBar(BlockBar{bar.state, bar.open, bar.high,
-		bar.low, bar.close, bar.volume})) {
+		!ValidState(bar.state)) {
+		return Status::Error(ErrorCode::InvalidArgument, "invalid history bar");
+	}
+	// In Cv data mode, open/high/low are all set equal to close. This allows
+	// callers to provide close-only inputs without needing to populate the
+	// other price fields, and keeps stored bars self-consistent.
+	BlockBar block_bar = {};
+	block_bar.state = bar.state;
+	block_bar.close = bar.close;
+	block_bar.volume = bar.volume;
+	if (fields_ == DataFields::CV) {
+		block_bar.open = bar.close;
+		block_bar.high = bar.close;
+		block_bar.low = bar.close;
+	} else {
+		block_bar.open = bar.open;
+		block_bar.high = bar.high;
+		block_bar.low = bar.low;
+	}
+	if (!ValidBar(block_bar)) {
 		return Status::Error(ErrorCode::InvalidArgument, "invalid history bar");
 	}
 	TimeId time_id = 0;
@@ -114,7 +134,6 @@ Status History::put(const Bar& bar) {
 		staging_->contains(bar.symbol_id, time_id)) {
 		return Status::Error(ErrorCode::AlreadyPresent, "history bar is already present");
 	}
-	BlockBar block_bar = {bar.state, bar.open, bar.high, bar.low, bar.close, bar.volume};
 	status = active_->put(bar.symbol_id, time_id, block_id, block_offset, block_bar, false);
 	if (!status.ok()) {
 		return status;
@@ -136,8 +155,25 @@ Status History::put(const std::vector<Bar>& bars) {
 	for (size_t i = 0; i < bars.size(); ++i) {
 		const Bar& bar = bars[i];
 		if (bar.frequency != frequency_ || bar.symbol_id == kInvalidSymbolId ||
-			!ValidState(bar.state) || !ValidBar(BlockBar{bar.state, bar.open, bar.high,
-			bar.low, bar.close, bar.volume})) {
+			!ValidState(bar.state)) {
+			return Status::Error(ErrorCode::InvalidArgument, "invalid history batch bar");
+		}
+		// Apply data-type normalization before validation so Cv-mode inputs
+		// (which may omit open/high/low) pass the consistency check.
+		BlockBar block_bar = {};
+		block_bar.state = bar.state;
+		block_bar.close = bar.close;
+		block_bar.volume = bar.volume;
+		if (fields_ == DataFields::CV) {
+			block_bar.open = bar.close;
+			block_bar.high = bar.close;
+			block_bar.low = bar.close;
+		} else {
+			block_bar.open = bar.open;
+			block_bar.high = bar.high;
+			block_bar.low = bar.low;
+		}
+		if (!ValidBar(block_bar)) {
 			return Status::Error(ErrorCode::InvalidArgument, "invalid history batch bar");
 		}
 		ResolvedBar item = {};
@@ -156,8 +192,19 @@ Status History::put(const std::vector<Bar>& bars) {
 	}
 	for (size_t i = 0; i < resolved.size(); ++i) {
 		const ResolvedBar& item = resolved[i];
-		BlockBar block_bar = {item.bar.state, item.bar.open, item.bar.high,
-			item.bar.low, item.bar.close, item.bar.volume};
+		BlockBar block_bar = {};
+		block_bar.state = item.bar.state;
+		block_bar.close = item.bar.close;
+		block_bar.volume = item.bar.volume;
+		if (fields_ == DataFields::CV) {
+			block_bar.open = item.bar.close;
+			block_bar.high = item.bar.close;
+			block_bar.low = item.bar.close;
+		} else {
+			block_bar.open = item.bar.open;
+			block_bar.high = item.bar.high;
+			block_bar.low = item.bar.low;
+		}
 		Status status = active_->put(item.bar.symbol_id, item.time_id, item.block_id,
 							 item.block_offset, block_bar, false);
 		if (!status.ok()) {
@@ -819,7 +866,7 @@ Status CompactVault(const std::string& config_path,
 	if (!status.ok()) {
 		return status;
 	}
-	Calendar calendar(market->type());
+	Calendar calendar(market->schedule());
 	TimeId cutoff = 0;
 	TimeId cutoff_block = 0;
 	BlockOff unused_offset = 0;

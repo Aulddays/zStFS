@@ -75,14 +75,27 @@ Status LoadMarketsConfig(const std::string& config_path,
 			return Status::Error(ErrorCode::InvalidArgument,
 				"config: market " + std::to_string(i) + " has no name");
 		}
-		const char* type = NULL;
-		if (!config_setting_lookup_string(market, "type", &type) || type == NULL) {
+		const char* schedule = NULL;
+		if (!config_setting_lookup_string(market, "schedule", &schedule) || schedule == NULL) {
 			return Status::Error(ErrorCode::InvalidArgument,
-				std::string("config: market '") + name + "' missing 'type'");
+				std::string("config: market '") + name + "' missing 'schedule'");
 		}
 		MarketDef def = {};
 		def.name = name;
-		def.type = type;
+		def.schedule = schedule;
+		def.fields = DataFields::OHLCV;
+		const char* fields_str = NULL;
+		if (config_setting_lookup_string(market, "fields", &fields_str) &&
+			fields_str != NULL) {
+			std::string f(fields_str);
+			if (f == "cv" || f == "CV") {
+				def.fields = DataFields::CV;
+			} else if (f != "ohlcv" && f != "OHLCV") {
+				return Status::Error(ErrorCode::InvalidArgument,
+					std::string("config: market '") + name +
+					"' has invalid fields (must be 'ohlcv' or 'cv')");
+			}
+		}
 		defs.push_back(def);
 	}
 	out_markets->swap(defs);
@@ -133,16 +146,16 @@ Status Markets::initialize(const std::vector<MarketDef>& markets) {
 			return Status::Error(ErrorCode::InvalidArgument,
 				"invalid market name: " + def.name);
 		}
-		if (def.type.empty()) {
+		if (def.schedule.empty()) {
 			return Status::Error(ErrorCode::InvalidArgument,
-				"market type is required for: " + def.name);
+				"market schedule is required for: " + def.name);
 		}
 		if (loaded.find(def.name) != loaded.end()) {
 			return Status::Error(ErrorCode::AlreadyPresent,
 				"duplicate market name: " + def.name);
 		}
 		const std::string market_path = root_path_ + "/markets/" + def.name;
-		std::unique_ptr<Market> market(new Market(def.name, market_path, def.type));
+		std::unique_ptr<Market> market(new Market(def.name, market_path, def.schedule, def.fields));
 		if (!market->status().ok()) {
 			return market->status();
 		}

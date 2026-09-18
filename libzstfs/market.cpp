@@ -266,8 +266,9 @@ bool HasLiveData(const std::string& market_path) {
 }  // namespace
 
 Market::Market(const std::string& name, const std::string& path,
-	const std::string& type)
-	: name_(name), path_(path), type_(type), calendar_(new Calendar(type)),
+	const std::string& schedule, DataFields fields)
+	: name_(name), path_(path), schedule_(schedule), fields_(fields),
+	calendar_(new Calendar(schedule)),
 	symbols_(new Symbols()), actions_(new Actions()), daily_history_(),
 	hourly_history_(), status_(Status::Ok()), manifest_generation_(0),
 	manifest_loaded_(false) {
@@ -285,9 +286,9 @@ Market::Market(const std::string& name, const std::string& path,
 		status_ = actions_->configure_persistence(path_ + "/actions.bin", publish);
 	}
 	daily_history_.reset(new History(Frequency::Daily, *calendar_, path_, *actions_,
-		publish, status_));
+		publish, status_, fields_));
 	hourly_history_.reset(new History(Frequency::Hourly, *calendar_, path_, *actions_,
-		publish, status_));
+		publish, status_, fields_));
 	if (status_.ok()) {
 		if (!daily_history_->status().ok()) {
 			status_ = daily_history_->status();
@@ -352,8 +353,8 @@ const std::string& Market::path() const {
 	return path_;
 }
 
-const std::string& Market::type() const {
-	return type_;
+const std::string& Market::schedule() const {
+	return schedule_;
 }
 
 Status Market::status() const {

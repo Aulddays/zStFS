@@ -1444,8 +1444,8 @@ static const uint64_t kVaultSegmentTargetBytes = 256ULL * 1024 * 1024;
 // in-memory records. A single LRU counter and shared capacity budget keep the
 // replacement policy consistent across layers. Sizes are configurable via
 // the public SetCacheSizes() API (declared in zstfs/market.h).
-static const size_t kDefaultCompressedCacheBytes = 32 * 1024 * 1024;
-static const size_t kDefaultDecodedCacheBytes = 16 * 1024 * 1024;
+static const size_t kDefaultCompressedCacheBytes = 128 * 1024 * 1024;
+static const size_t kDefaultDecodedCacheBytes = 32 * 1024 * 1024;
 static size_t g_compressed_cache_limit = kDefaultCompressedCacheBytes;
 static size_t g_decoded_cache_limit = kDefaultDecodedCacheBytes;
 

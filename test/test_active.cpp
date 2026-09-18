@@ -81,7 +81,7 @@ std::string WriteTestConfig(const std::string& root_path,
 	out << "root_path = \"" << root_path << "\"\n";
 	out << "markets:\n";
 	out << "{\n";
-	out << "  " << market_name << ": { type = \"" << market_type << "\" }\n";
+	out << "  " << market_name << ": { schedule = \"" << market_type << "\" }\n";
 	out << "}\n";
 	out.close();
 	return config_path;
@@ -123,7 +123,7 @@ public:
 		const std::string& type)
 		: name_(name), markets_(), market_(NULL) {
 		std::vector<zstfs::MarketDef> defs;
-		zstfs::MarketDef def = {name, type};
+		zstfs::MarketDef def(name, type);
 		defs.push_back(def);
 		markets_.reset(new zstfs::Markets(root_path, defs));
 		ExpectOk(markets_->status());
@@ -578,7 +578,7 @@ void TestManifestAndActions() {
 	}
 	assert(unlink((MarketPath(missing_path, "missing-manifest") + "/manifest").c_str()) == 0);
 	std::vector<zstfs::MarketDef> missing_defs;
-	zstfs::MarketDef missing_def = {"missing-manifest", "CNA"};
+	zstfs::MarketDef missing_def("missing-manifest", "CNA");
 	missing_defs.push_back(missing_def);
 	zstfs::Markets missing_markets(missing_path, missing_defs);
 	assert(missing_markets.status().code() == zstfs::ErrorCode::CorruptData);
@@ -596,7 +596,7 @@ void TestManifestAndActions() {
 	corrupt.write("X", 1);
 	corrupt.close();
 	std::vector<zstfs::MarketDef> corrupt_defs;
-	zstfs::MarketDef corrupt_def = {"corrupt-manifest", "CNA"};
+	zstfs::MarketDef corrupt_def("corrupt-manifest", "CNA");
 	corrupt_defs.push_back(corrupt_def);
 	zstfs::Markets corrupt_markets(corrupt_path, corrupt_defs);
 	assert(corrupt_markets.status().code() == zstfs::ErrorCode::CorruptData);

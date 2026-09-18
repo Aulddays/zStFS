@@ -104,26 +104,23 @@ int main() {
 	ScopedTreeRemoval cleanup(root_path);
 
 	std::vector<zstfs::MarketDef> defs;
-	zstfs::MarketDef def1 = {"test-market", "CNA"};
-	zstfs::MarketDef def2 = {"shanghai", "CNA"};
-	zstfs::MarketDef def3 = {"shenzhen", "CNA"};
-	defs.push_back(def1);
-	defs.push_back(def2);
-	defs.push_back(def3);
+	defs.push_back(zstfs::MarketDef("test-market", "CNA"));
+	defs.push_back(zstfs::MarketDef("shanghai", "CNA"));
+	defs.push_back(zstfs::MarketDef("shenzhen", "CNA"));
 	MarketsFixture fixture(root_path, defs);
 	zstfs::Markets& markets = fixture.markets();
 	zstfs::Market& market = fixture.market("test-market");
-	assert(market.type() == "CNA");
+	assert(market.schedule() == "CNA");
 
 	zstfs::Market* shanghai = NULL;
 	ExpectOk(markets.get("shanghai", &shanghai));
-	assert(shanghai->type() == "CNA");
+	assert(shanghai->schedule() == "CNA");
 
 	// An unknown market is not found; the in-memory markets list is fixed
 	// at construction and does not track on-disk config changes.
 	zstfs::Market* new_market = NULL;
 	assert(markets.get("new-market", &new_market).code() == zstfs::ErrorCode::NotFound);
-	assert(shanghai->type() == "CNA");
+	assert(shanghai->schedule() == "CNA");
 
 	zstfs::SymbolId symbol_id = zstfs::kInvalidSymbolId;
 	ExpectOk(market.symbols().add(NewSymbol("TEST"), &symbol_id));

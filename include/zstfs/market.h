@@ -21,6 +21,15 @@ class StagingStore;
 class VaultStore;
 class Markets;
 
+// DataFields determines which bar fields are meaningful on input and how they
+// are stored.
+//   OHLCV - full OHLCV data (default)
+//   CV    - close+volume only; open/high/low are set equal to close on write
+enum class DataFields {
+	OHLCV = 0,
+	CV = 1,
+};
+
 // VaultCompactionStats reports the stable operational totals produced by one
 // offline compaction. Elapsed time is observational; the byte and block counts
 // are derived from deterministic ordered input and output records.
@@ -62,7 +71,7 @@ public:
 
 	const std::string& name() const;
 	const std::string& path() const;
-	const std::string& type() const;
+	const std::string& schedule() const;
 	// status reports whether the on-disk market generation was accepted during
 	// construction. A non-OK status means no history or action mutation may use
 	// the market state.
@@ -84,11 +93,13 @@ private:
 
 	Market(const std::string& name,
 	       const std::string& path,
-	       const std::string& type);
+	       const std::string& schedule,
+	       DataFields fields);
 
 	std::string name_;
 	std::string path_;
-	std::string type_;
+	std::string schedule_;
+	DataFields fields_;
 	std::unique_ptr<Calendar> calendar_;
 	std::unique_ptr<Symbols> symbols_;
 	std::unique_ptr<Actions> actions_;
@@ -262,11 +273,13 @@ private:
 	        const std::string& market_path,
 	        const Actions& actions,
 	        const std::function<Status()>& publish_manifest,
-	        const Status& initial_status);
+	        const Status& initial_status,
+	        DataFields fields);
 
 	Frequency frequency_;
 	const Calendar& calendar_;
 	const Actions& actions_;
+	DataFields fields_;
 	std::function<Status()> publish_manifest_;
 	Status status_;
 	std::unique_ptr<ActiveStore> active_;
@@ -274,11 +287,18 @@ private:
 	std::unique_ptr<VaultStore> vault_;
 };
 
-// MarketDef describes one market to be created: its short name and its type
-// string (e.g. "CNA"). The type string selects the calendar and trading hours.
+// MarketDef describes one market to be created: its short name, its schedule
+// string (e.g. "CNA") that selects the calendar and trading hours, and which
+// bar fields are populated on input (defaults to OHLCV).
 struct MarketDef {
 	std::string name;
-	std::string type;
+	std::string schedule;
+	DataFields fields;
+
+	MarketDef() : fields(DataFields::OHLCV) {}
+	MarketDef(const std::string& n, const std::string& s,
+	          DataFields f = DataFields::OHLCV)
+		: name(n), schedule(s), fields(f) {}
 };
 
 // LoadMarketsConfig parses the "markets" group from a libconfig-format config
