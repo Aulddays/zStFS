@@ -1,0 +1,27 @@
+# zstfsd configuration file
+
+# HTTP listen settings
+listen_addr = "0.0.0.0"
+listen_port = 8080
+
+# zStFS data root directory (required)
+root_path = "/var/lib/zstfs"
+
+# Cache size limits in megabytes (optional, library defaults are used when
+# unset or set to 0).
+#compressed_cache_mb = 64
+#decoded_cache_mb = 32
+
+# Market definitions. Each market has a name (the group key) and a type
+# string that selects the calendar and trading schedule.
+#
+# Supported types:
+#   CNA  - China A-share market (4 daily sessions, Mon-Fri)
+
+markets:
+{
+	cna:
+	{
+		type = "CNA"
+	}
+}

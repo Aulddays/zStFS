@@ -32,10 +32,23 @@ struct VaultCompactionStats {
 	uint64_t elapsed_milliseconds;
 };
 
+// SetCacheSizes configures the global unified page cache capacity. Both
+// compressed and decoded cache tiers share an LRU eviction policy across all
+// stores. Call this before constructing any Markets object for the limits to
+// take effect. Passing 0 for either size disables that cache tier.
+void SetCacheSizes(size_t compressed_cache_bytes, size_t decoded_cache_bytes);
+
+// Returns the current compressed cache capacity in bytes.
+size_t CompressedCacheBytes();
+
+// Returns the current decoded cache capacity in bytes.
+size_t DecodedCacheBytes();
+
 // CompactVault rebuilds one configured market's immutable Vault from existing
 // Vault and Staging records strictly before cutoff_local_time. The caller runs
 // it while all writers are stopped because publication replaces store files.
-Status CompactVault(const std::string& root_path,
+// config_path is the path to the unified zStFS config file.
+Status CompactVault(const std::string& config_path,
                     const std::string& market_name,
                     Frequency frequency,
                     const std::string& cutoff_local_time,
@@ -261,11 +274,26 @@ private:
 	std::unique_ptr<VaultStore> vault_;
 };
 
-// Markets is the root-level zStFS entry point. It reads root/markets.conf once
-// and owns every configured Market and its library-managed storage directory.
+// MarketDef describes one market to be created: its short name and its type
+// string (e.g. "CNA"). The type string selects the calendar and trading hours.
+struct MarketDef {
+	std::string name;
+	std::string type;
+};
+
+// LoadMarketsConfig parses the "markets" group from a libconfig-format config
+// file. The caller passes the full config file path; this function reads only
+// the markets list and leaves other fields to higher-level parsers.
+Status LoadMarketsConfig(const std::string& config_path,
+                         std::vector<MarketDef>* out_markets);
+
+// Markets is the root-level zStFS entry point. It owns every configured Market
+// and its library-managed storage directory under root_path/markets/.
 class Markets {
 public:
-	explicit Markets(const std::string& root_path);
+	// Constructs Markets from an explicit list of market definitions. The
+	// markets directory is created under root_path when it does not yet exist.
+	Markets(const std::string& root_path, const std::vector<MarketDef>& markets);
 
 	const std::string& root_path() const;
 	Status status() const;
@@ -278,7 +306,9 @@ public:
 	Status seal_all_before(const std::string& today_local, int trading_days_back);
 
 private:
-	Status load_configuration();
+	// initialize validates the root path, ensures the markets/ directory
+	// exists, and constructs each Market in the provided list.
+	Status initialize(const std::vector<MarketDef>& markets);
 
 	std::string root_path_;
 	std::map<std::string, std::unique_ptr<Market> > by_name_;

@@ -16,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include "config.h"
 #include "zstfs/market.h"
 
 namespace zstfsd {
@@ -33,9 +34,14 @@ struct HttpResponse {
 	std::string body;
 };
 
+// RequestWorker runs Markets on a dedicated thread. HTTP requests are queued
+// by the HTTP thread and processed serially here so the core library is never
+// accessed concurrently. The worker owns the Markets object and its lifetime.
 class RequestWorker {
 public:
-	explicit RequestWorker(const std::string& root_path);
+	// Constructs a worker with the given config. Cache sizes are applied to
+	// the global zStFS cache before Markets is constructed.
+	explicit RequestWorker(const DaemonConfig& config);
 	~RequestWorker();
 
 	void start();
@@ -46,7 +52,7 @@ private:
 	void run();
 	HttpResponse handle(const HttpRequest& request);
 
-	std::string root_path_;
+	DaemonConfig config_;
 	std::unique_ptr<zstfs::Markets> markets_;
 	std::mutex mutex_;
 	std::condition_variable condition_;
@@ -57,7 +63,9 @@ private:
 
 class HttpServer {
 public:
-	HttpServer(const std::string& root_path, unsigned short port);
+	// Constructs an HTTP server that listens on config.listen_addr:listen_port
+	// and dispatches requests to a RequestWorker built from config.
+	explicit HttpServer(const DaemonConfig& config);
 	~HttpServer();
 
 	int run();

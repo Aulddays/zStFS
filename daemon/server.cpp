@@ -780,8 +780,8 @@ private:
 
 }  // namespace
 
-RequestWorker::RequestWorker(const std::string& root_path)
-	: root_path_(root_path), stopping_(false) {}
+RequestWorker::RequestWorker(const DaemonConfig& config)
+	: config_(config), stopping_(false) {}
 
 RequestWorker::~RequestWorker() { stop(); }
 
@@ -809,7 +809,14 @@ void RequestWorker::submit(const HttpRequest& request) {
 }
 
 void RequestWorker::run() {
-	markets_.reset(new zstfs::Markets(root_path_));
+	// Apply cache size configuration before constructing any stores.
+	// When both values are 0 (unset in config), library defaults are used.
+	if (config_.compressed_cache_bytes > 0 || config_.decoded_cache_bytes > 0) {
+		zstfs::SetCacheSizes(
+			config_.compressed_cache_bytes > 0 ? config_.compressed_cache_bytes : zstfs::CompressedCacheBytes(),
+			config_.decoded_cache_bytes > 0 ? config_.decoded_cache_bytes : zstfs::DecodedCacheBytes());
+	}
+	markets_.reset(new zstfs::Markets(config_.root_path, config_.markets));
 	for (;;) {
 		HttpRequest request;
 		{
@@ -834,9 +841,10 @@ HttpResponse RequestWorker::handle(const HttpRequest& request) {
 
 class HttpServer::Impl {
 public:
-	Impl(const std::string& root_path, unsigned short port)
-		: acceptor_(io_, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)),
-		  worker_(root_path), stopped_(false) {}
+	explicit Impl(const DaemonConfig& config)
+		: acceptor_(io_, asio::ip::tcp::endpoint(
+			asio::ip::make_address(config.listen_addr), config.listen_port)),
+		  worker_(config), stopped_(false) {}
 
 	int run() {
 		worker_.start();
@@ -872,8 +880,8 @@ private:
 	bool stopped_;
 };
 
-HttpServer::HttpServer(const std::string& root_path, unsigned short port)
-	: impl_(new Impl(root_path, port)) {}
+HttpServer::HttpServer(const DaemonConfig& config)
+	: impl_(new Impl(config)) {}
 
 HttpServer::~HttpServer() { stop(); }
 

@@ -1,1 +1,1 @@
-SUBDIRS = libzstfs test makevault daemon
+SUBDIRS = libconfig libzstfs test makevault daemon

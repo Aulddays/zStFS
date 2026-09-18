@@ -70,6 +70,23 @@ std::string MakeTestDirectory() {
 	return path;
 }
 
+// Writes a minimal zStFS config file into the test directory and returns its
+// path. Used by tests that call CompactVault, which reads the unified config.
+std::string WriteTestConfig(const std::string& root_path,
+                            const std::string& market_name,
+                            const std::string& market_type) {
+	const std::string config_path = root_path + "/zstfsd.conf";
+	std::ofstream out(config_path.c_str());
+	assert(out);
+	out << "root_path = \"" << root_path << "\"\n";
+	out << "markets:\n";
+	out << "{\n";
+	out << "  " << market_name << ": { type = \"" << market_type << "\" }\n";
+	out << "}\n";
+	out.close();
+	return config_path;
+}
+
 void RemoveTree(const std::string& path) {
 	DIR* directory = opendir(path.c_str());
 	if (directory == NULL) {
@@ -97,20 +114,18 @@ void RemoveTestDirectory(const std::string& path) {
 	RemoveTree(path);
 }
 
-// MarketFixture models the application-owned root configuration boundary. Each
-// fixture writes the immutable name,type record before opening Markets, which
-// keeps the returned Market valid for all operations in its enclosing scope.
+// MarketFixture constructs Markets from a single MarketDef for tests that
+// only need one market. The fixture keeps the Markets object alive so the
+// returned Market reference is valid for the test's enclosing scope.
 class MarketFixture {
 public:
 	MarketFixture(const std::string& root_path, const std::string& name,
 		const std::string& type)
 		: name_(name), markets_(), market_(NULL) {
-		std::ofstream config((root_path + "/markets.conf").c_str());
-		assert(config);
-		config << name << "," << type << "\n";
-		config.close();
-
-		markets_.reset(new zstfs::Markets(root_path));
+		std::vector<zstfs::MarketDef> defs;
+		zstfs::MarketDef def = {name, type};
+		defs.push_back(def);
+		markets_.reset(new zstfs::Markets(root_path, defs));
 		ExpectOk(markets_->status());
 		ExpectOk(markets_->get(name_, &market_));
 	}
@@ -562,7 +577,10 @@ void TestManifestAndActions() {
 		ExpectOk(market.status());
 	}
 	assert(unlink((MarketPath(missing_path, "missing-manifest") + "/manifest").c_str()) == 0);
-	zstfs::Markets missing_markets(missing_path);
+	std::vector<zstfs::MarketDef> missing_defs;
+	zstfs::MarketDef missing_def = {"missing-manifest", "CNA"};
+	missing_defs.push_back(missing_def);
+	zstfs::Markets missing_markets(missing_path, missing_defs);
 	assert(missing_markets.status().code() == zstfs::ErrorCode::CorruptData);
 	RemoveTestDirectory(missing_path);
 
@@ -577,7 +595,10 @@ void TestManifestAndActions() {
 	assert(corrupt);
 	corrupt.write("X", 1);
 	corrupt.close();
-	zstfs::Markets corrupt_markets(corrupt_path);
+	std::vector<zstfs::MarketDef> corrupt_defs;
+	zstfs::MarketDef corrupt_def = {"corrupt-manifest", "CNA"};
+	corrupt_defs.push_back(corrupt_def);
+	zstfs::Markets corrupt_markets(corrupt_path, corrupt_defs);
 	assert(corrupt_markets.status().code() == zstfs::ErrorCode::CorruptData);
 	RemoveTestDirectory(corrupt_path);
 }
@@ -678,8 +699,10 @@ void TestOfflineVaultCompaction() {
 	}
 	zstfs::VaultCompactionStats stats = {};
 	zstfs::VaultCompactionStats duplicate_stats = {};
-	ExpectOk(zstfs::CompactVault(path, "compaction-test", zstfs::Frequency::Daily, "20260805", &stats));
-	ExpectOk(zstfs::CompactVault(duplicate_path, "compaction-test", zstfs::Frequency::Daily, "20260805",
+	const std::string config_file = WriteTestConfig(path, "compaction-test", "CNA");
+	const std::string dup_config_file = WriteTestConfig(duplicate_path, "compaction-test", "CNA");
+	ExpectOk(zstfs::CompactVault(config_file, "compaction-test", zstfs::Frequency::Daily, "20260805", &stats));
+	ExpectOk(zstfs::CompactVault(dup_config_file, "compaction-test", zstfs::Frequency::Daily, "20260805",
 		&duplicate_stats));
 	assert(stats.input_blocks >= 2);
 	// Compaction preserves complete BarBlockFrame ownership and never splits
@@ -723,7 +746,7 @@ void TestOfflineVaultCompaction() {
 		assert(CloseEnough(bar.close, 50.0));
 	}
 	zstfs::VaultCompactionStats second_stats = {};
-	ExpectOk(zstfs::CompactVault(path, "compaction-test", zstfs::Frequency::Daily, "20270105", &second_stats));
+	ExpectOk(zstfs::CompactVault(config_file, "compaction-test", zstfs::Frequency::Daily, "20270105", &second_stats));
 	{
 		zstfs::VaultStore vault(zstfs::Frequency::Daily, calendar, frequency_path, 994);
 		std::vector<zstfs::StockTimeBlock> blocks;

@@ -1,41 +1,39 @@
 // daemon/main.cpp
 //
-// Command-line entry point for zstfsd. The daemon owns one configured zStFS
-// root and exposes the HTTP service until SIGINT or SIGTERM is received.
+// Command-line entry point for zstfsd. Loads the configuration file, starts
+// the HTTP service, and runs until SIGINT or SIGTERM is received.
+//
+// Usage: zstfsd <config-file>
 
-#include <cstdlib>
 #include <iostream>
 #include <string>
 
+#include "config.h"
 #include "server.h"
 
 namespace {
 
-bool ParsePort(const char* text, unsigned short* port) {
-	char* end = NULL;
-	long value = std::strtol(text, &end, 10);
-	if (end == text || *end != '\0' || value < 1 || value > 65535) return false;
-	*port = static_cast<unsigned short>(value);
-	return true;
-}
-
 void Usage(const char* program) {
-	std::cerr << "usage: " << program << " <root-path> [port]\n";
+	std::cerr << "usage: " << program << " <config-file>\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-	if (argc < 2 || argc > 3) {
+	if (argc != 2) {
 		Usage(argv[0]);
 		return 2;
 	}
-	unsigned short port = 8080;
-	if (argc == 3 && !ParsePort(argv[2], &port)) {
-		std::cerr << "invalid port\n";
-		return 2;
+
+	zstfsd::DaemonConfig config;
+	zstfs::Status status = zstfsd::LoadDaemonConfig(argv[1], &config);
+	if (!status.ok()) {
+		std::cerr << "config error: " << status.message() << "\n";
+		return 1;
 	}
-	zstfsd::HttpServer server(argv[1], port);
-	std::cerr << "zstfsd listening on port " << port << "\n";
+
+	zstfsd::HttpServer server(config);
+	std::cerr << "zstfsd listening on " << config.listen_addr
+	          << ":" << config.listen_port << "\n";
 	return server.run();
 }

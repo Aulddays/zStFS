@@ -1442,9 +1442,25 @@ static const uint64_t kVaultSegmentTargetBytes = 256ULL * 1024 * 1024;
 // Unified page cache shared by Vault and Staging stores. Both stores use the
 // same two-level cache design: compressed raw bytes (blob/page) and decoded
 // in-memory records. A single LRU counter and shared capacity budget keep the
-// replacement policy consistent across layers.
-static const size_t kCompressedCacheBytes = 32 * 1024 * 1024;
-static const size_t kDecodedCacheBytes = 16 * 1024 * 1024;
+// replacement policy consistent across layers. Sizes are configurable via
+// the public SetCacheSizes() API (declared in zstfs/market.h).
+static const size_t kDefaultCompressedCacheBytes = 32 * 1024 * 1024;
+static const size_t kDefaultDecodedCacheBytes = 16 * 1024 * 1024;
+static size_t g_compressed_cache_limit = kDefaultCompressedCacheBytes;
+static size_t g_decoded_cache_limit = kDefaultDecodedCacheBytes;
+
+void SetCacheSizes(size_t compressed_cache_bytes, size_t decoded_cache_bytes) {
+	g_compressed_cache_limit = compressed_cache_bytes;
+	g_decoded_cache_limit = decoded_cache_bytes;
+}
+
+size_t CompressedCacheBytes() {
+	return g_compressed_cache_limit;
+}
+
+size_t DecodedCacheBytes() {
+	return g_decoded_cache_limit;
+}
 
 // CachedPage is the compressed-cache entry: one raw blob (vault) or one raw
 // page (staging), identified by its store type, market, frequency, segment,
@@ -1549,12 +1565,12 @@ static void InsertCompressedCache(CacheStoreType store_type,
 						  uint32_t segment_id,
 						  uint64_t offset,
 						  const std::vector<uint8_t>& bytes) {
-	if (bytes.size() > kCompressedCacheBytes) {
+	if (bytes.size() > g_compressed_cache_limit) {
 		return;
 	}
 	std::lock_guard<std::mutex> lock(g_cache_mutex);
 	while (!g_compressed_cache.empty() &&
-		g_compressed_cache_size + bytes.size() > kCompressedCacheBytes) {
+		g_compressed_cache_size + bytes.size() > g_compressed_cache_limit) {
 		size_t oldest = 0;
 		for (size_t i = 1; i < g_compressed_cache.size(); ++i) {
 			if (g_compressed_cache[i].last_use < g_compressed_cache[oldest].last_use) {
@@ -1635,17 +1651,17 @@ static void InsertVaultDecodedCache(uint64_t runtime_market_id,
 						  TimeId time_block_id,
 						  const std::vector<ActiveBar>& bars) {
 	const size_t bytes = VaultBarsBytes(bars);
-	if (bytes > kDecodedCacheBytes) {
+	if (bytes > g_decoded_cache_limit) {
 		return;
 	}
 	std::lock_guard<std::mutex> lock(g_cache_mutex);
 	while (!g_vault_decoded_cache.empty() && !g_staging_decoded_cache.empty() &&
-		g_decoded_cache_size + bytes > kDecodedCacheBytes) {
+		g_decoded_cache_size + bytes > g_decoded_cache_limit) {
 		EvictOldestDecodedLocked();
 	}
 	// If one cache is empty but we're still over budget, it means the other
 	// cache alone exceeds the limit. Keep evicting from the non-empty one.
-	while (g_decoded_cache_size + bytes > kDecodedCacheBytes &&
+	while (g_decoded_cache_size + bytes > g_decoded_cache_limit &&
 		(!g_vault_decoded_cache.empty() || !g_staging_decoded_cache.empty())) {
 		EvictOldestDecodedLocked();
 	}
@@ -1689,11 +1705,11 @@ static void InsertStagingDecodedCache(uint64_t runtime_market_id,
 							  uint64_t page_offset,
 							  const std::vector<ParsedStagingRecord>& records) {
 	const size_t bytes = StagingPageDecodedBytes(records);
-	if (bytes > kDecodedCacheBytes) {
+	if (bytes > g_decoded_cache_limit) {
 		return;
 	}
 	std::lock_guard<std::mutex> lock(g_cache_mutex);
-	while (g_decoded_cache_size + bytes > kDecodedCacheBytes &&
+	while (g_decoded_cache_size + bytes > g_decoded_cache_limit &&
 		(!g_vault_decoded_cache.empty() || !g_staging_decoded_cache.empty())) {
 		EvictOldestDecodedLocked();
 	}

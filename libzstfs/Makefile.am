@@ -1,6 +1,6 @@
 lib_LIBRARIES = libzstfs.a
 
-libzstfs_a_CPPFLAGS = -I$(top_srcdir)/include
+libzstfs_a_CPPFLAGS = -I$(top_srcdir)/libconfig -I$(top_srcdir)/include
 libzstfs_a_SOURCES = \
 	status.cpp \
 	calendar.cpp \

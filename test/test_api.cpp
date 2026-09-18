@@ -72,21 +72,13 @@ private:
 	std::string path_;
 };
 
-// MarketsFixture writes one application root configuration and opens its market
-// collection. The collection owns every returned Market pointer and reference.
+// MarketsFixture constructs Markets from an explicit MarketDef list.
+// The collection owns every returned Market pointer and reference.
 class MarketsFixture {
 public:
-	MarketsFixture(const std::string& root_path, const std::vector<std::string>& records)
+	MarketsFixture(const std::string& root_path, const std::vector<zstfs::MarketDef>& defs)
 		: markets_() {
-		std::ofstream config((root_path + "/markets.conf").c_str());
-		assert(config);
-		for (std::vector<std::string>::const_iterator record = records.begin();
-			record != records.end(); ++record) {
-			config << *record << "\n";
-		}
-		config.close();
-
-		markets_.reset(new zstfs::Markets(root_path));
+		markets_.reset(new zstfs::Markets(root_path, defs));
 		ExpectOk(markets_->status());
 	}
 
@@ -111,11 +103,14 @@ int main() {
 	assert(mkdir(root_path.c_str(), 0755) == 0);
 	ScopedTreeRemoval cleanup(root_path);
 
-	std::vector<std::string> records;
-	records.push_back("test-market,CNA");
-	records.push_back("shanghai,CNA");
-	records.push_back("shenzhen,CNA");
-	MarketsFixture fixture(root_path, records);
+	std::vector<zstfs::MarketDef> defs;
+	zstfs::MarketDef def1 = {"test-market", "CNA"};
+	zstfs::MarketDef def2 = {"shanghai", "CNA"};
+	zstfs::MarketDef def3 = {"shenzhen", "CNA"};
+	defs.push_back(def1);
+	defs.push_back(def2);
+	defs.push_back(def3);
+	MarketsFixture fixture(root_path, defs);
 	zstfs::Markets& markets = fixture.markets();
 	zstfs::Market& market = fixture.market("test-market");
 	assert(market.type() == "CNA");
@@ -124,11 +119,8 @@ int main() {
 	ExpectOk(markets.get("shanghai", &shanghai));
 	assert(shanghai->type() == "CNA");
 
-	{
-		std::ofstream config((root_path + "/markets.conf").c_str(), std::ios::trunc);
-		assert(config);
-		config << "test-market,CNA\nnew-market,CNA\n";
-	}
+	// An unknown market is not found; the in-memory markets list is fixed
+	// at construction and does not track on-disk config changes.
 	zstfs::Market* new_market = NULL;
 	assert(markets.get("new-market", &new_market).code() == zstfs::ErrorCode::NotFound);
 	assert(shanghai->type() == "CNA");
@@ -151,7 +143,7 @@ int main() {
 	assert(symbol.aliases[0].code == "TEST");
 	ExpectOk(market.symbols().find("TEST", "20260803", &symbol));
 
-	zstfs::Markets restored_markets(root_path);
+	zstfs::Markets restored_markets(root_path, defs);
 	ExpectOk(restored_markets.status());
 	zstfs::Market* restored_market = NULL;
 	ExpectOk(restored_markets.get("test-market", &restored_market));
@@ -208,7 +200,7 @@ int main() {
 	assert(actions.size() == 1);
 	const zstfs::ActionId reinserted_action_id = actions[0].id;
 
-	zstfs::Markets action_reloaded_markets(root_path);
+	zstfs::Markets action_reloaded_markets(root_path, defs);
 	ExpectOk(action_reloaded_markets.status());
 	zstfs::Market* action_reloaded_market = NULL;
 	ExpectOk(action_reloaded_markets.get("test-market", &action_reloaded_market));
@@ -247,7 +239,7 @@ int main() {
 	actions_file.seekp(static_cast<std::streamoff>(key_offset));
 	actions_file.write(duplicate_key.data(), duplicate_key.size());
 	actions_file.close();
-	zstfs::Markets corrupted_action_markets(root_path);
+	zstfs::Markets corrupted_action_markets(root_path, defs);
 	assert(corrupted_action_markets.status().code() == zstfs::ErrorCode::CorruptData);
 
 	assert(market.history(zstfs::Frequency::Daily).frequency() ==

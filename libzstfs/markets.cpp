@@ -1,8 +1,10 @@
 // markets.cpp
 //
-// Owns the root-level configuration boundary for zStFS. The caller supplies a
-// root directory and its fixed markets.conf file; this module creates every
-// market below that root and never lets caller-provided paths select storage.
+// Owns the root-level configuration boundary for zStFS. The unified config
+// file uses libconfig format; this module reads only the "markets" group from
+// it and constructs the corresponding Market objects under root_path/markets/.
+// Higher-level layers (daemon, tools) parse their own fields from the same
+// config file.
 
 #include "zstfs/market.h"
 
@@ -10,24 +12,85 @@
 
 #include <cerrno>
 #include <cctype>
-#include <fstream>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#include "libconfig.h"
 
 namespace zstfs {
 
 // =============================================================================
-// Root Configuration Parsing
-// markets.conf is intentionally a small immutable startup contract: name,type.
+// Public API — config loading
 
-static std::string Trim(const std::string& value) {
-	std::string::size_type begin = value.find_first_not_of(" \t\r\n");
-	if (begin == std::string::npos) {
-		return "";
+Status LoadMarketsConfig(const std::string& config_path,
+                         std::vector<MarketDef>* out_markets) {
+	if (out_markets == NULL) {
+		return Status::Error(ErrorCode::InvalidArgument, "output is required");
 	}
-	std::string::size_type end = value.find_last_not_of(" \t\r\n");
-	return value.substr(begin, end - begin + 1);
+	if (config_path.empty()) {
+		return Status::Error(ErrorCode::InvalidArgument, "config path is required");
+	}
+
+	// RAII wrapper around the C config_t struct so we never leak on error paths.
+	struct ConfigHandle : public config_t {
+		ConfigHandle() { config_init(this); }
+		~ConfigHandle() { config_destroy(this); }
+	};
+	ConfigHandle cfg;
+	if (config_read_file(&cfg, config_path.c_str()) != CONFIG_TRUE) {
+		std::string msg = "config parse error";
+		const char* file = config_error_file(&cfg);
+		if (file != NULL && *file != '\0') {
+			msg += " in ";
+			msg += file;
+		}
+		int line = config_error_line(&cfg);
+		if (line > 0) {
+			msg += " line " + std::to_string(line);
+		}
+		const char* text = config_error_text(&cfg);
+		if (text != NULL && *text != '\0') {
+			msg += ": ";
+			msg += text;
+		}
+		return Status::Error(ErrorCode::IoError, msg);
+	}
+
+	config_setting_t* markets_group = config_lookup(&cfg, "markets");
+	if (markets_group == NULL) {
+		return Status::Error(ErrorCode::InvalidArgument,
+			"config: 'markets' group is required");
+	}
+	int count = config_setting_length(markets_group);
+	if (count <= 0) {
+		return Status::Error(ErrorCode::InvalidArgument,
+			"config: no markets defined");
+	}
+	std::vector<MarketDef> defs;
+	defs.reserve(static_cast<size_t>(count));
+	for (int i = 0; i < count; ++i) {
+		config_setting_t* market = config_setting_get_elem(markets_group, i);
+		const char* name = config_setting_name(market);
+		if (name == NULL || *name == '\0') {
+			return Status::Error(ErrorCode::InvalidArgument,
+				"config: market " + std::to_string(i) + " has no name");
+		}
+		const char* type = NULL;
+		if (!config_setting_lookup_string(market, "type", &type) || type == NULL) {
+			return Status::Error(ErrorCode::InvalidArgument,
+				std::string("config: market '") + name + "' missing 'type'");
+		}
+		MarketDef def = {};
+		def.name = name;
+		def.type = type;
+		defs.push_back(def);
+	}
+	out_markets->swap(defs);
+	return Status::Ok();
 }
+
+// =============================================================================
+// Markets construction
 
 static bool ValidMarketName(const std::string& name) {
 	if (name.empty() || name == "." || name == "..") {
@@ -42,36 +105,12 @@ static bool ValidMarketName(const std::string& name) {
 	return true;
 }
 
-static bool ParseMarketLine(const std::string& line, std::string* name,
-	std::string* type) {
-	const std::string::size_type separator = line.find(',');
-	if (separator == std::string::npos || line.find(',', separator + 1) != std::string::npos) {
-		return false;
-	}
-	*name = Trim(line.substr(0, separator));
-	*type = Trim(line.substr(separator + 1));
-	return ValidMarketName(*name) && !type->empty();
-}
-
-// =============================================================================
-// Root Lifecycle
-// The root and markets.conf belong to the application; market subdirectories
-// are owned exclusively by this library after configuration has been accepted.
-
-Markets::Markets(const std::string& root_path)
+Markets::Markets(const std::string& root_path, const std::vector<MarketDef>& markets)
 	: root_path_(root_path), by_name_(), status_(Status::Ok()) {
-	status_ = load_configuration();
+	status_ = initialize(markets);
 }
 
-const std::string& Markets::root_path() const {
-	return root_path_;
-}
-
-Status Markets::status() const {
-	return status_;
-}
-
-Status Markets::load_configuration() {
+Status Markets::initialize(const std::vector<MarketDef>& markets) {
 	if (root_path_.empty()) {
 		return Status::Error(ErrorCode::InvalidArgument, "zstfs root path is required");
 	}
@@ -87,48 +126,42 @@ Status Markets::load_configuration() {
 		return Status::Error(ErrorCode::IoError, "markets path is not a directory");
 	}
 
-	const std::string config_path = root_path_ + "/markets.conf";
-	std::ifstream input(config_path.c_str());
-	if (!input) {
-		return Status::Error(ErrorCode::IoError, "cannot open root markets.conf");
-	}
-
 	std::map<std::string, std::unique_ptr<Market> > loaded;
-	std::string line;
-	unsigned int line_number = 0;
-	while (std::getline(input, line)) {
-		++line_number;
-		line = Trim(line);
-		if (line.empty() || line[0] == '#') {
-			continue;
-		}
-		std::string name;
-		std::string type;
-		if (!ParseMarketLine(line, &name, &type)) {
+	for (size_t i = 0; i < markets.size(); ++i) {
+		const MarketDef& def = markets[i];
+		if (!ValidMarketName(def.name)) {
 			return Status::Error(ErrorCode::InvalidArgument,
-				"invalid markets.conf line " + std::to_string(line_number));
+				"invalid market name: " + def.name);
 		}
-		if (loaded.find(name) != loaded.end()) {
+		if (def.type.empty()) {
+			return Status::Error(ErrorCode::InvalidArgument,
+				"market type is required for: " + def.name);
+		}
+		if (loaded.find(def.name) != loaded.end()) {
 			return Status::Error(ErrorCode::AlreadyPresent,
-				"duplicate market name in markets.conf");
+				"duplicate market name: " + def.name);
 		}
-		const std::string market_path = root_path_ + "/markets/" + name;
-		std::unique_ptr<Market> market(new Market(name, market_path, type));
+		const std::string market_path = root_path_ + "/markets/" + def.name;
+		std::unique_ptr<Market> market(new Market(def.name, market_path, def.type));
 		if (!market->status().ok()) {
 			return market->status();
 		}
-		loaded[name] = std::move(market);
+		loaded[def.name] = std::move(market);
 	}
-	if (!input.eof()) {
-		return Status::Error(ErrorCode::IoError, "cannot read root markets.conf");
-	}
-
 	by_name_.swap(loaded);
 	return Status::Ok();
 }
 
+const std::string& Markets::root_path() const {
+	return root_path_;
+}
+
+Status Markets::status() const {
+	return status_;
+}
+
 // =============================================================================
-// Market Lookup
+// Market lookup
 
 Status Markets::get(const std::string& name, Market** out) {
 	if (out == NULL) {

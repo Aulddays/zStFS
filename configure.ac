@@ -4,6 +4,7 @@ AM_INIT_AUTOMAKE([foreign subdir-objects])
 AC_CONFIG_SRCDIR([libzstfs/market.cpp])
 AC_CONFIG_HEADERS([config.h])
 
+AC_PROG_CC
 AC_PROG_CXX
 AC_PROG_RANLIB
 
@@ -21,6 +22,7 @@ AC_COMPILE_IFELSE([
 
 AC_CONFIG_FILES([
 	Makefile
+	libconfig/Makefile
 	libzstfs/Makefile
 	test/Makefile
 	makevault/Makefile

@@ -7,6 +7,9 @@
 
 #include "codec.h"
 
+#include "libconfig.h"
+#include "zstfs/market.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -773,20 +776,41 @@ static Status RestoreCompactedStore(const std::string& frequency_path,
 	return Status::Ok();
 }
 
-Status CompactVault(const std::string& root_path,
+Status CompactVault(const std::string& config_path,
 					const std::string& market_name,
 					Frequency frequency,
 					const std::string& cutoff_local_time,
 					VaultCompactionStats* stats) {
-	if (stats == NULL || root_path.empty() || market_name.empty()) {
-		return Status::Error(ErrorCode::InvalidArgument, "root path, market name, and compaction stats are required");
+	if (stats == NULL || config_path.empty() || market_name.empty()) {
+		return Status::Error(ErrorCode::InvalidArgument, "config path, market name, and compaction stats are required");
 	}
 	*stats = {};
 	const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+
+	// Read root_path and markets list from the unified config file.
+	struct ConfigHandle : public config_t {
+		ConfigHandle() { config_init(this); }
+		~ConfigHandle() { config_destroy(this); }
+	};
+	ConfigHandle cfg;
+	if (config_read_file(&cfg, config_path.c_str()) != CONFIG_TRUE) {
+		return Status::Error(ErrorCode::IoError, "cannot read config file");
+	}
+	const char* root_path_cstr = NULL;
+	if (!config_lookup_string(&cfg, "root_path", &root_path_cstr) ||
+		root_path_cstr == NULL || *root_path_cstr == '\0') {
+		return Status::Error(ErrorCode::InvalidArgument, "config: root_path is required");
+	}
+	const std::string root_path(root_path_cstr);
+
+	std::vector<MarketDef> market_defs;
+	Status load_status = LoadMarketsConfig(config_path, &market_defs);
+	if (!load_status.ok()) return load_status;
+
 	// Compaction changes two immutable stores as one offline operation. Opening
 	// the configured root verifies the published input generation; sync below
 	// exposes replacement files only after both store publications complete.
-	Markets markets(root_path);
+	Markets markets(root_path, market_defs);
 	if (!markets.status().ok()) {
 		return markets.status();
 	}
