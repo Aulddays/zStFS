@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "serialization.h"
+#include <zstfs/pe_log.h>
 
 namespace zstfs {
 
@@ -110,14 +111,18 @@ static bool GetAction(const std::vector<uint8_t>& bytes, size_t* offset, Action*
 	return ValidAction(*action) && action->id != kInvalidActionId;
 }
 
-Status Actions::load() {
+Status Actions::load()
+{
 	by_id_.clear();
 	by_external_event_key_.clear();
 	anchors_.clear();
 	next_id_ = kInvalidActionId + 1;
 	std::ifstream input(path_.c_str(), std::ios::binary);
-	if (!input) {
-		if (access(path_.c_str(), F_OK) == 0) {
+	if (!input)
+	{
+		if (access(path_.c_str(), F_OK) == 0)
+		{
+			PELOG_LOG((PLV_ERROR, "actions load: cannot open %s (errno=%d)\n", path_.c_str(), errno));
 			status_ = Status::Error(ErrorCode::IoError, "cannot open actions.bin");
 			return status_;
 		}
@@ -132,7 +137,9 @@ Status Actions::load() {
 	uint32_t count = 0;
 	uint32_t persisted_next_id = 0;
 	if (bytes.size() < 16 || bytes[0] != 'Z' || bytes[1] != 'A' ||
-		bytes[2] != 'C' || bytes[3] != '8') {
+		bytes[2] != 'C' || bytes[3] != '8')
+	{
+		PELOG_LOG((PLV_ERROR, "actions load: bad magic in %s\n", path_.c_str()));
 		status_ = Status::Error(ErrorCode::CorruptData, "invalid actions.bin magic");
 		return status_;
 	}
@@ -188,13 +195,17 @@ Status Actions::save(const std::map<ActionId, Action>& actions,
 
 	const std::string temporary = path_ + ".tmp-actions";
 	std::ofstream output(temporary.c_str(), std::ios::binary | std::ios::trunc);
-	if (!output) {
+	if (!output)
+	{
+		PELOG_LOG((PLV_ERROR, "actions save: cannot create temp file %s\n", temporary.c_str()));
 		return Status::Error(ErrorCode::IoError, "cannot create actions temporary file");
 	}
 	output.write(reinterpret_cast<const char*>(&bytes[0]), bytes.size());
 	output.close();
-	if (!output || rename(temporary.c_str(), path_.c_str()) != 0) {
+	if (!output || rename(temporary.c_str(), path_.c_str()) != 0)
+	{
 		unlink(temporary.c_str());
+		PELOG_LOG((PLV_ERROR, "actions save: cannot publish %s (errno=%d)\n", path_.c_str(), errno));
 		return Status::Error(ErrorCode::IoError, "cannot publish actions.bin");
 	}
 	return Status::Ok();

@@ -10,9 +10,10 @@ libzstfs_a_SOURCES = \
 	history.cpp \
 	market.cpp \
 	markets.cpp \
-	codec.cpp
+	codec.cpp pe_log.cpp
 
 nobase_include_HEADERS = \
 	$(top_srcdir)/include/zstfs/status.h \
 	$(top_srcdir)/include/zstfs/data.h \
-	$(top_srcdir)/include/zstfs/market.h
+	$(top_srcdir)/include/zstfs/market.h \
+	$(top_srcdir)/include/zstfs/pe_log.h

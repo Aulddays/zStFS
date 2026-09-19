@@ -18,6 +18,7 @@ depcomp
 install-sh
 missing
 test-driver
+/compile
 
 # Build outputs and dependency metadata
 *.a
@@ -37,3 +38,7 @@ testrun/
 CLAUDE.md
 todo.md
 prog.md
+
+updater/venv
+updater/__pycache__
+.env

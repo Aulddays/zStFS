@@ -27,6 +27,7 @@
 
 #include "serialization.h"
 #include "zstfs/market.h"
+#include <zstfs/pe_log.h>
 
 namespace zstfs {
 
@@ -460,7 +461,9 @@ Status ActiveStore::flush_locked() {
 		return Status::Ok();
 	}
 	std::ofstream output(path_.c_str(), std::ios::binary | std::ios::app);
-	if (!output) {
+	if (!output)
+	{
+		PELOG_LOG((PLV_ERROR, "active store: cannot append %s (errno=%d)\n", path_.c_str(), errno));
 		return Status::Error(ErrorCode::IoError, "cannot append active log");
 	}
 	for (std::map<TimeId, ActiveTimeBlock>::iterator block = blocks_.begin();
@@ -478,14 +481,18 @@ Status ActiveStore::flush_locked() {
 					return Status::Error(ErrorCode::CorruptData, "invalid dirty active bar");
 				}
 				output.write(reinterpret_cast<const char*>(&bytes[0]), bytes.size());
-				if (!output) {
+				if (!output)
+				{
+					PELOG_LOG((PLV_ERROR, "active store: write failed %s\n", path_.c_str()));
 					return Status::Error(ErrorCode::IoError, "cannot write active log");
 				}
 			}
 		}
 	}
 	output.flush();
-	if (!output) {
+	if (!output)
+	{
+		PELOG_LOG((PLV_ERROR, "active store: flush failed %s\n", path_.c_str()));
 		return Status::Error(ErrorCode::IoError, "cannot flush active log");
 	}
 	for (std::map<TimeId, ActiveTimeBlock>::iterator block = blocks_.begin();
@@ -562,7 +569,9 @@ Status ActiveStore::remove_before(TimeId time_id) {
 		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
 	const std::string temporary_path = path_ + ".tmp";
 	std::ofstream output(temporary_path.c_str(), std::ios::binary | std::ios::trunc);
-	if (!output) {
+	if (!output)
+	{
+		PELOG_LOG((PLV_ERROR, "active store: cannot create rewrite temp %s\n", temporary_path.c_str()));
 		return Status::Error(ErrorCode::IoError, "cannot rewrite active log");
 	}
 	for (std::map<TimeId, ActiveTimeBlock>::const_iterator block = blocks_.begin();
@@ -583,7 +592,9 @@ Status ActiveStore::remove_before(TimeId time_id) {
 					return Status::Error(ErrorCode::CorruptData, "invalid active bar during rewrite");
 				}
 				output.write(reinterpret_cast<const char*>(&bytes[0]), bytes.size());
-				if (!output) {
+				if (!output)
+				{
+					PELOG_LOG((PLV_ERROR, "active store: rewrite write failed %s\n", path_.c_str()));
 					return Status::Error(ErrorCode::IoError, "cannot rewrite active log");
 				}
 			}
@@ -591,8 +602,10 @@ Status ActiveStore::remove_before(TimeId time_id) {
 	}
 	output.flush();
 	output.close();
-	if (!output || std::rename(temporary_path.c_str(), path_.c_str()) != 0) {
+	if (!output || std::rename(temporary_path.c_str(), path_.c_str()) != 0)
+	{
 		std::remove(temporary_path.c_str());
+		PELOG_LOG((PLV_ERROR, "active store: cannot publish rewrite %s (errno=%d)\n", path_.c_str(), errno));
 		return Status::Error(ErrorCode::IoError, "cannot publish rewritten active log");
 	}
 	for (std::map<TimeId, ActiveTimeBlock>::iterator block = blocks_.begin();

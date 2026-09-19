@@ -7,6 +7,7 @@
 #include "zstfs/market.h"
 
 #include "serialization.h"
+#include <zstfs/pe_log.h>
 
 #include <cerrno>
 #include <cstdio>
@@ -591,14 +592,18 @@ Status Symbols::save(const std::map<SymbolId, Symbol>& symbols,
 	// replacement operation on the file system holding the Market.
 	const std::string temporary = path_ + ".tmp-symbols";
 	std::ofstream output(temporary.c_str(), std::ios::binary | std::ios::trunc);
-	if (!output) {
+	if (!output)
+	{
+		PELOG_LOG((PLV_ERROR, "symbols save: cannot create temp file %s\n", temporary.c_str()));
 		return Status::Error(ErrorCode::IoError,
 		                     "failed to create symbols temporary file");
 	}
 	output.write(reinterpret_cast<const char*>(&data[0]), data.size());
 	output.close();
-	if (!output || rename(temporary.c_str(), path_.c_str()) != 0) {
+	if (!output || rename(temporary.c_str(), path_.c_str()) != 0)
+	{
 		unlink(temporary.c_str());
+		PELOG_LOG((PLV_ERROR, "symbols save: cannot publish %s (errno=%d)\n", path_.c_str(), errno));
 		return Status::Error(ErrorCode::IoError, "failed to publish symbols file");
 	}
 	return Status::Ok();
@@ -628,19 +633,25 @@ Status Symbols::persist(const std::map<SymbolId, Symbol>& symbols,
 	return Status::Ok();
 }
 
-Status Symbols::load() {
+Status Symbols::load()
+{
 	std::ifstream input(path_.c_str(), std::ios::binary);
-	if (!input) {
-		if (errno == ENOENT) {
+	if (!input)
+	{
+		if (errno == ENOENT)
+		{
 			return Status::Error(ErrorCode::NotFound, "symbols file was not found");
 		}
+		PELOG_LOG((PLV_ERROR, "symbols load: cannot open %s (errno=%d)\n", path_.c_str(), errno));
 		return Status::Error(ErrorCode::IoError, "failed to open symbols file");
 	}
 	std::vector<uint8_t> data((std::istreambuf_iterator<char>(input)),
 	                          std::istreambuf_iterator<char>());
 	size_t offset = 0;
 	if (data.size() < 20 || data[0] != 'Z' || data[1] != 'S' ||
-	    data[2] != 'Y' || data[3] != 'M') {
+	    data[2] != 'Y' || data[3] != 'M')
+	{
+		PELOG_LOG((PLV_ERROR, "symbols load: bad magic in %s\n", path_.c_str()));
 		return Status::Error(ErrorCode::CorruptData, "invalid symbols file header");
 	}
 	offset = 4;
@@ -728,7 +739,10 @@ Status Symbols::load() {
 			return Status::Error(ErrorCode::CorruptData, "invalid symbol code index");
 		}
 	}
-	if (offset != data.size() || next_id == kInvalidSymbolId) {
+	if (offset != data.size() || next_id == kInvalidSymbolId)
+	{
+		PELOG_LOG((PLV_ERROR, "symbols load: corrupt tail in %s (offset=%zu size=%zu next_id=%u)\n",
+			path_.c_str(), offset, data.size(), next_id));
 		return Status::Error(ErrorCode::CorruptData, "trailing symbols data");
 	}
 

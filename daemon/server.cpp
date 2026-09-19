@@ -19,9 +19,11 @@
 #include <utility>
 
 #include <signal.h>
+#include <sys/time.h>
 
 #include "asio.hpp"
 #include "nlohmann-json/json.hpp"
+#include <zstfs/pe_log.h>
 
 namespace zstfsd {
 namespace {
@@ -36,6 +38,14 @@ HttpResponse OkJson(const std::string& body) {
 HttpResponse ErrorResponse(int code, const std::string& message) {
 	HttpResponse response = {code, "application/json", json{{"error", message}}.dump()};
 	return response;
+}
+
+// Helper that logs an error-level message and returns the corresponding HTTP error response.
+// Used so every 4xx/5xx we return is also visible in the daemon's error log.
+HttpResponse LoggedError(int code, const std::string &message)
+{
+	PELOG_LOG((PLV_ERROR, "HTTP %d: %s\n", code, message.c_str()));
+	return ErrorResponse(code, message);
 }
 
 int StatusCode(const zstfs::Status& status) {
@@ -456,7 +466,7 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		return OkJson(json{{"trading_days_back", kStageTradingDaysBack}}.dump());
 	}
 	if (parts.size() < 3 || parts[0] != "v1" || parts[1] != "markets") {
-		return ErrorResponse(404, "endpoint not found");
+		return LoggedError(404, "endpoint not found");
 	}
 	zstfs::Market* market = NULL;
 	zstfs::Status status = markets->get(parts[2], &market);
@@ -489,7 +499,7 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		// are returned alongside the id.
 		json payload;
 		try { payload = json::parse(request.body); }
-		catch (const std::exception& error) { return ErrorResponse(400, std::string("invalid JSON: ") + error.what()); }
+		catch (const std::exception& error) { return LoggedError(400, std::string("invalid JSON: ") + error.what()); }
 		json items;
 		bool single = false;
 		if (payload.is_array()) {
@@ -500,9 +510,9 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 			items = json::array({payload});
 			single = true;
 		} else {
-			return ErrorResponse(400, "request body must contain a symbol object or array");
+			return LoggedError(400, "request body must contain a symbol object or array");
 		}
-		if (items.empty()) return ErrorResponse(400, "request body must contain at least one symbol");
+		if (items.empty()) return LoggedError(400, "request body must contain at least one symbol");
 		status = market->symbols().begin_batch();
 		if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
 		uint32_t changed_count = 0;
@@ -511,10 +521,13 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		bool first_changed = false;
 		bool batch_ok = true;
 		std::string batch_error;
+		zstfs::Status batch_lib_status = zstfs::Status::Ok();
+		bool batch_is_lib_error = false;
 		for (size_t i = 0; i < items.size(); ++i) {
 			zstfs::Symbol symbol = {};
 			std::string perror;
-			if (!ParseSymbol(items[i], &symbol, &perror)) {
+			if (!ParseSymbol(items[i], &symbol, &perror))
+			{
 				batch_error = "symbol[" + std::to_string(i) + "]: " + perror;
 				batch_ok = false;
 				break;
@@ -522,8 +535,10 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 			bool changed = false;
 			zstfs::SymbolId out_id = 0;
 			zstfs::Status s = market->symbols().upsert(symbol, &out_id, &changed);
-			if (!s.ok()) {
-				batch_error = "symbol[" + std::to_string(i) + "]: " + s.message();
+			if (!s.ok())
+			{
+				batch_lib_status = s;
+				batch_is_lib_error = true;
 				batch_ok = false;
 				break;
 			}
@@ -536,11 +551,16 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		}
 		if (!batch_ok) {
 			market->symbols().abort_batch();
-			return ErrorResponse(400, batch_error);
+			if (batch_is_lib_error) {
+				return ErrorResponse(StatusCode(batch_lib_status), batch_lib_status.message());
+			}
+			return LoggedError(400, batch_error);
 		}
 		bool batch_changed = false;
 		status = market->symbols().commit_batch(&batch_changed);
 		if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
+		PELOG_LOG((PLV_INFO, "symbols upsert: market=%s accepted=%zu changed=%u unchanged=%u batch_changed=%d\n",
+			parts[2].c_str(), items.size(), changed_count, unchanged_count, batch_changed ? 1 : 0));
 		if (single) {
 			return OkJson(json{{"id", first_id}, {"updated", first_changed}}.dump());
 		}
@@ -558,6 +578,8 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
 		status = market->symbols().remove(symbol.id);
 		if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
+		PELOG_LOG((PLV_INFO, "symbol removed: market=%s code=%s id=%u\n",
+			parts[2].c_str(), code.c_str(), symbol.id));
 		return OkJson("{\"removed\":true}");
 	}
 
@@ -568,7 +590,7 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 			std::map<std::string, std::string>::const_iterator key_it = query.find("external_event_key");
 			uint32_t symbol_id = 0;
 			if (symbol_it == query.end() || key_it == query.end() || key_it->second.empty() || !Integer(symbol_it->second, &symbol_id)) {
-				return ErrorResponse(400, "symbol_id and external_event_key are required");
+				return LoggedError(400, "symbol_id and external_event_key are required");
 			}
 			status = market->actions().remove(symbol_id, key_it->second);
 			if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
@@ -577,12 +599,15 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		if (request.method == "POST") {
 			json payload;
 			try { payload = json::parse(request.body); }
-			catch (const std::exception& error) { return ErrorResponse(400, std::string("invalid JSON: ") + error.what()); }
+			catch (const std::exception& error) { return LoggedError(400, std::string("invalid JSON: ") + error.what()); }
 			zstfs::Action action = {};
 			std::string error;
-			if (!ParseAction(payload, &action, &error)) return ErrorResponse(400, error);
+			if (!ParseAction(payload, &action, &error)) return LoggedError(400, error);
 			status = market->actions().upsert(action);
 			if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
+			PELOG_LOG((PLV_INFO, "action upsert: market=%s symbol_id=%u type=%s date=%s\n",
+				parts[2].c_str(), action.symbol_id, ActionTypeName(action.type).c_str(),
+				action.effective_date.c_str()));
 			return OkJson("{\"accepted\":1}");
 		}
 		if (request.method == "GET") {
@@ -593,7 +618,7 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 			uint32_t symbol_id = 0;
 			std::vector<zstfs::Action> actions;
 			if (symbol_it == query.end() || begin_it == query.end() || end_it == query.end() ||
-					!Integer(symbol_it->second, &symbol_id)) return ErrorResponse(400, "symbol_id, begin and end are required");
+					!Integer(symbol_it->second, &symbol_id)) return LoggedError(400, "symbol_id, begin and end are required");
 			status = market->actions().get(symbol_id, begin_it->second, end_it->second, &actions);
 			if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
 			json result;
@@ -601,52 +626,54 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 			for (size_t i = 0; i < actions.size(); ++i) result["actions"].push_back(ActionJson(actions[i]));
 			return OkJson(result.dump());
 		}
-		return ErrorResponse(405, "method not allowed");
+		return LoggedError(405, "method not allowed");
 	}
 
-	if (parts.size() != 4 || parts[3] != "bars") return ErrorResponse(404, "endpoint not found");
+	if (parts.size() != 4 || parts[3] != "bars") return LoggedError(404, "endpoint not found");
 	if (request.method == "POST") {
 		json payload;
 		try {
 			payload = json::parse(request.body);
 		} catch (const std::exception& error) {
-			return ErrorResponse(400, std::string("invalid JSON: ") + error.what());
+			return LoggedError(400, std::string("invalid JSON: ") + error.what());
 		}
 		json items;
 		if (payload.is_array()) items = payload;
 		else if (payload.is_object() && payload.contains("bars") && payload["bars"].is_array()) items = payload["bars"];
 		else if (payload.is_object()) items = json::array({payload});
-		else return ErrorResponse(400, "request body must contain a bar object or array");
-		if (items.empty()) return ErrorResponse(400, "request body must contain at least one bar");
+		else return LoggedError(400, "request body must contain a bar object or array");
+		if (items.empty()) return LoggedError(400, "request body must contain at least one bar");
 		std::vector<zstfs::Bar> bars;
 		for (json::const_iterator item = items.begin(); item != items.end(); ++item) {
 			zstfs::Bar bar = {};
 			std::string error;
-			if (!ParseBar(*item, &bar, &error)) return ErrorResponse(400, error);
+			if (!ParseBar(*item, &bar, &error)) return LoggedError(400, error);
 			bars.push_back(bar);
 		}
 		zstfs::Frequency frequency = bars[0].frequency;
 		for (size_t i = 1; i < bars.size(); ++i) {
-			if (bars[i].frequency != frequency) return ErrorResponse(400, "a batch must use one frequency");
+			if (bars[i].frequency != frequency) return LoggedError(400, "a batch must use one frequency");
 		}
 		status = market->history(frequency).put(bars);
 		if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
+		PELOG_LOG((PLV_INFO, "bars put: market=%s frequency=%s count=%zu\n",
+			parts[2].c_str(), FrequencyName(frequency).c_str(), bars.size()));
 		return OkJson(json{{"accepted", bars.size()}}.dump());
 	}
-	if (request.method != "GET") return ErrorResponse(405, "method not allowed");
+	if (request.method != "GET") return LoggedError(405, "method not allowed");
 
 	const std::map<std::string, std::string> query = Query(request.target);
 	std::map<std::string, std::string>::const_iterator it = query.find("symbol_id");
 	uint32_t symbol_id = 0;
 	if (it == query.end() || !Integer(it->second, &symbol_id) || symbol_id == 0) {
-		return ErrorResponse(400, "symbol_id is required");
+		return LoggedError(400, "symbol_id is required");
 	}
 	it = query.find("frequency");
 	zstfs::Frequency frequency = zstfs::Frequency::Daily;
-	if (it == query.end() || !ParseFrequency(it->second, &frequency)) return ErrorResponse(400, "frequency is required");
+	if (it == query.end() || !ParseFrequency(it->second, &frequency)) return LoggedError(400, "frequency is required");
 	it = query.find("adjust");
 	zstfs::AdjustMode adjust = zstfs::AdjustMode::Raw;
-	if (it != query.end() && !ParseAdjust(it->second, &adjust)) return ErrorResponse(400, "adjust is invalid");
+	if (it != query.end() && !ParseAdjust(it->second, &adjust)) return LoggedError(400, "adjust is invalid");
 	it = query.find("time");
 	if (it != query.end()) {
 		zstfs::Bar bar = {};
@@ -656,7 +683,7 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 	}
 	const std::string begin = query.count("begin") ? query.find("begin")->second : "";
 	const std::string end = query.count("end") ? query.find("end")->second : "";
-	if (begin.empty() || end.empty()) return ErrorResponse(400, "begin and end are required");
+	if (begin.empty() || end.empty()) return LoggedError(400, "begin and end are required");
 	std::vector<zstfs::Bar> bars;
 	status = market->history(frequency).get(symbol_id, begin, end, adjust, &bars);
 	if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
@@ -826,14 +853,35 @@ void RequestWorker::run() {
 			request = requests_.front();
 			requests_.pop();
 		}
+		// Log request start: method + full target (includes query string)
+		PELOG_LOG((PLV_INFO, "REQ %s %s\n", request.method.c_str(), request.target.c_str()));
+		struct timeval t0;
+		gettimeofday(&t0, NULL);
 		const HttpResponse response = handle(request);
+		struct timeval t1;
+		gettimeofday(&t1, NULL);
+		double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_usec - t0.tv_usec) / 1000.0;
+		if (response.status_code >= 200 && response.status_code < 300)
+		{
+			PELOG_LOG((PLV_INFO, "RSP %s %s -> %d (%.2f ms)\n",
+				request.method.c_str(), request.target.c_str(),
+				response.status_code, elapsed_ms));
+		}
+		else
+		{
+			PELOG_LOG((PLV_WARNING, "RSP %s %s -> %d (%.2f ms)\n",
+				request.method.c_str(), request.target.c_str(),
+				response.status_code, elapsed_ms));
+		}
 		if (request.complete) request.complete(response.body, response.status_code, response.content_type);
 	}
 	markets_.reset();
 }
 
-HttpResponse RequestWorker::handle(const HttpRequest& request) {
-	if (!markets_ || !markets_->status().ok()) {
+HttpResponse RequestWorker::handle(const HttpRequest &request)
+{
+	if (!markets_ || !markets_->status().ok())
+	{
 		return ErrorResponse(500, markets_ ? markets_->status().message() : "market initialization failed");
 	}
 	return HandleRequest(markets_.get(), request);

@@ -20,6 +20,8 @@ AC_COMPILE_IFELSE([
 	AC_MSG_ERROR([a C++11 compiler is required])
 ])
 
+AC_CHECK_FUNCS([newlocale uselocale freelocale])
+
 AC_CONFIG_FILES([
 	Makefile
 	libconfig/Makefile
