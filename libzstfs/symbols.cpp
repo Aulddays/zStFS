@@ -118,18 +118,16 @@ Symbols::Symbols()
 // initial manifest publication.
 Status Symbols::configure_persistence(
 	const std::string& file_path,
-	const std::function<Status()>& publish_manifest,
 	bool* created) {
 	if (created == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "created is required");
 	}
-	if (file_path.empty() || !publish_manifest) {
+	if (file_path.empty()) {
 		return Status::Error(ErrorCode::InvalidArgument,
 		                     "symbols persistence configuration is invalid");
 	}
 
 	path_ = file_path;
-	publish_manifest_ = publish_manifest;
 	*created = false;
 	Status loaded = load();
 	if (loaded.ok()) {
@@ -235,10 +233,8 @@ Status Symbols::flush_if_dirty(const std::map<SymbolId, Symbol>& symbols,
 	if (!status_.ok()) {
 		return status_;
 	}
-	if (path_.empty() || !publish_manifest_) {
-		return Status::Error(ErrorCode::Conflict,
-		                     "symbols persistence is not configured");
-	}
+	if (path_.empty())
+		return Status::Error(ErrorCode::Conflict, "symbols persistence is not configured");
 	if (in_batch_) {
 		batch_dirty_ = true;
 		return Status::Ok();
@@ -466,10 +462,8 @@ Status Symbols::begin_batch() {
 	if (in_batch_) {
 		return Status::Error(ErrorCode::Conflict, "symbols batch is already active");
 	}
-	if (path_.empty() || !publish_manifest_) {
-		return Status::Error(ErrorCode::Conflict,
-		                     "symbols persistence is not configured");
-	}
+	if (path_.empty())
+		return Status::Error(ErrorCode::Conflict, "symbols persistence is not configured");
 	// Snapshot current state so abort_batch can roll back without touching disk.
 	saved_by_id_ = by_id_;
 	saved_by_code_ = by_code_;
@@ -609,23 +603,19 @@ Status Symbols::save(const std::map<SymbolId, Symbol>& symbols,
 	return Status::Ok();
 }
 
-// The manifest is published only after rename has installed the replacement.
-// Candidate indexes become visible only when both persistence steps succeed.
+// Writes the full snapshot via atomic tmp+rename, then swaps in-memory state.
+// Single-file rename is atomic so no manifest coordination is needed.
 Status Symbols::persist(const std::map<SymbolId, Symbol>& symbols,
                         const std::map<std::string, SymbolId>& codes,
                         SymbolId next_id) {
-	if (path_.empty() || !publish_manifest_) {
-		return Status::Error(ErrorCode::Conflict,
-		                     "symbols persistence is not configured");
-	}
+	if (path_.empty())
+		return Status::Error(ErrorCode::Conflict, "symbols persistence is not configured");
 
+	PELOG_LOG((PLV_INFO, "symbols persist: %zu symbols, next_id=%u\n",
+		symbols.size(), next_id));
 	Status saved = save(symbols, codes, next_id);
 	if (!saved.ok()) {
 		return saved;
-	}
-	Status published = publish_manifest_();
-	if (!published.ok()) {
-		return published;
 	}
 	by_id_ = symbols;
 	by_code_ = codes;

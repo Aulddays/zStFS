@@ -106,8 +106,6 @@ private:
 	std::unique_ptr<History> daily_history_;
 	std::unique_ptr<History> hourly_history_;
 	Status status_;
-	uint64_t manifest_generation_;
-	bool manifest_loaded_;
 
 	Status initialize_storage();
 	Status load_or_bootstrap_manifest();
@@ -162,7 +160,6 @@ private:
 	friend class Market;
 
 	Status configure_persistence(const std::string& file_path,
-	                             const std::function<Status()>& publish_manifest,
 	                             bool* created);
 	Status load();
 	Status save(const std::map<SymbolId, Symbol>& symbols,
@@ -185,7 +182,6 @@ private:
 	std::map<std::string, SymbolId> by_code_;
 	SymbolId next_id_;
 	std::string path_;
-	std::function<Status()> publish_manifest_;
 	Status status_;
 
 	bool in_batch_;
@@ -224,8 +220,7 @@ public:
 private:
 	friend class Market;
 
-	Status configure_persistence(const std::string& file_path,
-	                             const std::function<Status()>& publish_manifest);
+	Status configure_persistence(const std::string &file_path);
 	Status load();
 	Status save(const std::map<ActionId, Action>& actions,
 	            ActionId next_id) const;
@@ -238,7 +233,6 @@ private:
 	ActionId next_id_;
 	std::map<SymbolId, std::vector<Action> > anchors_;
 	std::string path_;
-	std::function<Status()> publish_manifest_;
 	Status status_;
 };
 

@@ -63,6 +63,18 @@ int StatusCode(const zstfs::Status& status) {
 	return 500;
 }
 
+// Converts a library Status to an HTTP error response and logs it.
+// 4xx errors log at WARNING level (client error), 5xx at ERROR level (server fault).
+HttpResponse StatusError(const zstfs::Status& status)
+{
+	int code = StatusCode(status);
+	if (code >= 500)
+		PELOG_LOG((PLV_ERROR, "library error: %s\n", status.message().c_str()));
+	else
+		PELOG_LOG((PLV_WARNING, "client error %d: %s\n", code, status.message().c_str()));
+	return ErrorResponse(code, status.message());
+}
+
 std::string UrlDecode(const std::string& value) {
 	std::string result;
 	for (size_t i = 0; i < value.size(); ++i) {

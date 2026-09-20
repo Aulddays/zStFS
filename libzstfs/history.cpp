@@ -30,6 +30,7 @@
 
 #include "serialization.h"
 #include "zstfs/market.h"
+#include <zstfs/pe_log.h>
 
 namespace zstfs {
 
@@ -101,7 +102,10 @@ Status History::put(const Bar& bar) {
 	}
 	if (bar.frequency != frequency_ || bar.symbol_id == kInvalidSymbolId ||
 		!ValidState(bar.state)) {
-		return Status::Error(ErrorCode::InvalidArgument, "invalid history bar");
+		PELOG_ERROR_RETURN((PLV_WARNING,
+			"history put: invalid bar header: symbol_id=%u frequency=%d state=%d\n",
+			bar.symbol_id, static_cast<int>(bar.frequency), static_cast<int>(bar.state)),
+			Status::Error(ErrorCode::InvalidArgument, "invalid history bar"));
 	}
 	// In Cv data mode, open/high/low are all set equal to close. This allows
 	// callers to provide close-only inputs without needing to populate the
@@ -120,7 +124,12 @@ Status History::put(const Bar& bar) {
 		block_bar.low = bar.low;
 	}
 	if (!ValidBar(block_bar)) {
-		return Status::Error(ErrorCode::InvalidArgument, "invalid history bar");
+		PELOG_ERROR_RETURN((PLV_WARNING,
+			"history put: invalid bar values: symbol_id=%u time=%s "
+			"open=%f high=%f low=%f close=%f volume=%f\n",
+			bar.symbol_id, bar.time.c_str(),
+			block_bar.open, block_bar.high, block_bar.low, block_bar.close, block_bar.volume),
+			Status::Error(ErrorCode::InvalidArgument, "invalid history bar"));
 	}
 	TimeId time_id = 0;
 	TimeId block_id = 0;
@@ -132,17 +141,17 @@ Status History::put(const Bar& bar) {
 	}
 	if (active_->contains(bar.symbol_id, time_id) ||
 		staging_->contains(bar.symbol_id, time_id)) {
-		return Status::Error(ErrorCode::AlreadyPresent, "history bar is already present");
+		PELOG_ERROR_RETURN((PLV_WARNING,
+			"history put: bar already present: symbol_id=%u time=%s\n",
+			bar.symbol_id, bar.time.c_str()),
+			Status::Error(ErrorCode::AlreadyPresent, "history bar is already present"));
 	}
 	status = active_->put(bar.symbol_id, time_id, block_id, block_offset, block_bar, false);
-	if (!status.ok()) {
+	if (!status.ok())
+	{
 		return status;
 	}
-	status = active_->flush();
-	if (!status.ok()) {
-		return status;
-	}
-	return publish_manifest_ ? publish_manifest_() : Status::Ok();
+	return active_->flush();
 }
 
 Status History::put(const std::vector<Bar>& bars) {
@@ -156,7 +165,10 @@ Status History::put(const std::vector<Bar>& bars) {
 		const Bar& bar = bars[i];
 		if (bar.frequency != frequency_ || bar.symbol_id == kInvalidSymbolId ||
 			!ValidState(bar.state)) {
-			return Status::Error(ErrorCode::InvalidArgument, "invalid history batch bar");
+			PELOG_ERROR_RETURN((PLV_WARNING,
+				"history batch put: invalid bar[%zu] header: symbol_id=%u frequency=%d state=%d\n",
+				i, bar.symbol_id, static_cast<int>(bar.frequency), static_cast<int>(bar.state)),
+				Status::Error(ErrorCode::InvalidArgument, "invalid history batch bar"));
 		}
 		// Apply data-type normalization before validation so Cv-mode inputs
 		// (which may omit open/high/low) pass the consistency check.
@@ -174,7 +186,12 @@ Status History::put(const std::vector<Bar>& bars) {
 			block_bar.low = bar.low;
 		}
 		if (!ValidBar(block_bar)) {
-			return Status::Error(ErrorCode::InvalidArgument, "invalid history batch bar");
+			PELOG_ERROR_RETURN((PLV_WARNING,
+				"history batch put: invalid bar[%zu] values: symbol_id=%u time=%s "
+				"open=%f high=%f low=%f close=%f volume=%f\n",
+				i, bar.symbol_id, bar.time.c_str(),
+				block_bar.open, block_bar.high, block_bar.low, block_bar.close, block_bar.volume),
+				Status::Error(ErrorCode::InvalidArgument, "invalid history batch bar"));
 		}
 		ResolvedBar item = {};
 		item.bar = bar;
@@ -186,7 +203,10 @@ Status History::put(const std::vector<Bar>& bars) {
 		if (!seen.insert(std::make_pair(bar.symbol_id, item.time_id)).second ||
 			active_->contains(bar.symbol_id, item.time_id) ||
 			staging_->contains(bar.symbol_id, item.time_id)) {
-			return Status::Error(ErrorCode::AlreadyPresent, "history batch contains an existing bar");
+			PELOG_ERROR_RETURN((PLV_WARNING,
+				"history batch put: duplicate bar at index %zu: symbol_id=%u time=%s\n",
+				i, bar.symbol_id, bar.time.c_str()),
+				Status::Error(ErrorCode::AlreadyPresent, "history batch contains an existing bar"));
 		}
 		resolved.push_back(item);
 	}
@@ -211,11 +231,7 @@ Status History::put(const std::vector<Bar>& bars) {
 			return status;
 		}
 	}
-	Status status = active_->flush();
-	if (!status.ok()) {
-		return status;
-	}
-	return publish_manifest_ ? publish_manifest_() : Status::Ok();
+	return active_->flush();
 }
 
 Status History::get(SymbolId symbol_id,
@@ -442,15 +458,11 @@ Status History::get(const std::vector<SymbolId>& symbol_ids,
 		"one or more history range blocks are corrupt") : Status::Ok();
 }
 
-Status History::flush() {
-	if (!status_.ok()) {
+Status History::flush()
+{
+	if (!status_.ok())
 		return status_;
-	}
-	Status status = active_->flush();
-	if (!status.ok()) {
-		return status;
-	}
-	return publish_manifest_ ? publish_manifest_() : Status::Ok();
+	return active_->flush();
 }
 
 Status History::seal_before(const std::string& time) {
@@ -480,7 +492,8 @@ Status History::seal_before(const std::string& time) {
 		return status;
 	}
 	status = active_->remove_before(time_id);
-	if (!status.ok()) {
+	if (!status.ok())
+	{
 		return status;
 	}
 	return publish_manifest_ ? publish_manifest_() : Status::Ok();

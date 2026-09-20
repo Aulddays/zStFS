@@ -31,11 +31,9 @@ Actions::Actions()
 	: next_id_(kInvalidActionId + 1), status_(Status::Ok()) {
 }
 
-Status Actions::configure_persistence(
-	const std::string& file_path,
-	const std::function<Status()>& publish_manifest) {
+Status Actions::configure_persistence(const std::string &file_path)
+{
 	path_ = file_path;
-	publish_manifest_ = publish_manifest;
 	return load();
 }
 
@@ -225,12 +223,6 @@ Status Actions::persist(const std::map<ActionId, Action>& actions,
 	Status status = save(actions, next_id);
 	if (!status.ok()) {
 		return status;
-	}
-	if (publish_manifest_) {
-		status = publish_manifest_();
-		if (!status.ok()) {
-			return status;
-		}
 	}
 	by_id_ = actions;
 	by_external_event_key_ = external_event_keys;
