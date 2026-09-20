@@ -247,7 +247,7 @@ int main() {
 	zstfs::Bar bar = {};
 	bar.symbol_id = symbol_id;
 	bar.frequency = zstfs::Frequency::Daily;
-	bar.local_time = "20260803";
+	bar.time = "20260803";
 	bar.state = zstfs::BarState::Normal;
 	assert(!market.history(zstfs::Frequency::Daily).put(bar).ok());
 

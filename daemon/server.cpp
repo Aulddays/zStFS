@@ -244,32 +244,77 @@ bool ParseState(const std::string& value, zstfs::BarState* output) {
 	return true;
 }
 
+// Resolves a symbol reference to its integer id. Accepts either a numeric
+// symbol_id or a string code. Returns Ok with *out set on success; the
+// caller's error message is set on failure so each endpoint can return a
+// consistent description.
+zstfs::Status ResolveSymbolId(zstfs::Market *market,
+	const std::string &symbol_id_str,
+	const std::string &code,
+	zstfs::SymbolId *out,
+	std::string *error)
+{
+	if (!symbol_id_str.empty())
+	{
+		uint32_t parsed = 0;
+		if (!Integer(symbol_id_str, &parsed) || parsed == 0)
+		{
+			*error = "symbol_id is invalid";
+			return zstfs::Status::Error(zstfs::ErrorCode::InvalidArgument, *error);
+		}
+		zstfs::Symbol symbol = {};
+		zstfs::Status s = market->symbols().get(parsed, &symbol);
+		if (!s.ok()) return s;
+		*out = parsed;
+		return zstfs::Status::Ok();
+	}
+	if (!code.empty())
+	{
+		zstfs::Symbol symbol = {};
+		zstfs::Status s = market->symbols().find(code, &symbol);
+		if (!s.ok()) return s;
+		*out = symbol.id;
+		return zstfs::Status::Ok();
+	}
+	*error = "symbol_id or code is required";
+	return zstfs::Status::Error(zstfs::ErrorCode::InvalidArgument, *error);
+}
+
 bool ParseBar(const json& object, zstfs::Bar* bar, std::string* error) {
 	if (!object.is_object()) {
 		*error = "each bar must be a JSON object";
 		return false;
 	}
-	if (!object.contains("symbol_id") || !object["symbol_id"].is_number_unsigned()) {
-		*error = "symbol_id must be an unsigned integer";
-		return false;
+	// symbol_id is optional in the parser; callers resolve it together with the
+	// "code" field using the market's symbol table. When neither is present,
+	// bar->symbol_id stays 0 and the caller reports the error.
+	bar->symbol_id = 0;
+	if (object.contains("symbol_id"))
+	{
+		if (!object["symbol_id"].is_number_unsigned())
+		{
+			*error = "symbol_id must be an unsigned integer";
+			return false;
+		}
+		const uint64_t symbol_id = object["symbol_id"].get<uint64_t>();
+		if (symbol_id == 0 || symbol_id > 0xffffffffULL)
+		{
+			*error = "symbol_id is out of range";
+			return false;
+		}
+		bar->symbol_id = static_cast<zstfs::SymbolId>(symbol_id);
 	}
-	const uint64_t symbol_id = object["symbol_id"].get<uint64_t>();
-	if (symbol_id == 0 || symbol_id > 0xffffffffULL) {
-		*error = "symbol_id is out of range";
-		return false;
-	}
-	bar->symbol_id = static_cast<zstfs::SymbolId>(symbol_id);
 	if (!object.contains("frequency") || !object["frequency"].is_string() ||
 			!ParseFrequency(object["frequency"].get<std::string>(), &bar->frequency)) {
 		*error = "frequency must be daily or hourly";
 		return false;
 	}
-	if (!object.contains("local_time") || !object["local_time"].is_string() ||
-			object["local_time"].get<std::string>().empty()) {
-		*error = "local_time is required";
+	if (!object.contains("time") || !object["time"].is_string() ||
+			object["time"].get<std::string>().empty()) {
+		*error = "time is required";
 		return false;
 	}
-	bar->local_time = object["local_time"].get<std::string>();
+	bar->time = object["time"].get<std::string>();
 	if (!object.contains("state") || !object["state"].is_string() ||
 			!ParseState(object["state"].get<std::string>(), &bar->state)) {
 		*error = "state is invalid";
@@ -335,18 +380,31 @@ bool ParseAction(const json& object, zstfs::Action* action, std::string* error) 
 		*error = "external_event_key is required";
 		return false;
 	}
-	if (!object.contains("symbol_id") || !object["symbol_id"].is_number_unsigned()) {
-		*error = "symbol_id must be an unsigned integer";
+	if (!object.contains("effective_date") || !object["effective_date"].is_string()) {
+		*error = "effective_date is required";
 		return false;
 	}
-	const uint64_t symbol_id = object["symbol_id"].get<uint64_t>();
-	if (symbol_id == 0 || symbol_id > 0xffffffffULL || !object.contains("effective_date") || !object["effective_date"].is_string()) {
-		*error = "symbol_id and effective_date are required";
-		return false;
+	// symbol_id is optional in the parser; callers resolve it together with the
+	// "code" field using the market's symbol table. When neither is present,
+	// action->symbol_id stays 0 and the caller reports the error.
+	action->symbol_id = 0;
+	if (object.contains("symbol_id"))
+	{
+		if (!object["symbol_id"].is_number_unsigned())
+		{
+			*error = "symbol_id must be an unsigned integer";
+			return false;
+		}
+		const uint64_t symbol_id = object["symbol_id"].get<uint64_t>();
+		if (symbol_id == 0 || symbol_id > 0xffffffffULL)
+		{
+			*error = "symbol_id is out of range";
+			return false;
+		}
+		action->symbol_id = static_cast<zstfs::SymbolId>(symbol_id);
 	}
 	action->id = 0;
 	action->external_event_key = object["external_event_key"].get<std::string>();
-	action->symbol_id = static_cast<zstfs::SymbolId>(symbol_id);
 	action->effective_date = object["effective_date"].get<std::string>();
 	const std::string type = object.value("type", std::string());
 	if (type == "split") action->type = zstfs::ActionType::Split;
@@ -432,7 +490,7 @@ json BarJson(const zstfs::Bar& bar) {
 	json result = {
 		{"symbol_id", bar.symbol_id},
 		{"frequency", FrequencyName(bar.frequency)},
-		{"local_time", bar.local_time},
+		{"time", bar.time},
 		{"state", StateName(bar.state)}
 	};
 	if (bar.state == zstfs::BarState::Normal) {
@@ -584,13 +642,30 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 	}
 
 	if (parts.size() == 4 && parts[3] == "actions") {
-		if (request.method == "DELETE") {
+		if (request.method == "DELETE")
+		{
 			const std::map<std::string, std::string> query = Query(request.target);
-			std::map<std::string, std::string>::const_iterator symbol_it = query.find("symbol_id");
+			std::string symbol_id_str;
+			std::string code_str;
+			std::map<std::string, std::string>::const_iterator it = query.find("symbol_id");
+			if (it != query.end()) symbol_id_str = it->second;
+			it = query.find("code");
+			if (it != query.end()) code_str = it->second;
 			std::map<std::string, std::string>::const_iterator key_it = query.find("external_event_key");
-			uint32_t symbol_id = 0;
-			if (symbol_it == query.end() || key_it == query.end() || key_it->second.empty() || !Integer(symbol_it->second, &symbol_id)) {
-				return LoggedError(400, "symbol_id and external_event_key are required");
+			if (key_it == query.end() || key_it->second.empty())
+			{
+				return LoggedError(400, "external_event_key is required");
+			}
+			zstfs::SymbolId symbol_id = 0;
+			std::string resolve_error;
+			status = ResolveSymbolId(market, symbol_id_str, code_str, &symbol_id, &resolve_error);
+			if (!status.ok())
+			{
+				if (status.code() == zstfs::ErrorCode::InvalidArgument)
+				{
+					return LoggedError(400, resolve_error);
+				}
+				return ErrorResponse(StatusCode(status), status.message());
 			}
 			status = market->actions().remove(symbol_id, key_it->second);
 			if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
@@ -603,6 +678,26 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 			zstfs::Action action = {};
 			std::string error;
 			if (!ParseAction(payload, &action, &error)) return LoggedError(400, error);
+			// Resolve symbol reference: numeric symbol_id takes priority, then code string.
+			if (action.symbol_id == 0)
+			{
+				std::string code_str;
+				if (payload.contains("code") && payload["code"].is_string())
+				{
+					code_str = payload["code"].get<std::string>();
+				}
+				zstfs::SymbolId resolved_id = 0;
+				status = ResolveSymbolId(market, "", code_str, &resolved_id, &error);
+				if (!status.ok())
+				{
+					if (status.code() == zstfs::ErrorCode::InvalidArgument)
+					{
+						return LoggedError(400, error);
+					}
+					return ErrorResponse(StatusCode(status), status.message());
+				}
+				action.symbol_id = resolved_id;
+			}
 			status = market->actions().upsert(action);
 			if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
 			PELOG_LOG((PLV_INFO, "action upsert: market=%s symbol_id=%u type=%s date=%s\n",
@@ -610,15 +705,33 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 				action.effective_date.c_str()));
 			return OkJson("{\"accepted\":1}");
 		}
-		if (request.method == "GET") {
+		if (request.method == "GET")
+		{
 			const std::map<std::string, std::string> query = Query(request.target);
-			std::map<std::string, std::string>::const_iterator symbol_it = query.find("symbol_id");
+			std::string symbol_id_str;
+			std::string code_str;
+			std::map<std::string, std::string>::const_iterator it = query.find("symbol_id");
+			if (it != query.end()) symbol_id_str = it->second;
+			it = query.find("code");
+			if (it != query.end()) code_str = it->second;
 			std::map<std::string, std::string>::const_iterator begin_it = query.find("begin");
 			std::map<std::string, std::string>::const_iterator end_it = query.find("end");
-			uint32_t symbol_id = 0;
+			if (begin_it == query.end() || end_it == query.end())
+			{
+				return LoggedError(400, "begin and end are required");
+			}
+			zstfs::SymbolId symbol_id = 0;
+			std::string resolve_error;
+			status = ResolveSymbolId(market, symbol_id_str, code_str, &symbol_id, &resolve_error);
+			if (!status.ok())
+			{
+				if (status.code() == zstfs::ErrorCode::InvalidArgument)
+				{
+					return LoggedError(400, resolve_error);
+				}
+				return ErrorResponse(StatusCode(status), status.message());
+			}
 			std::vector<zstfs::Action> actions;
-			if (symbol_it == query.end() || begin_it == query.end() || end_it == query.end() ||
-					!Integer(symbol_it->second, &symbol_id)) return LoggedError(400, "symbol_id, begin and end are required");
 			status = market->actions().get(symbol_id, begin_it->second, end_it->second, &actions);
 			if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
 			json result;
@@ -644,10 +757,31 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		else return LoggedError(400, "request body must contain a bar object or array");
 		if (items.empty()) return LoggedError(400, "request body must contain at least one bar");
 		std::vector<zstfs::Bar> bars;
-		for (json::const_iterator item = items.begin(); item != items.end(); ++item) {
+		for (json::const_iterator item = items.begin(); item != items.end(); ++item)
+		{
 			zstfs::Bar bar = {};
 			std::string error;
 			if (!ParseBar(*item, &bar, &error)) return LoggedError(400, error);
+			// Resolve symbol reference: numeric symbol_id takes priority, then code string.
+			if (bar.symbol_id == 0)
+			{
+				std::string code_str;
+				if ((*item).contains("code") && (*item)["code"].is_string())
+				{
+					code_str = (*item)["code"].get<std::string>();
+				}
+				zstfs::SymbolId resolved_id = 0;
+				status = ResolveSymbolId(market, "", code_str, &resolved_id, &error);
+				if (!status.ok())
+				{
+					if (status.code() == zstfs::ErrorCode::InvalidArgument)
+					{
+						return LoggedError(400, error);
+					}
+					return ErrorResponse(StatusCode(status), status.message());
+				}
+				bar.symbol_id = resolved_id;
+			}
 			bars.push_back(bar);
 		}
 		zstfs::Frequency frequency = bars[0].frequency;
@@ -663,10 +797,22 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 	if (request.method != "GET") return LoggedError(405, "method not allowed");
 
 	const std::map<std::string, std::string> query = Query(request.target);
+	std::string symbol_id_str;
+	std::string code_str;
 	std::map<std::string, std::string>::const_iterator it = query.find("symbol_id");
-	uint32_t symbol_id = 0;
-	if (it == query.end() || !Integer(it->second, &symbol_id) || symbol_id == 0) {
-		return LoggedError(400, "symbol_id is required");
+	if (it != query.end()) symbol_id_str = it->second;
+	it = query.find("code");
+	if (it != query.end()) code_str = it->second;
+	zstfs::SymbolId symbol_id = 0;
+	std::string resolve_error;
+	status = ResolveSymbolId(market, symbol_id_str, code_str, &symbol_id, &resolve_error);
+	if (!status.ok())
+	{
+		if (status.code() == zstfs::ErrorCode::InvalidArgument)
+		{
+			return LoggedError(400, resolve_error);
+		}
+		return ErrorResponse(StatusCode(status), status.message());
 	}
 	it = query.find("frequency");
 	zstfs::Frequency frequency = zstfs::Frequency::Daily;
@@ -675,14 +821,17 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 	zstfs::AdjustMode adjust = zstfs::AdjustMode::Raw;
 	if (it != query.end() && !ParseAdjust(it->second, &adjust)) return LoggedError(400, "adjust is invalid");
 	it = query.find("time");
-	if (it != query.end()) {
+	const bool has_time = it != query.end() && !it->second.empty();
+	const std::string begin = query.count("begin") ? query.find("begin")->second : "";
+	const std::string end = query.count("end") ? query.find("end")->second : "";
+	if (has_time || (begin.empty() && end.empty()))
+	{
+		// Single-bar lookup: explicit time, or latest when neither time nor range is given.
 		zstfs::Bar bar = {};
-		status = market->history(frequency).get(symbol_id, it->second, &bar);
+		status = market->history(frequency).get(symbol_id, has_time ? it->second : "", &bar);
 		if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
 		return OkJson(json{{"bar", BarJson(bar)}}.dump());
 	}
-	const std::string begin = query.count("begin") ? query.find("begin")->second : "";
-	const std::string end = query.count("end") ? query.find("end")->second : "";
 	if (begin.empty() || end.empty()) return LoggedError(400, "begin and end are required");
 	std::vector<zstfs::Bar> bars;
 	status = market->history(frequency).get(symbol_id, begin, end, adjust, &bars);

@@ -408,6 +408,40 @@ Status ActiveStore::range(const std::vector<SymbolId>& symbol_ids,
 	return Status::Ok();
 }
 
+Status ActiveStore::latest_time(SymbolId symbol_id, TimeId *out) const
+{
+	// Walk blocks in reverse order and find the last position at which the
+	// symbol has data. The in-memory block map and per-stock presence vector
+	// make this O(blocks * stock_positions) in the worst case, but ActiveStore
+	// holds only a small number of unsealed blocks so this is effectively constant.
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (!replay_status_.ok())
+	{
+		return replay_status_;
+	}
+	if (symbol_id == kInvalidSymbolId || out == NULL)
+	{
+		return Status::Error(ErrorCode::InvalidArgument, "invalid latest_time arguments");
+	}
+	for (std::map<TimeId, ActiveTimeBlock>::const_reverse_iterator block = blocks_.rbegin();
+		 block != blocks_.rend(); ++block)
+	{
+		std::map<SymbolId, ActiveStockBlock>::const_iterator stock =
+			block->second.stocks.find(symbol_id);
+		if (stock == block->second.stocks.end()) continue;
+		// Find the last present position within this stock's block.
+		for (int i = static_cast<int>(stock->second.present.size()) - 1; i >= 0; --i)
+		{
+			if (stock->second.present[i])
+			{
+				*out = stock->second.time_ids[i];
+				return Status::Ok();
+			}
+		}
+	}
+	return Status::Error(ErrorCode::NotFound, "no active history for symbol");
+}
+
 // The byte trigger is evaluated after History has completed its current
 // accepted batch. The timer uses the same locked writer path, so a threshold
 // flush and a periodic flush cannot append overlapping record batches.
@@ -1388,6 +1422,54 @@ Status StagingStore::range(const std::vector<SymbolId>& symbol_ids,
 	return Status::Ok();
 }
 
+Status StagingStore::latest_time(SymbolId symbol_id, TimeId *out) const
+{
+	// The staging index is ordered by (time_block_id, symbol_id). Walk in
+	// reverse to find the last block that contains data for this symbol, then
+	// load its page and scan for the maximum time_id. Since the index alone
+	// is always resident, only one page load is needed in the common case.
+	if (!status_.ok())
+	{
+		return status_;
+	}
+	if (symbol_id == kInvalidSymbolId || out == NULL)
+	{
+		return Status::Error(ErrorCode::InvalidArgument, "invalid latest_time arguments");
+	}
+	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_reverse_iterator it =
+		 index_.rbegin(); it != index_.rend(); ++it)
+	{
+		if (it->first.second != symbol_id) continue;
+		std::vector<ParsedStagingRecord> records;
+		Status status = load_page(it->second.segment_id, it->second.page_offset,
+			it->second.page_length, &records);
+		if (!status.ok())
+		{
+			return status;
+		}
+		TimeId max_time = 0;
+		bool found = false;
+		for (size_t r = 0; r < records.size(); ++r)
+		{
+			for (size_t i = 0; i < records[r].bars.size(); ++i)
+			{
+				if (records[r].bars[i].symbol_id == symbol_id &&
+					records[r].bars[i].time_id > max_time)
+				{
+					max_time = records[r].bars[i].time_id;
+					found = true;
+				}
+			}
+		}
+		if (found)
+		{
+			*out = max_time;
+			return Status::Ok();
+		}
+	}
+	return Status::Error(ErrorCode::NotFound, "no staging history for symbol");
+}
+
 Status StagingStore::snapshot(std::vector<StockTimeBlock>* blocks,
 								 std::vector<ActiveBar>* bars,
 								 std::vector<std::vector<uint8_t> >* frame_bytes) const {
@@ -2355,6 +2437,79 @@ Status VaultStore::range(const std::vector<SymbolId>& symbol_ids,
 	}
 	std::sort(out->begin(), out->end(), ActiveBarOrder);
 	return corrupt ? Status::Error(ErrorCode::CorruptData, "one or more vault blocks are corrupt") : Status::Ok();
+}
+
+Status VaultStore::latest_time(SymbolId symbol_id, TimeId *out) const
+{
+	// The vault index is a flat vector ordered by symbol. Walk it to find the
+	// locator with the highest last_time_block_id for this symbol, then load
+	// that blob and scan for the maximum time_id. In the common case the
+	// symbol has one blob and we pay exactly one blob load.
+	if (!status_.ok())
+	{
+		return status_;
+	}
+	if (symbol_id == kInvalidSymbolId || out == NULL)
+	{
+		return Status::Error(ErrorCode::InvalidArgument, "invalid latest_time arguments");
+	}
+	int best_index = -1;
+	TimeId best_last_block = 0;
+	for (size_t i = 0; i < index_.size(); ++i)
+	{
+		const Locator &locator = index_[i];
+		if (locator.symbol_id != symbol_id) continue;
+		if (best_index == -1 || locator.last_time_block_id > best_last_block)
+		{
+			best_index = static_cast<int>(i);
+			best_last_block = locator.last_time_block_id;
+		}
+	}
+	if (best_index == -1)
+	{
+		return Status::Error(ErrorCode::NotFound, "no vault history for symbol");
+	}
+	const Locator &best = index_[best_index];
+	std::vector<uint8_t> bytes;
+	Status status = ReadVaultBlob(path_, runtime_market_id_, frequency_, best.segment_id,
+		best.blob_offset, best.blob_length, &bytes);
+	if (!status.ok())
+	{
+		return status.code() == ErrorCode::IoError ? status :
+			Status::Error(ErrorCode::CorruptData, status.message());
+	}
+	TimeId max_time = 0;
+	bool found = false;
+	for (TimeId block_id = best.first_time_block_id; block_id <= best.last_time_block_id;
+		 block_id = daily_bar_id(time_day(block_id) + 64))
+	{
+		std::vector<ActiveBar> bars;
+		Status decode_status = DecodeVaultBlock(calendar_, frequency_, runtime_market_id_,
+			best.segment_id, best.blob_offset, bytes, symbol_id, block_id, &bars, NULL);
+		if (!decode_status.ok())
+		{
+			if (decode_status.code() == ErrorCode::NotFound) continue;
+			return Status::Error(ErrorCode::CorruptData, decode_status.message());
+		}
+		for (size_t j = 0; j < bars.size(); ++j)
+		{
+			if (bars[j].time_id > max_time)
+			{
+				max_time = bars[j].time_id;
+				found = true;
+			}
+		}
+		if (block_id > std::numeric_limits<TimeId>::max() - kTimeIdDayStep * 64)
+		{
+			break;
+		}
+	}
+	if (!found)
+	{
+		return Status::Error(ErrorCode::NotFound, "no vault history for symbol");
+	}
+	*out = max_time;
+	return Status::Ok();
 }
 
 // Reconstruct logical blocks from explicit bars when copying an immutable

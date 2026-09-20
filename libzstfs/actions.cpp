@@ -431,7 +431,7 @@ static void ApplyAction(const Action& action, bool inverse, Bar* bar) {
 	}
 }
 
-Status Actions::adjust(SymbolId symbol_id, const std::string& local_time,
+Status Actions::adjust(SymbolId symbol_id, const std::string& time,
 	AdjustMode mode, Bar* bar) const {
 	if (bar == NULL || bar->symbol_id != symbol_id) {
 		return Status::Error(ErrorCode::InvalidArgument, "invalid adjustment bar");
@@ -447,14 +447,14 @@ Status Actions::adjust(SymbolId symbol_id, const std::string& local_time,
 	if (mode == AdjustMode::Forward) {
 		for (std::vector<Action>::const_reverse_iterator it = actions.rbegin();
 			 it != actions.rend(); ++it) {
-			if (it->effective_date <= local_time) {
+			if (it->effective_date <= time) {
 				ApplyAction(*it, true, bar);
 			}
 		}
 	} else if (mode == AdjustMode::Backward) {
 		for (std::vector<Action>::const_iterator it = actions.begin();
 			 it != actions.end(); ++it) {
-			if (it->effective_date > local_time) {
+			if (it->effective_date > time) {
 				ApplyAction(*it, false, bar);
 			}
 		}

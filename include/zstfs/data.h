@@ -60,12 +60,12 @@ enum class FieldId {
 	Volume
 };
 
-// Bar is one complete daily or hourly OHLCV sample. local_time uses YYYYMMDD
-// for daily data and YYYYMMDD-HHMM for hourly data.
+// Bar is one complete daily or hourly OHLCV sample. time uses YYYYMMDD for
+// daily data and YYYYMMDD-HHMM for hourly data (market-local time).
 struct Bar {
 	SymbolId symbol_id;
 	Frequency frequency;
-	std::string local_time;
+	std::string time;
 	BarState state;
 	float open;
 	float high;

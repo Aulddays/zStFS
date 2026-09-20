@@ -38,12 +38,12 @@ bool CloseEnough(double actual, double expected) {
 
 zstfs::Bar BarFor(zstfs::SymbolId symbol_id,
 			  zstfs::Frequency frequency,
-			  const std::string& local_time,
+			  const std::string& time,
 			  double close) {
 	zstfs::Bar bar = {};
 	bar.symbol_id = symbol_id;
 	bar.frequency = frequency;
-	bar.local_time = local_time;
+	bar.time = time;
 	bar.state = zstfs::BarState::Normal;
 	bar.open = close - 0.5;
 	bar.high = close + 1.0;
@@ -55,11 +55,11 @@ zstfs::Bar BarFor(zstfs::SymbolId symbol_id,
 
 zstfs::Bar MissingBar(zstfs::SymbolId symbol_id,
 			      zstfs::Frequency frequency,
-			      const std::string& local_time) {
+			      const std::string& time) {
 	zstfs::Bar bar = {};
 	bar.symbol_id = symbol_id;
 	bar.frequency = frequency;
-	bar.local_time = local_time;
+	bar.time = time;
 	bar.state = zstfs::BarState::Missing;
 	return bar;
 }
@@ -151,13 +151,13 @@ std::string MarketPath(const std::string& root_path, const std::string& name) {
 void IngestVaultBar(zstfs::VaultStore* vault,
 					const zstfs::Calendar& calendar,
 					zstfs::SymbolId symbol_id,
-					const std::string& local_time,
+					const std::string& time,
 					double close) {
 	zstfs::TimeId time_id = 0;
 	zstfs::TimeId block_id = 0;
 	zstfs::BlockOff block_offset = 0;
-	ExpectOk(calendar.time_id(local_time, &time_id));
-	ExpectOk(calendar.block_offset(zstfs::Frequency::Daily, local_time,
+	ExpectOk(calendar.time_id(time, &time_id));
+	ExpectOk(calendar.block_offset(zstfs::Frequency::Daily, time,
 		&block_id, &block_offset));
 	zstfs::BlockOff block_length = 0;
 	ExpectOk(calendar.block_length(zstfs::Frequency::Daily, block_id, &block_length));
@@ -167,7 +167,7 @@ void IngestVaultBar(zstfs::VaultStore* vault,
 	block.key.time_block_id = block_id;
 	block.day_presence = 1;
 	block.positions.assign(block_length, missing);
-	const zstfs::Bar bar = BarFor(symbol_id, zstfs::Frequency::Daily, local_time, close);
+	const zstfs::Bar bar = BarFor(symbol_id, zstfs::Frequency::Daily, time, close);
 	block.positions[block_offset] = {bar.state, bar.open, bar.high, bar.low, bar.close, bar.volume};
 	zstfs::ActiveBar active_bar = {symbol_id, time_id, block.positions[block_offset]};
 	std::vector<zstfs::StockTimeBlock> blocks(1, block);
@@ -214,7 +214,7 @@ void TestDailyWriteReadAndRecovery() {
 		ExpectOk(history.get(symbol_id, "20260803", "20260807",
 			zstfs::AdjustMode::Raw, &values));
 		assert(values.size() == 5);
-		assert(values[0].local_time == "20260803");
+		assert(values[0].time == "20260803");
 		assert(values[4].state == zstfs::BarState::Missing);
 		ExpectOk(history.flush());
 	}
@@ -388,14 +388,14 @@ void TestHourlyOrderingAndCanonicalSlots() {
 			"20260803-0939", 19.0)));
 		zstfs::Bar bar = {};
 		ExpectOk(history.get(symbol_id, "20260803-0930", &bar));
-		assert(bar.local_time == "20260803-0930");
+		assert(bar.time == "20260803-0930");
 		assert(CloseEnough(bar.close, 19.0));
 		std::vector<zstfs::Bar> values;
 		ExpectOk(history.get(symbol_id, "20260803-0930", "20260803-1400",
 			zstfs::AdjustMode::Raw, &values));
 		assert(values.size() == 2);
-		assert(values[0].local_time == "20260803-0930");
-		assert(values[1].local_time == "20260803-1400");
+		assert(values[0].time == "20260803-0930");
+		assert(values[1].time == "20260803-1400");
 		ExpectOk(history.flush());
 	}
 	RemoveTestDirectory(path);
@@ -630,9 +630,9 @@ void PopulateCompactionFixture(const std::string& path) {
 	for (size_t i = 0; i < sizeof(bars) / sizeof(bars[0]); ++i) {
 		zstfs::TimeId time_id = 0;
 		zstfs::BlockOff offset = 0;
-		ExpectOk(calendar.block_offset(zstfs::Frequency::Daily, bars[i].local_time,
+		ExpectOk(calendar.block_offset(zstfs::Frequency::Daily, bars[i].time,
 			&block_id, &offset));
-		ExpectOk(calendar.time_id(bars[i].local_time, &time_id));
+		ExpectOk(calendar.time_id(bars[i].time, &time_id));
 		staged.positions[offset] = {bars[i].state, bars[i].open, bars[i].high, bars[i].low,
 			bars[i].close, bars[i].volume};
 		staged.day_presence |= static_cast<uint64_t>(1) << (zstfs::time_day(time_id) -

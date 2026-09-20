@@ -125,7 +125,7 @@ Status History::put(const Bar& bar) {
 	TimeId time_id = 0;
 	TimeId block_id = 0;
 	BlockOff block_offset = 0;
-	Status status = ResolveTime(calendar_, frequency_, bar.local_time,
+	Status status = ResolveTime(calendar_, frequency_, bar.time,
 						&time_id, &block_id, &block_offset);
 	if (!status.ok()) {
 		return status;
@@ -178,7 +178,7 @@ Status History::put(const std::vector<Bar>& bars) {
 		}
 		ResolvedBar item = {};
 		item.bar = bar;
-		Status status = ResolveTime(calendar_, frequency_, bar.local_time,
+		Status status = ResolveTime(calendar_, frequency_, bar.time,
 								&item.time_id, &item.block_id, &item.block_offset);
 		if (!status.ok()) {
 			return status;
@@ -219,7 +219,7 @@ Status History::put(const std::vector<Bar>& bars) {
 }
 
 Status History::get(SymbolId symbol_id,
-			    const std::string& local_time,
+			    const std::string& time,
 			    Bar* out) const {
 	if (!status_.ok()) {
 		return status_;
@@ -227,10 +227,68 @@ Status History::get(SymbolId symbol_id,
 	if (out == NULL || symbol_id == kInvalidSymbolId) {
 		return Status::Error(ErrorCode::InvalidArgument, "history read output and symbol are required");
 	}
+	// An empty time means "latest bar". We first find the latest TimeId
+	// using each store's in-memory index, then read the single bar at that time.
+	// This avoids scanning the full history range and only pays for one point
+	// lookup across the three layers, the same as a time-specified get.
+	if (time.empty())
+	{
+		TimeId latest = 0;
+		bool found = false;
+		TimeId active_latest = 0;
+		Status active_status = active_->latest_time(symbol_id, &active_latest);
+		if (active_status.ok())
+		{
+			latest = active_latest;
+			found = true;
+		}
+		else if (active_status.code() != ErrorCode::NotFound)
+		{
+			return active_status;
+		}
+		TimeId staged_latest = 0;
+		Status staged_status = staging_->latest_time(symbol_id, &staged_latest);
+		if (staged_status.ok())
+		{
+			if (!found || staged_latest > latest)
+			{
+				latest = staged_latest;
+			}
+			found = true;
+		}
+		else if (staged_status.code() != ErrorCode::NotFound)
+		{
+			return staged_status;
+		}
+		TimeId vault_latest = 0;
+		Status vault_status = vault_->latest_time(symbol_id, &vault_latest);
+		if (vault_status.ok())
+		{
+			if (!found || vault_latest > latest)
+			{
+				latest = vault_latest;
+			}
+			found = true;
+		}
+		else if (vault_status.code() != ErrorCode::NotFound)
+		{
+			return vault_status;
+		}
+		if (!found)
+		{
+			return Status::Error(ErrorCode::NotFound, "history bar was not found");
+		}
+		// Convert the resolved TimeId back to a canonical local-time string and
+		// fall through to the normal single-bar read path.
+		std::string resolved_time;
+		Status status = LocalTime(calendar_, frequency_, latest, &resolved_time);
+		if (!status.ok()) return status;
+		return get(symbol_id, resolved_time, out);
+	}
 	TimeId time_id = 0;
 	TimeId block_id = 0;
 	BlockOff block_offset = 0;
-	Status status = ResolveTime(calendar_, frequency_, local_time,
+	Status status = ResolveTime(calendar_, frequency_, time,
 						&time_id, &block_id, &block_offset);
 	if (!status.ok()) {
 		return status;
@@ -395,7 +453,7 @@ Status History::flush() {
 	return publish_manifest_ ? publish_manifest_() : Status::Ok();
 }
 
-Status History::seal_before(const std::string& local_time) {
+Status History::seal_before(const std::string& time) {
 	if (!status_.ok()) {
 		return status_;
 	}
@@ -406,7 +464,7 @@ Status History::seal_before(const std::string& local_time) {
 	if (!status.ok()) {
 		return status;
 	}
-	status = ResolveTime(calendar_, frequency_, local_time,
+	status = ResolveTime(calendar_, frequency_, time,
 						&time_id, &ignored_block_id, &ignored_block_offset);
 	if (!status.ok()) {
 		return status;
@@ -826,7 +884,7 @@ static Status RestoreCompactedStore(const std::string& frequency_path,
 Status CompactVault(const std::string& config_path,
 					const std::string& market_name,
 					Frequency frequency,
-					const std::string& cutoff_local_time,
+					const std::string& cutoff_time,
 					VaultCompactionStats* stats) {
 	if (stats == NULL || config_path.empty() || market_name.empty()) {
 		return Status::Error(ErrorCode::InvalidArgument, "config path, market name, and compaction stats are required");
@@ -870,7 +928,7 @@ Status CompactVault(const std::string& config_path,
 	TimeId cutoff = 0;
 	TimeId cutoff_block = 0;
 	BlockOff unused_offset = 0;
-	status = ResolveTime(calendar, frequency, cutoff_local_time, &cutoff, &cutoff_block, &unused_offset);
+	status = ResolveTime(calendar, frequency, cutoff_time, &cutoff, &cutoff_block, &unused_offset);
 	if (!status.ok()) {
 		return status;
 	}

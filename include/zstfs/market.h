@@ -54,13 +54,13 @@ size_t CompressedCacheBytes();
 size_t DecodedCacheBytes();
 
 // CompactVault rebuilds one configured market's immutable Vault from existing
-// Vault and Staging records strictly before cutoff_local_time. The caller runs
+// Vault and Staging records strictly before cutoff_time. The caller runs
 // it while all writers are stopped because publication replaces store files.
 // config_path is the path to the unified zStFS config file.
 Status CompactVault(const std::string& config_path,
                     const std::string& market_name,
                     Frequency frequency,
-                    const std::string& cutoff_local_time,
+                    const std::string& cutoff_time,
                     VaultCompactionStats* stats);
 
 // Market owns all data domains for one configured market. It provides access
@@ -216,7 +216,7 @@ public:
 	// Raw actions remain the only persistent representation; the ordered
 	// in-memory anchors are rebuilt whenever the action set changes.
 	Status adjust(SymbolId symbol_id,
-	              const std::string& local_time,
+	              const std::string& time,
 	              AdjustMode mode,
 	              Bar* bar) const;
 	Status status() const;
@@ -252,7 +252,7 @@ public:
 	Status status() const;
 	Status put(const Bar& bar);
 	Status put(const std::vector<Bar>& bars);
-	Status get(SymbolId symbol_id, const std::string& local_time, Bar* out) const;
+	Status get(SymbolId symbol_id, const std::string& time, Bar* out) const;
 	Status get(SymbolId symbol_id,
 	           const std::string& begin,
 	           const std::string& end,
@@ -264,7 +264,7 @@ public:
 	           AdjustMode adjust_mode,
 	           std::vector<Bar>* out) const;
 	Status flush();
-	Status seal_before(const std::string& local_time);
+	Status seal_before(const std::string& time);
 
 private:
 	friend class Market;

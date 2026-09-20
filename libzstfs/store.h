@@ -102,6 +102,9 @@ public:
 	             TimeId begin,
 	             TimeId end,
 	             std::vector<ActiveBar>* out) const;
+	// latest_time finds the most recent TimeId at which the given symbol
+	// has any data in this store. Returns NotFound when absent.
+	Status latest_time(SymbolId symbol_id, TimeId* out) const;
 	Status flush_if_needed();
 	Status flush();
 	// collect_before snapshots complete blocks without changing their Active
@@ -153,6 +156,9 @@ public:
 	             TimeId begin,
 	             TimeId end,
 	             std::vector<ActiveBar>* out) const;
+	// latest_time finds the most recent TimeId at which the given symbol
+	// has any data in this store. Returns NotFound when absent.
+	Status latest_time(SymbolId symbol_id, TimeId* out) const;
 	// snapshot exposes complete logical records to the offline compactor without
 	// exposing the persistent Staging page layout outside this implementation.
 	// When requested, frame_bytes is aligned with blocks and contains immutable
@@ -208,6 +214,9 @@ public:
 	             TimeId begin,
 	             TimeId end,
 	             std::vector<ActiveBar>* out) const;
+	// latest_time finds the most recent TimeId at which the given symbol
+	// has any data in this store. Returns NotFound when absent.
+	Status latest_time(SymbolId symbol_id, TimeId* out) const;
 	// snapshot reconstructs complete logical records from immutable Vault blobs.
 	// frame_bytes, when requested, is aligned with blocks for byte-preserving
 	// compaction into a replacement Vault generation.
