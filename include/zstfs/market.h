@@ -76,10 +76,6 @@ public:
 	// construction. A non-OK status means no history or action mutation may use
 	// the market state.
 	Status status() const;
-	// sync publishes the complete current file set as a new manifest generation.
-	// History and Actions mutations publish automatically; maintenance code calls
-	// this after writing a fully prepared replacement store while the daemon is stopped.
-	Status sync();
 
 	Symbols& symbols();
 	const Symbols& symbols() const;
@@ -108,8 +104,6 @@ private:
 	Status status_;
 
 	Status initialize_storage();
-	Status load_or_bootstrap_manifest();
-	Status publish_manifest();
 };
 
 // Symbols owns all Symbol records for one Market, including the stable ID map
@@ -266,7 +260,6 @@ private:
 	        const Calendar& calendar,
 	        const std::string& market_path,
 	        const Actions& actions,
-	        const std::function<Status()>& publish_manifest,
 	        const Status& initial_status,
 	        DataFields fields);
 
@@ -274,8 +267,8 @@ private:
 	const Calendar& calendar_;
 	const Actions& actions_;
 	DataFields fields_;
-	std::function<Status()> publish_manifest_;
 	Status status_;
+	std::string frequency_path_;
 	std::unique_ptr<ActiveStore> active_;
 	std::unique_ptr<StagingStore> staging_;
 	std::unique_ptr<VaultStore> vault_;

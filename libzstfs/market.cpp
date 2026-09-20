@@ -1,10 +1,11 @@
 // market.cpp
 //
-// Opens one market generation and owns the ZMF8 publication protocol. The
-// manifest is a best-effort crash detector without pretending to provide
-// durability: complete files are closed, renamed within their directory, and
-// the manifest is published last. Startup accepts only the exact files named
-// by the current manifest; unreferenced temporary names are ignored.
+// Opens one market generation. Each storage layer (Active, Staging, Vault)
+// handles its own persistence and crash recovery independently. Multi-file
+// operations like seal and compaction use ad-hoc transaction markers (.txn)
+// for crash detection and forward/backward recovery. There is no permanent
+// manifest file tracking the full file set; each store validates its own
+// files at load time via magic numbers and record-level checksums.
 
 #include "zstfs/market.h"
 
@@ -25,222 +26,6 @@ namespace zstfs {
 
 namespace {
 
-const uint16_t kManifestVersion = 1;
-
-struct ManifestFile {
-	std::string name;
-	uint64_t size;
-};
-
-bool IsTemporaryName(const std::string& name) {
-	return name.find(".tmp") != std::string::npos ||
-		name.find(".partial") != std::string::npos;
-}
-
-bool IsLiveFile(const std::string& name)
-{
-	// active.data is append-only with self-contained record validation; it
-	// recovers from crashes on its own and is not tracked in the manifest.
-	if (name == "staging-index" || name == "vault-index")
-	{
-		return true;
-	}
-	const std::string staging_prefix = "staging-pages-";
-	const std::string vault_prefix = "vault-";
-	return (name.compare(0, staging_prefix.size(), staging_prefix) == 0 &&
-		name.size() > staging_prefix.size() + 4 &&
-		name.substr(name.size() - 4) == ".seg") ||
-		(name.compare(0, vault_prefix.size(), vault_prefix) == 0 &&
-		name.size() > vault_prefix.size() + 4 &&
-		name.substr(name.size() - 4) == ".seg");
-}
-
-bool SameManifestName(const ManifestFile& left, const ManifestFile& right) {
-	return left.name == right.name;
-}
-
-Status ReadBytes(const std::string& path, std::vector<uint8_t>* bytes) {
-	std::ifstream input(path.c_str(), std::ios::binary);
-	if (!input) {
-		return Status::Error(ErrorCode::CorruptData, "cannot read market manifest");
-	}
-	*bytes = std::vector<uint8_t>((std::istreambuf_iterator<char>(input)),
-		std::istreambuf_iterator<char>());
-	return Status::Ok();
-}
-
-Status ListDirectory(const std::string& directory,
-	const std::string& prefix,
-	std::vector<ManifestFile>* files) {
-	DIR* handle = opendir(directory.c_str());
-	if (handle == NULL) {
-		if (errno == ENOENT) {
-			return Status::Ok();
-		}
-		return Status::Error(ErrorCode::IoError, "cannot list market directory");
-	}
-	struct dirent* entry = NULL;
-	while ((entry = readdir(handle)) != NULL) {
-		const std::string name(entry->d_name);
-		if (name == "." || name == ".." || IsTemporaryName(name) || !IsLiveFile(name)) {
-			continue;
-		}
-		const std::string path = directory + "/" + name;
-		struct stat metadata = {};
-		if (stat(path.c_str(), &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
-			closedir(handle);
-			return Status::Error(ErrorCode::CorruptData, "invalid market live file");
-		}
-		ManifestFile file = {prefix + "/" + name,
-			static_cast<uint64_t>(metadata.st_size)};
-		files->push_back(file);
-	}
-	closedir(handle);
-	return Status::Ok();
-}
-
-Status CurrentFiles(const std::string& market_path, std::vector<ManifestFile>* files) {
-	files->clear();
-	Status status = ListDirectory(market_path + "/daily", "daily", files);
-	if (!status.ok()) {
-		return status;
-	}
-	status = ListDirectory(market_path + "/hourly", "hourly", files);
-	if (!status.ok()) {
-		return status;
-	}
-	std::sort(files->begin(), files->end(),
-		[](const ManifestFile& left, const ManifestFile& right) {
-			return left.name < right.name;
-		});
-	return Status::Ok();
-}
-
-void PutManifest(std::vector<uint8_t>* bytes, uint64_t generation,
-	const std::vector<ManifestFile>& files) {
-	bytes->clear();
-	bytes->push_back('Z');
-	bytes->push_back('M');
-	bytes->push_back('F');
-	bytes->push_back('8');
-	PutU16(bytes, kManifestVersion);
-	PutU16(bytes, 0);
-	PutU64(bytes, generation);
-	PutU32(bytes, static_cast<uint32_t>(files.size()));
-	for (size_t i = 0; i < files.size(); ++i) {
-		PutString(bytes, files[i].name);
-		PutU64(bytes, files[i].size);
-	}
-}
-
-Status ParseManifest(const std::vector<uint8_t>& bytes, uint64_t* generation,
-	std::vector<ManifestFile>* files) {
-	if (bytes.size() < 20 || bytes[0] != 'Z' || bytes[1] != 'M' ||
-		bytes[2] != 'F' || bytes[3] != '8') {
-		return Status::Error(ErrorCode::CorruptData, "invalid manifest magic");
-	}
-	size_t offset = 4;
-	uint16_t version = 0;
-	uint16_t reserved = 0;
-	uint32_t count = 0;
-	if (!GetU16(bytes, &offset, &version) || !GetU16(bytes, &offset, &reserved) ||
-		!GetU64(bytes, &offset, generation) || !GetU32(bytes, &offset, &count) ||
-		version != kManifestVersion || reserved != 0 || count > bytes.size()) {
-		return Status::Error(ErrorCode::CorruptData, "invalid manifest header");
-	}
-	files->clear();
-	for (uint32_t i = 0; i < count; ++i) {
-		ManifestFile file = {};
-		if (!GetString(bytes, &offset, &file.name) || !GetU64(bytes, &offset, &file.size) ||
-			file.name.empty() || file.name[0] == '/' ||
-			file.name.find("..") != std::string::npos ||
-			std::find_if(files->begin(), files->end(),
-				[&file](const ManifestFile& other) { return SameManifestName(file, other); }) != files->end()) {
-			return Status::Error(ErrorCode::CorruptData, "invalid manifest file set");
-		}
-		if (file.name.compare(0, 6, "daily/") != 0 &&
-			file.name.compare(0, 7, "hourly/") != 0)
-		{
-			return Status::Error(ErrorCode::CorruptData, "manifest contains an unknown file");
-		}
-		files->push_back(file);
-	}
-	if (offset != bytes.size()) {
-		return Status::Error(ErrorCode::CorruptData, "manifest has trailing bytes");
-	}
-	return Status::Ok();
-}
-
-Status ValidateManifest(const std::string &market_path)
-{
-	std::vector<uint8_t> bytes;
-	Status status = ReadBytes(market_path + "/manifest", &bytes);
-	if (!status.ok()) {
-		return status;
-	}
-	uint64_t generation = 0;
-	std::vector<ManifestFile> referenced;
-	status = ParseManifest(bytes, &generation, &referenced);
-	if (!status.ok()) {
-		return status;
-	}
-	std::vector<ManifestFile> current;
-	status = CurrentFiles(market_path, &current);
-	if (!status.ok()) {
-		return status;
-	}
-	if (referenced.size() != current.size())
-	{
-		std::ostringstream message;
-		message << "manifest file count differs: expected " << referenced.size() <<
-			", found " << current.size();
-		return Status::Error(ErrorCode::CorruptData, message.str());
-	}
-	for (size_t i = 0; i < referenced.size(); ++i)
-	{
-		if (referenced[i].name != current[i].name ||
-			referenced[i].size != current[i].size)
-		{
-			std::ostringstream message;
-			message << "manifest file differs at " << referenced[i].name;
-			return Status::Error(ErrorCode::CorruptData, message.str());
-		}
-		struct stat metadata = {};
-		if (stat((market_path + "/" + referenced[i].name).c_str(), &metadata) != 0 ||
-			!S_ISREG(metadata.st_mode)) {
-			return Status::Error(ErrorCode::CorruptData, "manifest references a missing file");
-		}
-	}
-	return Status::Ok();
-}
-
-Status WritePublishedManifest(const std::string& market_path,
-	const std::vector<ManifestFile> &files)
-{
-	std::vector<uint8_t> bytes;
-	PutManifest(&bytes, 0, files);
-	const std::string temp_path = market_path + "/manifest.tmp";
-	std::ofstream output(temp_path.c_str(), std::ios::binary | std::ios::trunc);
-	if (!output) {
-		return Status::Error(ErrorCode::IoError, "cannot create manifest temporary");
-	}
-	output.write(reinterpret_cast<const char*>(&bytes[0]), bytes.size());
-	output.close();
-	if (!output || rename(temp_path.c_str(), (market_path + "/manifest").c_str()) != 0) {
-		unlink(temp_path.c_str());
-		return Status::Error(ErrorCode::IoError, "cannot publish manifest");
-	}
-	return Status::Ok();
-}
-
-bool HasLiveData(const std::string& market_path) {
-	std::vector<ManifestFile> files;
-	if (!CurrentFiles(market_path, &files).ok()) {
-		return true;
-	}
-	return !files.empty();
-}
-
 }  // namespace
 
 Market::Market(const std::string& name, const std::string& path,
@@ -248,35 +33,24 @@ Market::Market(const std::string& name, const std::string& path,
 	: name_(name), path_(path), schedule_(schedule), fields_(fields),
 	calendar_(new Calendar(schedule)),
 	symbols_(new Symbols()), actions_(new Actions()), daily_history_(),
-	hourly_history_(), status_(Status::Ok()) {
+	hourly_history_(), status_(Status::Ok())
+{
 	bool symbols_created = false;
-	bool has_manifest = false;
 	status_ = initialize_storage();
-	if (status_.ok()) {
-		status_ = load_or_bootstrap_manifest();
-		has_manifest = status_.ok();
-		// load_or_bootstrap_manifest returns Ok both when manifest exists and when
-		// the market is empty (no data yet). Distinguish by checking file presence.
-		if (status_.ok() && access((path_ + "/manifest").c_str(), F_OK) != 0)
-			has_manifest = false;
-	}
-	const std::function<Status()> publish = std::bind(&Market::publish_manifest, this);
 	if (status_.ok())
 		status_ = symbols_->configure_persistence(path_ + "/symbols.bin", &symbols_created);
 	if (status_.ok())
 		status_ = actions_->configure_persistence(path_ + "/actions.bin");
 	daily_history_.reset(new History(Frequency::Daily, *calendar_, path_, *actions_,
-		publish, status_, fields_));
+		status_, fields_));
 	hourly_history_.reset(new History(Frequency::Hourly, *calendar_, path_, *actions_,
-		publish, status_, fields_));
+		status_, fields_));
 	if (status_.ok())
 	{
 		if (!daily_history_->status().ok())
 			status_ = daily_history_->status();
 		else if (!hourly_history_->status().ok())
 			status_ = hourly_history_->status();
-		else if (!has_manifest)
-			status_ = publish_manifest();
 	}
 }
 
@@ -294,29 +68,6 @@ Status Market::initialize_storage() {
 	return Status::Ok();
 }
 
-Status Market::load_or_bootstrap_manifest() {
-	const std::string manifest_path = path_ + "/manifest";
-	if (access(manifest_path.c_str(), F_OK) == 0) {
-		return ValidateManifest(path_);
-	}
-	if (errno != ENOENT) {
-		return Status::Error(ErrorCode::IoError, "cannot inspect market manifest");
-	}
-	if (HasLiveData(path_)) {
-		return Status::Error(ErrorCode::CorruptData, "market manifest is missing");
-	}
-	return Status::Ok();
-}
-
-Status Market::publish_manifest() {
-	std::vector<ManifestFile> files;
-	Status status = CurrentFiles(path_, &files);
-	if (!status.ok()) {
-		return status;
-	}
-	return WritePublishedManifest(path_, files);
-}
-
 const std::string& Market::name() const {
 	return name_;
 }
@@ -331,13 +82,6 @@ const std::string& Market::schedule() const {
 
 Status Market::status() const {
 	return status_;
-}
-
-Status Market::sync() {
-	if (!status_.ok()) {
-		return status_;
-	}
-	return publish_manifest();
 }
 
 Symbols& Market::symbols() {

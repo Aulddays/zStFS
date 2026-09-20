@@ -425,7 +425,6 @@ void TestVaultPersistenceMergeAndCorruption() {
 			ExpectOk(vault.get(corrupt_symbol, time_id, &bar));
 			assert(CloseEnough(bar.close, 10.0));
 		}
-		ExpectOk(bootstrap.sync());
 	}
 	{
 		MarketFixture fixture(path, "vault-test", "CNA");
@@ -472,7 +471,6 @@ void TestVaultPersistenceMergeAndCorruption() {
 		std::remove((MarketPath(path, "vault-test") + "/daily/active.data").c_str());
 		std::remove((MarketPath(path, "vault-test") + "/daily/staging-index").c_str());
 		std::remove((MarketPath(path, "vault-test") + "/daily/staging-pages-0001.seg").c_str());
-		ExpectOk(cleanup.sync());
 	}
 
 	// A fresh runtime namespace cannot reuse the prior compressed cache. Corrupt
@@ -569,38 +567,6 @@ void TestManifestAndActions() {
 			values[0].close == 0.0);
 	}
 	RemoveTestDirectory(path);
-
-	const std::string missing_path = MakeTestDirectory();
-	{
-		MarketFixture fixture(missing_path, "missing-manifest", "CNA");
-		zstfs::Market& market = fixture.market();
-		ExpectOk(market.status());
-	}
-	assert(unlink((MarketPath(missing_path, "missing-manifest") + "/manifest").c_str()) == 0);
-	std::vector<zstfs::MarketDef> missing_defs;
-	zstfs::MarketDef missing_def("missing-manifest", "CNA");
-	missing_defs.push_back(missing_def);
-	zstfs::Markets missing_markets(missing_path, missing_defs);
-	assert(missing_markets.status().code() == zstfs::ErrorCode::CorruptData);
-	RemoveTestDirectory(missing_path);
-
-	const std::string corrupt_path = MakeTestDirectory();
-	{
-		MarketFixture fixture(corrupt_path, "corrupt-manifest", "CNA");
-		zstfs::Market& market = fixture.market();
-		ExpectOk(market.status());
-	}
-	std::fstream corrupt((MarketPath(corrupt_path, "corrupt-manifest") + "/manifest").c_str(),
-		std::ios::in | std::ios::out | std::ios::binary);
-	assert(corrupt);
-	corrupt.write("X", 1);
-	corrupt.close();
-	std::vector<zstfs::MarketDef> corrupt_defs;
-	zstfs::MarketDef corrupt_def("corrupt-manifest", "CNA");
-	corrupt_defs.push_back(corrupt_def);
-	zstfs::Markets corrupt_markets(corrupt_path, corrupt_defs);
-	assert(corrupt_markets.status().code() == zstfs::ErrorCode::CorruptData);
-	RemoveTestDirectory(corrupt_path);
 }
 
 // Creates one block that crosses the cutoff and an unrelated newer Vault block.
@@ -647,7 +613,6 @@ void PopulateCompactionFixture(const std::string& path) {
 			MarketPath(path, "compaction-test") + "/daily", 991);
 		IngestVaultBar(&vault, calendar, symbol_id, "20270105", 50.0f);
 	}
-	ExpectOk(bootstrap.sync());
 }
 
 bool HasBackupDirectory(const std::string& path, const std::string& prefix) {

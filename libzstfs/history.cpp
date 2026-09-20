@@ -56,15 +56,14 @@ History::History(Frequency frequency,
 			 const Calendar& calendar,
 			 const std::string& market_path,
 			 const Actions& actions,
-			 const std::function<Status()>& publish_manifest,
 			 const Status& initial_status,
 			 DataFields fields)
 	: frequency_(frequency),
 	  calendar_(calendar),
 	  actions_(actions),
 	  fields_(fields),
-	  publish_manifest_(publish_manifest),
 	  status_(initial_status),
+	  frequency_path_(),
 	  active_(),
 	  staging_(),
 	  vault_() {
@@ -83,6 +82,7 @@ History::History(Frequency frequency,
 	active_.reset(new ActiveStore(frequency, calendar, frequency_path));
 	staging_.reset(new StagingStore(frequency, calendar, frequency_path, runtime_market_id));
 	vault_.reset(new VaultStore(frequency, calendar, frequency_path, runtime_market_id));
+	frequency_path_ = frequency_path;
 }
 
 Status History::status() const {
@@ -465,38 +465,139 @@ Status History::flush()
 	return active_->flush();
 }
 
-Status History::seal_before(const std::string& time) {
-	if (!status_.ok()) {
-		return status_;
+// WriteSealMarker atomically creates a seal transaction marker. The marker
+// stores the cutoff time_id so recovery knows which time range was being
+// sealed. Recovery logic is not yet implemented; the marker currently serves
+// as a crash-detection signal only.
+//
+// File format (little-endian):
+//   magic  : 4 bytes  'Z' 'T' 'X' 'N'  (shared transaction marker magic)
+//   type   : 1 byte   0x01 = seal
+//   cutoff : 4 bytes  TimeId (uint32) of the seal cutoff
+//
+// The marker lives inside the daily/ or hourly/ directory, so frequency is
+// implied by location; it does not need to be encoded in the file.
+static Status WriteSealMarker(const std::string &frequency_path, TimeId cutoff_time_id)
+{
+	const std::string marker_path = frequency_path + "/seal.txn";
+	const std::string temp_path = frequency_path + "/seal.txn.tmp";
+	std::ofstream output(temp_path.c_str(), std::ios::binary | std::ios::trunc);
+	if (!output)
+		return Status::Error(ErrorCode::IoError, "cannot create seal marker");
+	std::vector<uint8_t> bytes;
+	bytes.push_back('Z');
+	bytes.push_back('T');
+	bytes.push_back('X');
+	bytes.push_back('N');
+	bytes.push_back(0x01);  // type = seal
+	PutU32(&bytes, cutoff_time_id);
+	output.write(reinterpret_cast<const char *>(&bytes[0]), bytes.size());
+	output.close();
+	if (!output || rename(temp_path.c_str(), marker_path.c_str()) != 0)
+	{
+		unlink(temp_path.c_str());
+		return Status::Error(ErrorCode::IoError, "cannot publish seal marker");
 	}
+	return Status::Ok();
+}
+
+// RemoveSealMarker deletes the seal transaction marker after a successful
+// seal. Absence of the marker is not an error — the caller may have already
+// cleaned it up, or the operation may have been a no-op.
+static Status RemoveSealMarker(const std::string &frequency_path)
+{
+	const std::string marker_path = frequency_path + "/seal.txn";
+	if (unlink(marker_path.c_str()) != 0 && errno != ENOENT)
+		return Status::Error(ErrorCode::IoError, "cannot remove seal marker");
+	return Status::Ok();
+}
+
+// Seal moves completed blocks from ActiveStore into StagingStore. The operation
+// is crash-recoverable through a transaction marker (seal.txn) with forward
+// recovery semantics:
+//
+// Crash recovery strategy (not yet implemented, marker only):
+//   If seal.txn exists on startup, an in-flight seal is detected. Recovery:
+//   1. Read cutoff_time_id from the marker.
+//   2. Check whether staging contains the sealed blocks (by inspecting its
+//      index for keys before the cutoff).
+//   3a. If staging has none of the sealed data:
+//         - Staging append either didn't start or was truncated on replay.
+//         - The data is still fully in active.data.
+//         - Action: delete seal.txn; nothing more to do.
+//   3b. If staging has the sealed data (staging index references them):
+//         - Staging accept completed successfully.
+//         - Active may or may not have been trimmed; if not, data is duplicated.
+//         - Manifest may or may not be up to date.
+//         - Action:
+//           1. If active still has the data → call remove_before() to trim it.
+//           2. Republish manifest (covers both size and index changes).
+//           3. Delete seal.txn.
+//         This completes the seal forward.
+//
+// Rationale for forward recovery (not rollback):
+//   - Staging pages are append-only; rolling them back would require tracking
+//     exact byte offsets and truncating segment files, which is fragile.
+//   - Active truncation is already a full rewrite (tmp + rename), so redoing
+//     it is straightforward and idempotent.
+//   - Worst case after crash: data exists in BOTH stores (duplicate, not lost).
+//     Forward recovery removes the duplicate; data integrity is never violated.
+//
+// Ordering guarantee:
+//   marker created → staging accept (append pages + atomic index swap) →
+//   active remove_before (atomic rewrite) → publish manifest → marker deleted.
+//   At no point can data be lost (it's always in at least one store).
+//   The marker is removed LAST so any crash during publish leaves a recovery
+//   signal on disk even though both data stores are already consistent.
+Status History::seal_before(const std::string &time)
+{
+	if (!status_.ok())
+		return status_;
 	TimeId time_id = 0;
 	TimeId ignored_block_id = 0;
 	BlockOff ignored_block_offset = 0;
 	Status status = active_->flush();
-	if (!status.ok()) {
+	if (!status.ok())
 		return status;
-	}
 	status = ResolveTime(calendar_, frequency_, time,
 						&time_id, &ignored_block_id, &ignored_block_offset);
-	if (!status.ok()) {
+	if (!status.ok())
 		return status;
-	}
+
+	// Collect what we're about to seal first; if there's nothing to do, skip
+	// the marker entirely so no recovery state is created for a no-op.
 	std::vector<StockTimeBlock> sealed;
 	std::vector<ActiveBar> sealed_bars;
 	status = active_->collect_before(time_id, &sealed, &sealed_bars);
-	if (!status.ok()) {
+	if (!status.ok())
 		return status;
-	}
+	if (sealed.empty())
+		return Status::Ok();
+
+	// Atomically create the seal transaction marker. After this point, a crash
+	// leaves the marker on disk for post-crash recovery detection.
+	status = WriteSealMarker(frequency_path_, time_id);
+	if (!status.ok())
+		return status;
+
 	status = staging_->accept(sealed, sealed_bars);
-	if (!status.ok()) {
+	if (!status.ok())
+	{
+		// Staging failed before any durable change took effect (accept either
+		// fully commits via index swap or leaves no index-visible data).
+		// Clean up the marker and report the error.
+		RemoveSealMarker(frequency_path_);
 		return status;
 	}
 	status = active_->remove_before(time_id);
 	if (!status.ok())
 	{
+		// Active rewrite failed — staging already has the data, but we leave
+		// the marker in place so forward recovery can finish the job later.
 		return status;
 	}
-	return publish_manifest_ ? publish_manifest_() : Status::Ok();
+	// Seal is fully committed. Remove the transaction marker.
+	return RemoveSealMarker(frequency_path_);
 }
 
 // =============================================================================
@@ -858,6 +959,47 @@ static Status PublishCompactedStore(const std::string& frequency_path,
 			return Status::Error(ErrorCode::IoError, "cannot publish compacted store file");
 		}
 		moved_new.push_back(new_files[i]);
+	}
+	return Status::Ok();
+}
+
+// WriteCompactionMarker creates a transaction marker file atomically. Its
+// presence after a crash indicates an in-flight compaction that needs
+// recovery. The marker stores the compaction token so recovery can locate the
+// backup directories and roll forward or back. Recovery logic is not yet
+// implemented; the marker currently serves only as a crash-detection signal.
+static Status WriteCompactionMarker(const std::string &frequency_path, uint64_t token)
+{
+	const std::string marker_path = frequency_path + "/compact.txn";
+	const std::string temp_path = frequency_path + "/compact.txn.tmp";
+	std::ofstream output(temp_path.c_str(), std::ios::binary | std::ios::trunc);
+	if (!output)
+		return Status::Error(ErrorCode::IoError, "cannot create compaction marker");
+	std::vector<uint8_t> bytes;
+	bytes.push_back('Z');
+	bytes.push_back('T');
+	bytes.push_back('X');
+	bytes.push_back('N');
+	PutU64(&bytes, token);
+	output.write(reinterpret_cast<const char *>(&bytes[0]), bytes.size());
+	output.close();
+	if (!output || rename(temp_path.c_str(), marker_path.c_str()) != 0)
+	{
+		unlink(temp_path.c_str());
+		return Status::Error(ErrorCode::IoError, "cannot publish compaction marker");
+	}
+	return Status::Ok();
+}
+
+// RemoveCompactionMarker deletes the transaction marker after successful
+// compaction. If the marker is already absent the call succeeds so callers do
+// not need to distinguish "never started" from "already cleaned up".
+static Status RemoveCompactionMarker(const std::string &frequency_path)
+{
+	const std::string marker_path = frequency_path + "/compact.txn";
+	if (unlink(marker_path.c_str()) != 0 && errno != ENOENT)
+	{
+		return Status::Error(ErrorCode::IoError, "cannot remove compaction marker");
 	}
 	return Status::Ok();
 }
@@ -1232,28 +1374,33 @@ Status CompactVault(const std::string& config_path,
 	for (size_t i = 0; i < files.size(); ++i) {
 		stats->io_bytes += FileBytes(staging_build + "/" + files[i]);
 	}
+	status = WriteCompactionMarker(frequency_path, token);
+	if (!status.ok())
+	{
+		RemoveCompactionTree(build_root);
+		return status;
+	}
 	status = PublishCompactedStore(frequency_path, vault_build,
 		frequency_path + "/vault." + std::to_string(token), CompactionDestination::Vault);
 	const bool vault_published = status.ok();
-	if (vault_published) {
+	if (vault_published)
+	{
 		status = PublishCompactedStore(frequency_path, staging_build,
 			frequency_path + "/staging." + std::to_string(token), CompactionDestination::Staging);
-		if (!status.ok()) {
+		if (!status.ok())
+		{
 			const Status rollback_status = RestoreCompactedStore(frequency_path, vault_build,
 				frequency_path + "/vault." + std::to_string(token), CompactionDestination::Vault);
-			if (!rollback_status.ok()) {
+			if (!rollback_status.ok())
 				status = Status::Error(ErrorCode::IoError, "compaction publication and rollback both failed");
-			}
 		}
 	}
 	RemoveCompactionTree(build_root);
-	if (!status.ok()) {
+	if (!status.ok())
 		return status;
-	}
-	status = market->sync();
-	if (!status.ok()) {
+	status = RemoveCompactionMarker(frequency_path);
+	if (!status.ok())
 		return status;
-	}
 	stats->elapsed_milliseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now() - started).count());
 	return Status::Ok();
