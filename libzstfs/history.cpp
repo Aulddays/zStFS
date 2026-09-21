@@ -151,7 +151,7 @@ Status History::put(const Bar& bar) {
 	{
 		return status;
 	}
-	return active_->flush();
+	return active_->flush_if_needed();
 }
 
 Status History::put(const std::vector<Bar>& bars) {
@@ -231,7 +231,7 @@ Status History::put(const std::vector<Bar>& bars) {
 			return status;
 		}
 	}
-	return active_->flush();
+	return active_->flush_if_needed();
 }
 
 Status History::get(SymbolId symbol_id,

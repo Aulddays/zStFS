@@ -448,9 +448,8 @@ Status ActiveStore::latest_time(SymbolId symbol_id, TimeId *out) const
 Status ActiveStore::flush_if_needed() {
 	// This threshold check and flush must be synchronized with writes and the timer.
 	std::lock_guard<std::mutex> lock(mutex_);
-	if (dirty_bytes_ < flush_bytes_) {
+	if (dirty_bytes_ < flush_bytes_)
 		return Status::Ok();
-	}
 	return flush_locked();
 }
 

@@ -84,7 +84,7 @@ public:
 	            const Calendar& calendar,
 	            const std::string& market_path,
 	            size_t flush_bytes = 1024 * 1024,
-	            uint64_t flush_interval_milliseconds = 60 * 1000);
+	            uint64_t flush_interval_milliseconds = 300 * 1000);
 	~ActiveStore();
 
 	Status put(SymbolId symbol_id,
