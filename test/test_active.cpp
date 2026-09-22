@@ -169,10 +169,8 @@ void IngestVaultBar(zstfs::VaultStore* vault,
 	block.positions.assign(block_length, missing);
 	const zstfs::Bar bar = BarFor(symbol_id, zstfs::Frequency::Daily, time, close);
 	block.positions[block_offset] = {bar.state, bar.open, bar.high, bar.low, bar.close, bar.volume};
-	zstfs::ActiveBar active_bar = {symbol_id, time_id, block.positions[block_offset]};
 	std::vector<zstfs::StockTimeBlock> blocks(1, block);
-	std::vector<zstfs::ActiveBar> bars(1, active_bar);
-	ExpectOk(vault->ingest(blocks, bars));
+	ExpectOk(vault->ingest(blocks));
 }
 
 void TestDailyWriteReadAndRecovery() {
@@ -234,6 +232,9 @@ void TestDailyWriteReadAndRecovery() {
 		ExpectOk(history.put(BarFor(symbol_id, zstfs::Frequency::Daily,
 			"20260810", 16.0)));
 		ExpectOk(history.seal_before("20270101"));
+		// After sealing, explicit Missing bars are indistinguishable from
+		// unfilled positions in the staging layer, so 20260807 returns NotFound.
+		assert(history.get(symbol_id, "20260807", &bar).code() == zstfs::ErrorCode::NotFound);
 		assert(history.put(BarFor(symbol_id, zstfs::Frequency::Daily,
 			"20260803", 99.0)).code() == zstfs::ErrorCode::AlreadyPresent);
 		std::vector<zstfs::Bar> late_batch;
@@ -337,14 +338,14 @@ void TestStagingBatchAndIndexRecovery() {
 		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar, frequency_path, 10001);
 		std::vector<zstfs::StockTimeBlock> first_batch(1, first_block);
 		std::vector<zstfs::ActiveBar> first_bars(1, first_bar);
-		ExpectOk(staging.accept(first_batch, first_bars));
+		ExpectOk(staging.accept(first_batch));
 		std::vector<zstfs::StockTimeBlock> mixed_batch;
 		mixed_batch.push_back(first_block);
 		mixed_batch.push_back(second_block);
 		std::vector<zstfs::ActiveBar> mixed_bars;
 		mixed_bars.push_back(first_bar);
 		mixed_bars.push_back(second_bar);
-		ExpectOk(staging.accept(mixed_batch, mixed_bars));
+		ExpectOk(staging.accept(mixed_batch));
 		zstfs::BlockBar value = {};
 		ExpectOk(staging.get(32, time_id, &value));
 		assert(value.close > 19.9 && value.close < 20.1);
@@ -608,7 +609,7 @@ void PopulateCompactionFixture(const std::string& path) {
 	{
 		zstfs::StagingStore staging(zstfs::Frequency::Daily, calendar,
 			MarketPath(path, "compaction-test") + "/daily", 20004);
-		ExpectOk(staging.accept(std::vector<zstfs::StockTimeBlock>(1, staged), staged_bars));
+		ExpectOk(staging.accept(std::vector<zstfs::StockTimeBlock>(1, staged)));
 		zstfs::VaultStore vault(zstfs::Frequency::Daily, calendar,
 			MarketPath(path, "compaction-test") + "/daily", 991);
 		IngestVaultBar(&vault, calendar, symbol_id, "20270105", 50.0f);
@@ -703,8 +704,9 @@ void TestOfflineVaultCompaction() {
 		zstfs::Bar bar = {};
 		ExpectOk(history.get(symbol_id, "20260803", &bar));
 		assert(CloseEnough(bar.close, 10.0));
-		ExpectOk(history.get(symbol_id, "20260804", &bar));
-		assert(bar.state == zstfs::BarState::Missing);
+		// After compaction, explicit Missing bars are treated as unfilled
+		// positions (same as staging layer semantics).
+		assert(history.get(symbol_id, "20260804", &bar).code() == zstfs::ErrorCode::NotFound);
 		ExpectOk(history.get(symbol_id, "20260806", &bar));
 		assert(CloseEnough(bar.close, 20.0));
 		ExpectOk(history.get(symbol_id, "20270105", &bar));

@@ -8,6 +8,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <zstfs/pe_log.h>
 
 namespace zstfs {
 
@@ -219,17 +220,23 @@ const std::string& Calendar::market_type() const {
 
 Status Calendar::time_id(const std::string& value, TimeId* out) const {
 	DateParts date_parts;
-	if (out == NULL || !ParseDate(value, &date_parts)) {
-		return Status::Error(ErrorCode::InvalidArgument, "invalid local date");
+	if (out == NULL || !ParseDate(value, &date_parts))
+	{
+		PELOG_ERROR_RETURN((PLV_ERROR, "Calendar::time_id %s invalid date\n", value.c_str()),
+			Status::Error(ErrorCode::InvalidArgument, "invalid input date"));
 	}
 	const int ordinal = DaysBeforeDate(date_parts);
-	if (IsWeekendOrdinal(ordinal)) {
-		return Status::Error(ErrorCode::NotFound, "local date is a weekend");
+	if (IsWeekendOrdinal(ordinal))
+	{
+		PELOG_ERROR_RETURN((PLV_ERROR, "Calendar::time_id %s is weekend\n", value.c_str()),
+			Status::Error(ErrorCode::NotFound, "input date is a weekend"));
 	}
 	const int day_number = ordinal - (ordinal / 7) * 2;
 	if (day_number < 0 ||
-	    static_cast<TimeId>(day_number) > (std::numeric_limits<TimeId>::max() >> 8)) {
-		return Status::Error(ErrorCode::Conflict, "time identifier is out of range");
+			static_cast<TimeId>(day_number) > (std::numeric_limits<TimeId>::max() >> 8))
+	{
+		PELOG_ERROR_RETURN((PLV_ERROR, "Calendar::time_id %s out of range\n", value.c_str()),
+			Status::Error(ErrorCode::Conflict, "time identifier is out of range"));
 	}
 	*out = daily_bar_id(static_cast<TimeId>(day_number));
 	return Status::Ok();

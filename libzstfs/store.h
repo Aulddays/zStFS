@@ -42,6 +42,15 @@ struct StockTimeBlock {
 	std::vector<BlockBar> positions;
 };
 
+// RawBlockRecord carries a block's identity, metadata, and raw encoded frame
+// bytes without decoding the frame payload. Used by compaction paths that only
+// need to route and copy frames verbatim.
+struct RawBlockRecord {
+	BlockKey key;
+	uint64_t day_presence;
+	BlockOff position_count;
+	std::vector<uint8_t> frame_bytes;
+};
 
 // ActiveStore keeps mutable positions grouped by block so sealing can hand one
 // complete StockTimeBlock to the next layer. It also owns the low-frequency
@@ -147,8 +156,10 @@ public:
 	             const std::string& frequency_path,
 	             uint64_t runtime_market_id);
 
+	// Write StockTimeBlocks into staging and update index.
+	// If frame_bytes is provided, its i-th element is the pre-encoded ZBF4
+	// frame for blocks[i]; otherwise the frame is encoded from positions.
 	Status accept(const std::vector<StockTimeBlock>& blocks,
-	              const std::vector<ActiveBar>& bars,
 	              const std::vector<std::vector<uint8_t> >* frame_bytes = NULL);
 	bool contains(SymbolId symbol_id, TimeId time_id) const;
 	Status get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const;
@@ -166,6 +177,13 @@ public:
 	Status snapshot(std::vector<StockTimeBlock>* blocks,
 	                std::vector<ActiveBar>* bars,
 	                std::vector<std::vector<uint8_t> >* frame_bytes = NULL) const;
+	// Lightweight snapshot that reads raw frame bytes plus minimal metadata
+	// directly from staging pages without decoding frame content. Intended for
+	// compaction paths that only need to route and copy frames verbatim.
+	Status snapshot(std::vector<BlockKey>* keys,
+	                std::vector<uint64_t>* day_presence,
+	                std::vector<BlockOff>* position_counts,
+	                std::vector<std::vector<uint8_t> >* frame_bytes) const;
 
 private:
 	struct Locator {
@@ -177,6 +195,10 @@ private:
 
 	Status load();
 	Status write_index() const;
+	// Loads raw page bytes from the compressed cache or disk. Does not
+	// decode page content.
+	Status load_page_bytes(uint32_t segment_id, uint64_t page_offset, uint32_t page_length,
+		std::vector<uint8_t>* page_bytes) const;
 	// Loads and decodes one page, returning its parsed records. Uses the
 	// shared decoded cache (and compressed cache as fallback).
 	Status load_page(uint32_t segment_id, uint64_t page_offset, uint32_t page_length,
@@ -206,7 +228,6 @@ public:
 	// Appends completed blocks as symbol-ordered ZVB6 blobs and publishes their
 	// locators in the persistent Vault index.
 	Status ingest(const std::vector<StockTimeBlock>& blocks,
-	              const std::vector<ActiveBar>& bars,
 	              const std::vector<std::vector<uint8_t> >* frame_bytes = NULL);
 	bool contains(SymbolId symbol_id, TimeId time_id) const;
 	Status get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const;
@@ -223,6 +244,13 @@ public:
 	Status snapshot(std::vector<StockTimeBlock>* blocks,
 	                std::vector<ActiveBar>* bars,
 	                std::vector<std::vector<uint8_t> >* frame_bytes = NULL) const;
+	// Lightweight snapshot that reads raw frame bytes plus minimal metadata
+	// directly from vault blobs without decoding frame content. Intended for
+	// compaction paths that only need to route and copy frames verbatim.
+	Status snapshot(std::vector<BlockKey>* keys,
+	                std::vector<uint64_t>* day_presence,
+	                std::vector<BlockOff>* position_counts,
+	                std::vector<std::vector<uint8_t> >* frame_bytes) const;
 
 private:
 	struct Locator {

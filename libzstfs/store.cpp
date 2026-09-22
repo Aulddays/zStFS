@@ -781,74 +781,63 @@ Status StagingTimeIds(const Calendar& calendar,
 	return Status::Ok();
 }
 
+// Build a pending staging record from a complete StockTimeBlock.
+// The present bitmap is derived from positions[i].state:
+// If frame_bytes is provided, it is used as-is, without encoding.
+// Otherwise the frame is encoded from positions.
 static Status MakePendingStagingRecord(const Calendar& calendar,
 					       Frequency frequency,
 					       const StockTimeBlock& block,
-					       const std::vector<ActiveBar>& bars,
 					       const std::vector<uint8_t>* frame_bytes,
 					       PendingStagingRecord* output) {
 	if (output == NULL || block.key.symbol_id == kInvalidSymbolId ||
-		block.positions.empty() || block.positions.size() > std::numeric_limits<BlockOff>::max()) {
+		block.positions.empty() || block.positions.size() > std::numeric_limits<BlockOff>::max())
+	{
 		return Status::Error(ErrorCode::InvalidArgument, "invalid staging block");
 	}
 	BlockOff expected_position_count = 0;
 	Status status = calendar.block_length(frequency, block.key.time_block_id,
 		&expected_position_count);
-	if (!status.ok() || block.positions.size() != expected_position_count) {
+	if (!status.ok() || block.positions.size() != expected_position_count)
+{
 		return !status.ok() ? status : Status::Error(ErrorCode::InvalidArgument,
 			"staging block does not cover its complete calendar range");
-	}
-	std::vector<TimeId> time_ids;
-	status = StagingTimeIds(calendar, frequency, block.key.time_block_id,
-		expected_position_count, &time_ids);
-	if (!status.ok()) {
-		return status;
 	}
 	PendingStagingRecord pending = {};
 	pending.block = block;
 	pending.present.assign((block.positions.size() + 7) / 8, 0);
-	for (size_t i = 0; i < bars.size(); ++i) {
-		if (bars[i].symbol_id != block.key.symbol_id) {
-			continue;
-		}
-		std::vector<TimeId>::const_iterator position = std::lower_bound(time_ids.begin(),
-			time_ids.end(), bars[i].time_id);
-		if (position == time_ids.end() || *position != bars[i].time_id) {
-			continue;
-		}
-		const size_t offset = static_cast<size_t>(position - time_ids.begin());
-		const uint8_t bit = static_cast<uint8_t>(1U << (offset % 8));
-		if ((pending.present[offset / 8] & bit) != 0 ||
-			!SameBlockBar(block.positions[offset], bars[i].bar)) {
-			return Status::Error(ErrorCode::InvalidArgument, "inconsistent staging bar record");
-		}
-		pending.present[offset / 8] |= bit;
-	}
-	for (size_t offset = 0; offset < block.positions.size(); ++offset) {
-		if (block.positions[offset].state != BarState::Missing &&
-			(pending.present[offset / 8] & static_cast<uint8_t>(1U << (offset % 8))) == 0) {
-			return Status::Error(ErrorCode::InvalidArgument, "staging block has an unrecorded position");
+	for (size_t offset = 0; offset < block.positions.size(); ++offset)
+	{
+		if (block.positions[offset].state != BarState::Missing)
+		{
+			pending.present[offset / 8] |= static_cast<uint8_t>(1U << (offset % 8));
 		}
 	}
-	if (frame_bytes != NULL) {
+	if (frame_bytes != NULL)
+	{
+		// When a pre-encoded frame is provided, decode it once to derive the
+		// present bitmap (needed for the page directory). The frame bytes
+		// themselves are used as-is for the payload, avoiding a re-encode.
 		BarBlockFrame frame = {*frame_bytes};
 		std::vector<BlockBar> decoded;
 		status = DecodeBarBlockFrame(frame, &decoded);
-		if (!status.ok() || decoded.size() != block.positions.size()) {
+		if (!status.ok() || decoded.size() != block.positions.size())
 			return Status::Error(ErrorCode::CorruptData, "invalid source staging bar block frame");
-		}
-		for (size_t i = 0; i < decoded.size(); ++i) {
-			if (!SameBlockBar(decoded[i], block.positions[i])) {
-				return Status::Error(ErrorCode::CorruptData, "source staging frame does not match record");
-			}
+		// Rebuild present from the decoded frame data.
+		pending.present.assign((decoded.size() + 7) / 8, 0);
+		for (size_t i = 0; i < decoded.size(); ++i)
+		{
+			if (decoded[i].state != BarState::Missing)
+				pending.present[i / 8] |= static_cast<uint8_t>(1U << (i % 8));
 		}
 		pending.frame_bytes.push_back(*frame_bytes);
-	} else {
+	}
+	else
+	{
 		BarBlockFrame frame;
 		status = EncodeBarBlockFrame(block.positions, &frame);
-		if (!status.ok()) {
+		if (!status.ok())
 			return status;
-		}
 		pending.frame_bytes.push_back(frame.bytes);
 	}
 	*output = pending;
@@ -1023,31 +1012,44 @@ StagingStore::StagingStore(Frequency frequency,
 	status_ = load();
 }
 
+Status StagingStore::load_page_bytes(uint32_t segment_id, uint64_t page_offset, uint32_t page_length,
+							  std::vector<uint8_t>* page_bytes) const
+{
+	if (GetCompressedCache(CacheStoreType::Staging, runtime_market_id_, frequency_,
+			segment_id, page_offset, page_bytes))
+	{
+		return Status::Ok();
+	}
+	std::ifstream input(StagingSegmentPath(path_, segment_id).c_str(), std::ios::binary);
+	if (!input)
+	{
+		return Status::Error(ErrorCode::IoError, "cannot read staging segment");
+	}
+	input.seekg(static_cast<std::streamoff>(page_offset));
+	page_bytes->assign(page_length, 0);
+	input.read(reinterpret_cast<char*>(&(*page_bytes)[0]), page_length);
+	if (input.gcount() != static_cast<std::streamsize>(page_length))
+	{
+		return Status::Error(ErrorCode::CorruptData, "truncated staging page");
+	}
+	InsertCompressedCache(CacheStoreType::Staging, runtime_market_id_, frequency_,
+		segment_id, page_offset, *page_bytes);
+	return Status::Ok();
+}
+
 Status StagingStore::load_page(uint32_t segment_id, uint64_t page_offset, uint32_t page_length,
 					 std::vector<ParsedStagingRecord>* records) const {
 	// First try the decoded page cache.
 	if (GetStagingDecodedCache(runtime_market_id_, frequency_, segment_id, page_offset, records)) {
 		return Status::Ok();
 	}
-	// Try the compressed cache, then fall back to disk.
 	std::vector<uint8_t> page_bytes;
-	if (!GetCompressedCache(CacheStoreType::Staging, runtime_market_id_, frequency_,
-			segment_id, page_offset, &page_bytes)) {
-		std::ifstream input(StagingSegmentPath(path_, segment_id).c_str(), std::ios::binary);
-		if (!input) {
-			return Status::Error(ErrorCode::IoError, "cannot read staging segment");
-		}
-		input.seekg(static_cast<std::streamoff>(page_offset));
-		page_bytes.assign(page_length, 0);
-		input.read(reinterpret_cast<char*>(&page_bytes[0]), page_length);
-		if (input.gcount() != static_cast<std::streamsize>(page_length)) {
-			return Status::Error(ErrorCode::CorruptData, "truncated staging page");
-		}
-		InsertCompressedCache(CacheStoreType::Staging, runtime_market_id_, frequency_,
-			segment_id, page_offset, page_bytes);
+	Status status = load_page_bytes(segment_id, page_offset, page_length, &page_bytes);
+	if (!status.ok()) {
+		return status;
 	}
 	uint32_t page_id = 0;
-	Status status = ParseStagingPage(calendar_, frequency_, page_bytes, records, &page_id);
+	status = ParseStagingPage(calendar_, frequency_, page_bytes, records, &page_id);
 	if (!status.ok()) {
 		return status;
 	}
@@ -1207,7 +1209,6 @@ Status StagingStore::write_index() const {
 }
 
 Status StagingStore::accept(const std::vector<StockTimeBlock>& blocks,
-				    const std::vector<ActiveBar>& bars,
 				    const std::vector<std::vector<uint8_t> >* frame_bytes) {
 	if (!status_.ok()) {
 		return status_;
@@ -1229,7 +1230,7 @@ Status StagingStore::accept(const std::vector<StockTimeBlock>& blocks,
 		PendingStagingRecord record;
 		const std::vector<uint8_t>* source_frame = frame_bytes == NULL || (*frame_bytes)[i].empty() ?
 			NULL : &(*frame_bytes)[i];
-		Status status = MakePendingStagingRecord(calendar_, frequency_, blocks[i], bars, source_frame, &record);
+		Status status = MakePendingStagingRecord(calendar_, frequency_, blocks[i], source_frame, &record);
 		if (!status.ok()) {
 			return status;
 		}
@@ -1297,16 +1298,6 @@ Status StagingStore::accept(const std::vector<StockTimeBlock>& blocks,
 			Locator locator = {current_segment_id_, offset, static_cast<uint32_t>(page_bytes.size()),
 				static_cast<uint32_t>(record)};
 			index_[key] = locator;
-		}
-		// New pages go straight into both caches (write-through).
-		std::vector<ParsedStagingRecord> new_records;
-		uint32_t new_page_id = 0;
-		Status page_status = ParseStagingPage(calendar_, frequency_, page_bytes, &new_records, &new_page_id);
-		if (page_status.ok()) {
-			InsertCompressedCache(CacheStoreType::Staging, runtime_market_id_, frequency_,
-				current_segment_id_, offset, page_bytes);
-			InsertStagingDecodedCache(runtime_market_id_, frequency_, current_segment_id_,
-				offset, new_records);
 		}
 		++next_page_id_;
 	}
@@ -1518,6 +1509,148 @@ Status StagingStore::snapshot(std::vector<StockTimeBlock>* blocks,
 		bars->insert(bars->end(), found->second.bars.begin(), found->second.bars.end());
 	}
 	std::sort(bars->begin(), bars->end(), ActiveBarOrder);
+	return Status::Ok();
+}
+
+struct RawStagingRecord
+{
+	BlockKey key;
+	uint64_t day_presence;
+	BlockOff position_count;
+	std::vector<uint8_t> frame_bytes;
+};
+
+static Status ParseStagingPageRaw(const std::vector<uint8_t> &bytes,
+							  Frequency frequency,
+							  std::vector<RawStagingRecord> *records,
+							  uint32_t *page_id)
+{
+	if (records == NULL || page_id == NULL || bytes.size() < kStagingPageHeaderBytes)
+		return Status::Error(ErrorCode::CorruptData, "truncated staging page");
+	size_t cursor = 0;
+	uint8_t magic[4] = {};
+	uint8_t version = 0;
+	uint8_t stored_frequency = 0;
+	uint16_t reserved = 0;
+	uint64_t stored_page_id = 0;
+	uint32_t count = 0;
+	uint32_t directory_size = 0;
+	uint32_t payload_size = 0;
+	if (!GetU8(bytes, &cursor, &magic[0]) || !GetU8(bytes, &cursor, &magic[1]) ||
+		!GetU8(bytes, &cursor, &magic[2]) || !GetU8(bytes, &cursor, &magic[3]) ||
+		magic[0] != 'Z' || magic[1] != 'S' || magic[2] != 'P' || magic[3] != '5' ||
+		!GetU8(bytes, &cursor, &version) || !GetU8(bytes, &cursor, &stored_frequency) ||
+		!GetU16(bytes, &cursor, &reserved) || !GetU64(bytes, &cursor, &stored_page_id) ||
+		!GetU32(bytes, &cursor, &count) ||
+		!GetU32(bytes, &cursor, &directory_size) || !GetU32(bytes, &cursor, &payload_size) ||
+		version != kStagingVersion || stored_frequency != static_cast<uint8_t>(frequency) ||
+		reserved != 0 || stored_page_id == 0 ||
+		stored_page_id > std::numeric_limits<uint32_t>::max() || count == 0 ||
+		kStagingPageHeaderBytes + static_cast<size_t>(directory_size) + payload_size != bytes.size())
+	{
+		return Status::Error(ErrorCode::CorruptData, "invalid staging page header");
+	}
+	*page_id = static_cast<uint32_t>(stored_page_id);
+	const size_t directory_end = cursor + directory_size;
+	const size_t payload_start = directory_end;
+	records->clear();
+	records->reserve(count);
+	for (uint32_t record_index = 0; record_index < count; ++record_index)
+	{
+		uint32_t symbol_id = 0;
+		uint32_t block_id = 0;
+		uint16_t position_count = 0;
+		uint64_t record_day_presence = 0;
+		uint16_t present_size = 0;
+		uint16_t frame_count = 0;
+		if (!GetU32(bytes, &cursor, &symbol_id) || !GetU32(bytes, &cursor, &block_id) ||
+			!GetU16(bytes, &cursor, &position_count) ||
+			!GetU64(bytes, &cursor, &record_day_presence) ||
+			!GetU16(bytes, &cursor, &present_size) || symbol_id == kInvalidSymbolId ||
+			position_count == 0 || present_size != (position_count + 7) / 8 ||
+			cursor + present_size > directory_end)
+		{
+			return Status::Error(ErrorCode::CorruptData, "invalid staging record directory");
+		}
+		cursor += present_size;
+		if (!GetU16(bytes, &cursor, &frame_count) || frame_count == 0)
+			return Status::Error(ErrorCode::CorruptData, "staging record has no frames");
+		if (frame_count != 1)
+			return Status::Error(ErrorCode::CorruptData,
+				"staging record must contain one bar block frame");
+		uint32_t frame_offset = 0;
+		uint32_t frame_length = 0;
+		if (!GetU32(bytes, &cursor, &frame_offset) || !GetU32(bytes, &cursor, &frame_length) ||
+			frame_offset > payload_size || frame_length > payload_size - frame_offset)
+			return Status::Error(ErrorCode::CorruptData, "invalid staging frame locator");
+		RawStagingRecord record = {};
+		record.key.symbol_id = symbol_id;
+		record.key.time_block_id = block_id;
+		record.day_presence = record_day_presence;
+		record.position_count = position_count;
+		record.frame_bytes.assign(bytes.begin() + payload_start + frame_offset,
+			bytes.begin() + payload_start + frame_offset + frame_length);
+		records->push_back(record);
+	}
+	if (cursor != directory_end)
+		return Status::Error(ErrorCode::CorruptData, "trailing staging directory bytes");
+	return Status::Ok();
+}
+
+Status StagingStore::snapshot(std::vector<BlockKey> *keys,
+						 std::vector<uint64_t> *day_presence,
+						 std::vector<BlockOff> *position_counts,
+						 std::vector<std::vector<uint8_t> > *frame_bytes) const
+{
+	if (keys == NULL || day_presence == NULL || position_counts == NULL || frame_bytes == NULL)
+		return Status::Error(ErrorCode::InvalidArgument, "staging raw snapshot outputs are required");
+	if (!status_.ok())
+		return status_;
+	keys->clear();
+	day_presence->clear();
+	position_counts->clear();
+	frame_bytes->clear();
+	// Walk the index, loading each page once. Records are keyed so we can emit
+	// them in index order below.
+	std::set<std::pair<uint32_t, uint64_t> > visited_pages;
+	std::map<std::pair<TimeId, SymbolId>, RawStagingRecord> by_key;
+	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
+		 it != index_.end(); ++it)
+	{
+		const std::pair<uint32_t, uint64_t> page_key(it->second.segment_id, it->second.page_offset);
+		if (visited_pages.insert(page_key).second)
+		{
+			std::vector<uint8_t> page_bytes;
+			Status status = load_page_bytes(it->second.segment_id, it->second.page_offset,
+				it->second.page_length, &page_bytes);
+			if (!status.ok())
+				return status;
+			std::vector<RawStagingRecord> records;
+			uint32_t page_id = 0;
+			status = ParseStagingPageRaw(page_bytes, frequency_, &records, &page_id);
+			if (!status.ok())
+				return status;
+			for (size_t r = 0; r < records.size(); ++r)
+			{
+				const std::pair<TimeId, SymbolId> key(
+					records[r].key.time_block_id, records[r].key.symbol_id);
+				by_key.insert(std::make_pair(key, records[r]));
+			}
+		}
+	}
+	// Emit in index order.
+	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
+		 it != index_.end(); ++it)
+	{
+		std::map<std::pair<TimeId, SymbolId>, RawStagingRecord>::iterator found =
+			by_key.find(it->first);
+		if (found == by_key.end())
+			return Status::Error(ErrorCode::CorruptData, "staging raw snapshot missing record");
+		keys->push_back(found->second.key);
+		day_presence->push_back(found->second.day_presence);
+		position_counts->push_back(found->second.position_count);
+		frame_bytes->push_back(found->second.frame_bytes);
+	}
 	return Status::Ok();
 }
 
@@ -1836,63 +1969,50 @@ static bool GetStagingDecodedCache(uint64_t runtime_market_id,
 	return false;
 }
 
+// Build a pending vault block from StockTimeBlock.
+// Similar to MakePendingStagingRecord
 static Status MakeVaultPendingBlock(const Calendar& calendar,
 							Frequency frequency,
 							const StockTimeBlock& block,
-							const std::vector<ActiveBar>& bars,
 							const std::vector<uint8_t>* frame_bytes,
-							VaultPendingBlock* output) {
-	if (output == NULL || block.key.symbol_id == kInvalidSymbolId || block.positions.empty()) {
+							VaultPendingBlock *output)
+{
+	if (output == NULL || block.key.symbol_id == kInvalidSymbolId || block.positions.empty())
 		return Status::Error(ErrorCode::InvalidArgument, "invalid vault block");
-	}
 	BlockOff expected_length = 0;
 	Status status = calendar.block_length(frequency, block.key.time_block_id, &expected_length);
-	if (!status.ok() || block.positions.size() != expected_length) {
+	if (!status.ok() || block.positions.size() != expected_length)
 		return Status::Error(ErrorCode::InvalidArgument, "vault block length does not match calendar");
-	}
 	output->block = block;
-	output->present.assign((block.positions.size() + 7) / 8, 0);
-	std::vector<TimeId> time_ids;
-	status = StagingTimeIds(calendar, frequency, block.key.time_block_id, expected_length, &time_ids);
-	if (!status.ok()) {
-		return status;
-	}
-	for (size_t i = 0; i < bars.size(); ++i) {
-		if (bars[i].symbol_id != block.key.symbol_id) {
-			continue;
-		}
-		std::vector<TimeId>::const_iterator position = std::lower_bound(time_ids.begin(), time_ids.end(),
-			bars[i].time_id);
-		if (position == time_ids.end() || *position != bars[i].time_id) {
-			continue;
-		}
-		const size_t index = static_cast<size_t>(position - time_ids.begin());
-		const uint8_t bit = static_cast<uint8_t>(1U << (index % 8));
-		if ((output->present[index / 8] & bit) != 0) {
-			return Status::Error(ErrorCode::Conflict, "duplicate vault bar");
-		}
-		output->present[index / 8] |= bit;
-	}
-	if (frame_bytes != NULL) {
+	if (frame_bytes != NULL)
+	{
+		// When a pre-encoded frame is provided, decode it once to derive the
+		// present bitmap. The frame bytes are used as-is for the payload.
 		BarBlockFrame frame = {*frame_bytes};
 		std::vector<BlockBar> decoded;
 		status = DecodeBarBlockFrame(frame, &decoded);
-		if (!status.ok() || decoded.size() != block.positions.size()) {
+		if (!status.ok() || decoded.size() != block.positions.size())
 			return Status::Error(ErrorCode::CorruptData, "invalid source bar block frame");
-		}
-		for (size_t i = 0; i < decoded.size(); ++i) {
-			if (!SameBlockBar(decoded[i], block.positions[i])) {
-				return Status::Error(ErrorCode::CorruptData, "source bar block frame does not match record");
-			}
+		output->present.assign((decoded.size() + 7) / 8, 0);
+		for (size_t i = 0; i < decoded.size(); ++i)
+		{
+			if (decoded[i].state != BarState::Missing)
+				output->present[i / 8] |= static_cast<uint8_t>(1U << (i % 8));
 		}
 		output->frame_bytes = *frame_bytes;
 		return Status::Ok();
 	}
+	// No pre-encoded frame: build present from block positions and encode.
+	output->present.assign((block.positions.size() + 7) / 8, 0);
+	for (size_t offset = 0; offset < block.positions.size(); ++offset)
+	{
+		if (block.positions[offset].state != BarState::Missing)
+			output->present[offset / 8] |= static_cast<uint8_t>(1U << (offset % 8));
+	}
 	BarBlockFrame frame;
 	status = EncodeBarBlockFrame(block.positions, &frame);
-	if (status.ok()) {
+	if (status.ok())
 		output->frame_bytes.swap(frame.bytes);
-	}
 	return status;
 }
 
@@ -2072,7 +2192,6 @@ Status VaultStore::write_index() const {
 }
 
 Status VaultStore::ingest(const std::vector<StockTimeBlock>& blocks,
-					  const std::vector<ActiveBar>& bars,
 					  const std::vector<std::vector<uint8_t> >* frame_bytes) {
 	if (!status_.ok()) {
 		return status_;
@@ -2080,30 +2199,13 @@ Status VaultStore::ingest(const std::vector<StockTimeBlock>& blocks,
 	if (frame_bytes != NULL && frame_bytes->size() != blocks.size()) {
 		return Status::Error(ErrorCode::InvalidArgument, "vault frame bytes do not match blocks");
 	}
-	const TimeId block_day_length = frequency_ == Frequency::Daily
-		? kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
-	// A compaction batch carries bars for many complete blocks. Route them once
-	// so each pending Vault block validates only its own local positions.
-	std::map<std::pair<SymbolId, TimeId>, std::vector<ActiveBar> > bars_by_block;
-	for (size_t i = 0; i < bars.size(); ++i) {
-		const TimeId day = time_day(bars[i].time_id);
-		const TimeId block_id = daily_bar_id(day - day % block_day_length);
-		bars_by_block[std::make_pair(bars[i].symbol_id, block_id)].push_back(bars[i]);
-	}
 
 	std::map<SymbolId, std::vector<VaultPendingBlock> > by_symbol;
-	const std::vector<ActiveBar> empty_bars;
 	for (size_t i = 0; i < blocks.size(); ++i) {
-		const std::pair<SymbolId, TimeId> key(blocks[i].key.symbol_id,
-			blocks[i].key.time_block_id);
-		std::map<std::pair<SymbolId, TimeId>, std::vector<ActiveBar> >::const_iterator found =
-			bars_by_block.find(key);
-		const std::vector<ActiveBar>& block_bars = found == bars_by_block.end()
-			? empty_bars : found->second;
 		VaultPendingBlock pending;
 		const std::vector<uint8_t>* source_frame = frame_bytes == NULL || (*frame_bytes)[i].empty() ?
 			NULL : &(*frame_bytes)[i];
-		Status status = MakeVaultPendingBlock(calendar_, frequency_, blocks[i], block_bars, source_frame, &pending);
+		Status status = MakeVaultPendingBlock(calendar_, frequency_, blocks[i], source_frame, &pending);
 		if (!status.ok()) {
 			return status;
 		}
@@ -2637,6 +2739,111 @@ Status VaultStore::snapshot(std::vector<StockTimeBlock>* blocks,
 			return Status::Error(ErrorCode::CorruptData, "vault block frame is missing");
 		}
 		frame_bytes->push_back(found->second);
+	}
+	return Status::Ok();
+}
+
+Status VaultStore::snapshot(std::vector<BlockKey> *keys,
+						std::vector<uint64_t> *day_presence,
+						std::vector<BlockOff> *position_counts,
+						std::vector<std::vector<uint8_t>> *frame_bytes) const
+{
+	if (keys == NULL || day_presence == NULL || position_counts == NULL || frame_bytes == NULL)
+		return Status::Error(ErrorCode::InvalidArgument, "vault raw snapshot outputs are required");
+	if (!status_.ok())
+		return status_;
+	keys->clear();
+	day_presence->clear();
+	position_counts->clear();
+	frame_bytes->clear();
+	// Walk the index in order, reading each blob once.
+	for (size_t i = 0; i < index_.size(); ++i)
+	{
+		const Locator &locator = index_[i];
+		std::vector<uint8_t> blob;
+		Status status = ReadVaultBlob(path_, runtime_market_id_, frequency_,
+			locator.segment_id, locator.blob_offset, locator.blob_length, &blob);
+		if (!status.ok())
+			return status;
+		// Parse blob header + directories only; do not decode frame content.
+		if (blob.size() < 32)
+			return Status::Error(ErrorCode::CorruptData, "truncated vault blob header");
+		size_t cursor = 0;
+		uint8_t magic[4] = {};
+		uint8_t version = 0;
+		uint8_t stored_frequency = 0;
+		uint16_t reserved = 0;
+		uint32_t symbol_id = 0;
+		uint32_t first_block = 0;
+		uint32_t last_block = 0;
+		uint32_t block_count = 0;
+		uint32_t frame_count = 0;
+		uint32_t header_bytes = 0;
+		if (!GetU8(blob, &cursor, &magic[0]) || !GetU8(blob, &cursor, &magic[1]) ||
+			!GetU8(blob, &cursor, &magic[2]) || !GetU8(blob, &cursor, &magic[3]) ||
+			magic[0] != 'Z' || magic[1] != 'V' || magic[2] != 'B' || magic[3] != '6' ||
+			!GetU8(blob, &cursor, &version) || !GetU8(blob, &cursor, &stored_frequency) ||
+			!GetU16(blob, &cursor, &reserved) || !GetU32(blob, &cursor, &symbol_id) ||
+			!GetU32(blob, &cursor, &first_block) || !GetU32(blob, &cursor, &last_block) ||
+			!GetU32(blob, &cursor, &block_count) || !GetU32(blob, &cursor, &frame_count) ||
+			!GetU32(blob, &cursor, &header_bytes) || version != kVaultVersion ||
+			stored_frequency != static_cast<uint8_t>(frequency_) || reserved != 0 ||
+			symbol_id == kInvalidSymbolId || block_count == 0 || frame_count != block_count ||
+			header_bytes < 32 + block_count * 20 + frame_count * 17 ||
+			header_bytes > blob.size())
+		{
+			return Status::Error(ErrorCode::CorruptData, "invalid vault blob header");
+		}
+		// Read block directory (20 bytes each).
+		size_t block_dir_cursor = 32;
+		for (uint32_t b = 0; b < block_count; ++b)
+		{
+			uint32_t time_block_id = 0;
+			uint64_t block_day_presence = 0;
+			uint16_t position_count = 0;
+			uint16_t present_length = 0;
+			uint32_t present_offset = 0;
+			if (!GetU32(blob, &block_dir_cursor, &time_block_id) ||
+				!GetU64(blob, &block_dir_cursor, &block_day_presence) ||
+				!GetU16(blob, &block_dir_cursor, &position_count) ||
+				!GetU16(blob, &block_dir_cursor, &present_length) ||
+				!GetU32(blob, &block_dir_cursor, &present_offset) ||
+				position_count == 0 || present_length != (position_count + 7) / 8 ||
+				present_offset >= blob.size() || present_offset + present_length > blob.size())
+			{
+				return Status::Error(ErrorCode::CorruptData, "invalid vault block directory");
+			}
+			BlockKey key = {};
+			key.symbol_id = symbol_id;
+			key.time_block_id = time_block_id;
+			keys->push_back(key);
+			day_presence->push_back(block_day_presence);
+			position_counts->push_back(position_count);
+		}
+		// Read frame directory (17 bytes each) and extract frame bytes.
+		size_t frame_dir_cursor = 32 + block_count * 20;
+		for (uint32_t f = 0; f < frame_count; ++f)
+		{
+			uint8_t field = 0;
+			uint32_t frame_block_id = 0;
+			uint16_t first_offset = 0;
+			uint16_t sample_count = 0;
+			uint32_t frame_offset = 0;
+			uint32_t frame_length = 0;
+			if (!GetU8(blob, &frame_dir_cursor, &field) ||
+				!GetU32(blob, &frame_dir_cursor, &frame_block_id) ||
+				!GetU16(blob, &frame_dir_cursor, &first_offset) ||
+				!GetU16(blob, &frame_dir_cursor, &sample_count) ||
+				!GetU32(blob, &frame_dir_cursor, &frame_offset) ||
+				!GetU32(blob, &frame_dir_cursor, &frame_length) ||
+				field != static_cast<uint8_t>(FieldId::State) || first_offset != 0 ||
+				frame_offset >= blob.size() || frame_length > blob.size() - frame_offset)
+			{
+				return Status::Error(ErrorCode::CorruptData, "invalid vault frame directory");
+			}
+			frame_bytes->push_back(std::vector<uint8_t>(
+				blob.begin() + frame_offset, blob.begin() + frame_offset + frame_length));
+		}
 	}
 	return Status::Ok();
 }

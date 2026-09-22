@@ -516,16 +516,17 @@ json BarJson(const zstfs::Bar& bar) {
 }
 
 HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) {
+	// GET /v1/health
 	const std::vector<std::string> parts = PathParts(request.target);
 	if (parts.size() == 2 && parts[0] == "v1" && parts[1] == "health" && request.method == "GET") {
 		return OkJson(json{{"status", "ok"}}.dump());
 	}
-	// /v1/stage triggers a global seal: all markets, both daily and hourly.
-	// Each market computes its own cutoff using its calendar, going back
-	// kStageTradingDaysBack trading days from the system's local date.
-	// The date uses the system's local timezone, formatted as YYYYMMDD.
+
+	// /v1/stage
+	// global seal: all markets/frequency, 10 trading days before
 	static const int kStageTradingDaysBack = 10;
-	if (parts.size() == 2 && parts[0] == "v1" && parts[1] == "stage" && request.method == "POST") {
+	if (parts.size() == 2 && parts[0] == "v1" && parts[1] == "stage")
+	{
 		std::time_t now = std::time(NULL);
 		std::tm* local = std::localtime(&now);
 		char today[16];
@@ -535,6 +536,7 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
 		return OkJson(json{{"trading_days_back", kStageTradingDaysBack}}.dump());
 	}
+
 	if (parts.size() < 3 || parts[0] != "v1" || parts[1] != "markets") {
 		return LoggedError(404, "endpoint not found");
 	}
@@ -542,6 +544,7 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 	zstfs::Status status = markets->get(parts[2], &market);
 	if (!status.ok()) return ErrorResponse(StatusCode(status), status.message());
 
+	// GET /v1/markets/<market>/symbols
 	if (parts.size() == 4 && parts[3] == "symbols" && request.method == "GET") {
 		std::vector<zstfs::Symbol> symbols;
 		status = market->symbols().list(&symbols);
@@ -554,6 +557,7 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		return OkJson(result.dump());
 	}
 
+	// GET /v1/markets/<market>/symbols/<code>
 	if (parts.size() == 5 && parts[3] == "symbols" && request.method == "GET") {
 		const std::string& code = parts[4];
 		zstfs::Symbol symbol = {};
@@ -562,6 +566,7 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		return OkJson(json{{"symbol", SymbolJson(symbol)}}.dump());
 	}
 
+	// POST /v1/markets/<market>/symbols
 	if (parts.size() == 4 && parts[3] == "symbols" && request.method == "POST") {
 		// Symbols upsert accepts a single object or an array. Both paths go
 		// through the batch mechanism so a single-record write still behaves
@@ -641,6 +646,7 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		}.dump());
 	}
 
+	// DELETE /v1/markets/<market>/symbols/<code>
 	if (parts.size() == 5 && parts[3] == "symbols" && request.method == "DELETE") {
 		const std::string& code = parts[4];
 		zstfs::Symbol symbol = {};
@@ -653,6 +659,9 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		return OkJson("{\"removed\":true}");
 	}
 
+	// DELETE /v1/markets/<market>/actions?symbol_id=<id>|code=<code>&external_event_key=<key>
+	// POST   /v1/markets/<market>/actions
+	// GET    /v1/markets/<market>/actions?symbol_id=<id>|code=<code>&begin=<date>&end=<date>
 	if (parts.size() == 4 && parts[3] == "actions") {
 		if (request.method == "DELETE")
 		{
@@ -754,6 +763,8 @@ HttpResponse HandleRequest(zstfs::Markets* markets, const HttpRequest& request) 
 		return LoggedError(405, "method not allowed");
 	}
 
+	// POST /v1/markets/<market>/bars
+	// GET  /v1/markets/<market>/bars?symbol_id=<id>|code=<code>&frequency=<daily|hourly>&time=<time>|begin=<time>&end=<time>[&adjust=raw|forward|backward]
 	if (parts.size() != 4 || parts[3] != "bars") return LoggedError(404, "endpoint not found");
 	if (request.method == "POST") {
 		json payload;
