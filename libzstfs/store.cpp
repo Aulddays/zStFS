@@ -153,9 +153,11 @@ Status ResolveTime(const Calendar& calendar,
 		if (!status.ok()) {
 			return status;
 		}
-		status = calendar.hour_slot(local_time, &slot);
-		if (!status.ok()) {
-			return status;
+		if (local_time.size() > 8)	// else: no hourly part, just use slot 0
+		{
+			status = calendar.hour_slot(local_time, &slot);
+			if (!status.ok())
+				return status;
 		}
 		*time_id = hourly_bar_id(time_day(day_time_id), slot);
 	}
@@ -1108,6 +1110,12 @@ Status StagingStore::load() {
 				// next_page_id_ is only used by accept() to assign new ids; we
 				// recover it on the first full rebuild path below.
 				next_page_id_ = 1;
+				// Build the secondary symbol index from the primary index.
+				for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it =
+					 index_.begin(); it != index_.end(); ++it)
+				{
+					symbol_blocks_[it->first.second].insert(it->first.first);
+				}
 				return Status::Ok();
 			}
 		}
@@ -1164,6 +1172,8 @@ Status StagingStore::load() {
 				Locator locator = {segment_id, static_cast<uint64_t>(offset),
 					static_cast<uint32_t>(page_length), static_cast<uint32_t>(record)};
 				index_[key] = locator;
+				symbol_blocks_[parsed[record].block.key.symbol_id].insert(
+					parsed[record].block.key.time_block_id);
 			}
 			next_page_id_ = std::max(next_page_id_, page_id + 1);
 			offset += page_length;
@@ -1298,32 +1308,27 @@ Status StagingStore::accept(const std::vector<StockTimeBlock>& blocks,
 			Locator locator = {current_segment_id_, offset, static_cast<uint32_t>(page_bytes.size()),
 				static_cast<uint32_t>(record)};
 			index_[key] = locator;
+			symbol_blocks_[pages[page][record].block.key.symbol_id].insert(
+				pages[page][record].block.key.time_block_id);
+			}
+			++next_page_id_;
 		}
-		++next_page_id_;
+		return write_index();
 	}
-	return write_index();
-}
 
+// Check whether the *block* that would contain the data exists
 bool StagingStore::contains(SymbolId symbol_id, TimeId time_id) const {
 	if (!status_.ok()) {
 		return false;
 	}
-	// Locate the block+symbol key by scanning index keys. We check the
-	// block's time range against the requested time_id using day arithmetic.
-	const TimeId day = time_day(time_id);
+	// Compute which 64-day block the time_id falls into, then look up
+	// the (block_id, symbol_id) key directly in O(log n).
 	const TimeId block_days = frequency_ == Frequency::Daily ?
 		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
-	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
-		 it != index_.end(); ++it) {
-		if (it->first.second != symbol_id) {
-			continue;
-		}
-		const TimeId block_start_day = time_day(it->first.first);
-		if (day >= block_start_day && day < block_start_day + block_days) {
-			return true;
-		}
-	}
-	return false;
+	const TimeId block_day = time_day(time_id) - (time_day(time_id) % block_days);
+	const TimeId block_id = daily_bar_id(block_day);
+	const std::pair<TimeId, SymbolId> key(block_id, symbol_id);
+	return index_.find(key) != index_.end();
 }
 
 Status StagingStore::get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const {
@@ -1333,37 +1338,32 @@ Status StagingStore::get(SymbolId symbol_id, TimeId time_id, BlockBar* out) cons
 	if (!status_.ok()) {
 		return status_;
 	}
-	// Find the matching block in the index by checking each (block_id, symbol_id)
-	// entry's time range.
-	const TimeId day = time_day(time_id);
+	// Compute the 64-day block containing time_id and locate the record by
+	// (block_id, symbol_id) in O(log n).
 	const TimeId block_days = frequency_ == Frequency::Daily ?
 		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
-	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
-		 it != index_.end(); ++it) {
-		if (it->first.second != symbol_id) {
-			continue;
+	const TimeId block_day = time_day(time_id) - (time_day(time_id) % block_days);
+	const TimeId block_id = daily_bar_id(block_day);
+	const std::pair<TimeId, SymbolId> key(block_id, symbol_id);
+	std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.find(key);
+	if (it == index_.end()) {
+		return Status::Error(ErrorCode::NotFound, "staged bar was not found");
+	}
+	std::vector<ParsedStagingRecord> records;
+	Status status = load_page(it->second.segment_id, it->second.page_offset,
+		it->second.page_length, &records);
+	if (!status.ok()) {
+		return status;
+	}
+	if (it->second.record_index >= records.size()) {
+		return Status::Error(ErrorCode::CorruptData, "staging record index out of range");
+	}
+	const ParsedStagingRecord& record = records[it->second.record_index];
+	for (size_t i = 0; i < record.bars.size(); ++i) {
+		if (record.bars[i].time_id == time_id) {
+			*out = record.bars[i].bar;
+			return Status::Ok();
 		}
-		const TimeId block_start_day = time_day(it->first.first);
-		if (day < block_start_day || day >= block_start_day + block_days) {
-			continue;
-		}
-		std::vector<ParsedStagingRecord> records;
-		Status status = load_page(it->second.segment_id, it->second.page_offset,
-			it->second.page_length, &records);
-		if (!status.ok()) {
-			return status;
-		}
-		if (it->second.record_index >= records.size()) {
-			return Status::Error(ErrorCode::CorruptData, "staging record index out of range");
-		}
-		const ParsedStagingRecord& record = records[it->second.record_index];
-		for (size_t i = 0; i < record.bars.size(); ++i) {
-			if (record.bars[i].time_id == time_id) {
-				*out = record.bars[i].bar;
-				return Status::Ok();
-			}
-		}
-		break;
 	}
 	return Status::Error(ErrorCode::NotFound, "staged bar was not found");
 }
@@ -1380,23 +1380,46 @@ Status StagingStore::range(const std::vector<SymbolId>& symbol_ids,
 	}
 	std::set<SymbolId> requested(symbol_ids.begin(), symbol_ids.end());
 	out->clear();
-	// Walk the index in order. For each matching record, load its page and
-	// collect bars that fall within the requested range.
-	std::set<std::pair<uint32_t, uint64_t> > visited_pages;
-	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
-		 it != index_.end(); ++it) {
-		if (requested.find(it->first.second) == requested.end()) {
+	// For each requested symbol, use the secondary symbol index to binary-search
+	// the first block that could overlap [begin, end], then walk forward until
+	// the block start passes end. This avoids scanning unrelated symbols.
+	const TimeId block_days = frequency_ == Frequency::Daily ?
+		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	const TimeId begin_block_day = time_day(begin) - (time_day(begin) % block_days);
+	const TimeId begin_block_id = daily_bar_id(begin_block_day);
+	const TimeId end_day = time_day(end);
+	std::set<std::pair<uint32_t, uint64_t>> visited_pages;
+	for (std::set<SymbolId>::const_iterator s = requested.begin();
+		 s != requested.end(); ++s) {
+		std::map<SymbolId, std::set<TimeId>>::const_iterator symbol_it =
+			symbol_blocks_.find(*s);
+		if (symbol_it == symbol_blocks_.end()) {
 			continue;
 		}
-		const std::pair<uint32_t, uint64_t> page_key(it->second.segment_id, it->second.page_offset);
-		std::vector<ParsedStagingRecord> records;
-		Status status = load_page(it->second.segment_id, it->second.page_offset,
-			it->second.page_length, &records);
-		if (!status.ok()) {
-			return status;
-		}
-		// Only scan the page once even if multiple index entries point at it.
-		if (visited_pages.insert(page_key).second) {
+		const std::set<TimeId>& blocks = symbol_it->second;
+		for (std::set<TimeId>::const_iterator block_it =
+			 blocks.lower_bound(begin_block_id);
+			 block_it != blocks.end(); ++block_it) {
+			if (time_day(*block_it) > end_day) {
+				break;
+			}
+			const std::pair<TimeId, SymbolId> key(*block_it, *s);
+			std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator idx_it =
+				index_.find(key);
+			if (idx_it == index_.end()) {
+				continue;
+			}
+			const std::pair<uint32_t, uint64_t> page_key(
+				idx_it->second.segment_id, idx_it->second.page_offset);
+			if (!visited_pages.insert(page_key).second) {
+				continue;
+			}
+			std::vector<ParsedStagingRecord> records;
+			Status status = load_page(idx_it->second.segment_id,
+				idx_it->second.page_offset, idx_it->second.page_length, &records);
+			if (!status.ok()) {
+				return status;
+			}
 			for (size_t r = 0; r < records.size(); ++r) {
 				for (size_t i = 0; i < records[r].bars.size(); ++i) {
 					const ActiveBar& bar = records[r].bars[i];
@@ -1414,10 +1437,8 @@ Status StagingStore::range(const std::vector<SymbolId>& symbol_ids,
 
 Status StagingStore::latest_time(SymbolId symbol_id, TimeId *out) const
 {
-	// The staging index is ordered by (time_block_id, symbol_id). Walk in
-	// reverse to find the last block that contains data for this symbol, then
-	// load its page and scan for the maximum time_id. Since the index alone
-	// is always resident, only one page load is needed in the common case.
+	// Use the symbol secondary index to find the latest block in O(log n),
+	// then load that single page and scan for the maximum time_id.
 	if (!status_.ok())
 	{
 		return status_;
@@ -1426,13 +1447,27 @@ Status StagingStore::latest_time(SymbolId symbol_id, TimeId *out) const
 	{
 		return Status::Error(ErrorCode::InvalidArgument, "invalid latest_time arguments");
 	}
-	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_reverse_iterator it =
-		 index_.rbegin(); it != index_.rend(); ++it)
+	std::map<SymbolId, std::set<TimeId>>::const_iterator symbol_it =
+		symbol_blocks_.find(symbol_id);
+	if (symbol_it == symbol_blocks_.end() || symbol_it->second.empty())
 	{
-		if (it->first.second != symbol_id) continue;
+		return Status::Error(ErrorCode::NotFound, "no staging history for symbol");
+	}
+	// Walk blocks from newest to oldest until we find one with bar data.
+	// The newest block normally has data, so only one page load is needed.
+	for (std::set<TimeId>::const_reverse_iterator block_it = symbol_it->second.rbegin();
+		 block_it != symbol_it->second.rend(); ++block_it)
+	{
+		const std::pair<TimeId, SymbolId> key(*block_it, symbol_id);
+		std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator idx_it =
+			index_.find(key);
+		if (idx_it == index_.end())
+		{
+			continue;
+		}
 		std::vector<ParsedStagingRecord> records;
-		Status status = load_page(it->second.segment_id, it->second.page_offset,
-			it->second.page_length, &records);
+		Status status = load_page(idx_it->second.segment_id, idx_it->second.page_offset,
+			idx_it->second.page_length, &records);
 		if (!status.ok())
 		{
 			return status;

@@ -342,9 +342,12 @@ Status Calendar::block_offset(Frequency frequency,
 	}
 
 	HourSlot requested_slot = 0;
-	status = hour_slot(value, &requested_slot);
-	if (!status.ok()) {
-		return status;
+	bool has_time = value.size() > 8;
+	if (has_time)	// else: no hourly part, just use slot=0
+	{
+		status = hour_slot(value, &requested_slot);
+		if (!status.ok())
+			return status;
 	}
 	std::vector<HourSlot> date_slots;
 	BlockOff compact_offset = 0;
@@ -360,6 +363,11 @@ Status Calendar::block_offset(Frequency frequency,
 			return status;
 		}
 		if (offset == day_offset) {
+			if (!has_time)
+			{
+				*block_offset = compact_offset;
+				return Status::Ok();
+			}
 			std::vector<HourSlot>::const_iterator found =
 				std::find(date_slots.begin(), date_slots.end(), requested_slot);
 			if (found == date_slots.end()) {

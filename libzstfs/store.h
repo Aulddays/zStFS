@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -161,6 +162,7 @@ public:
 	// frame for blocks[i]; otherwise the frame is encoded from positions.
 	Status accept(const std::vector<StockTimeBlock>& blocks,
 	              const std::vector<std::vector<uint8_t> >* frame_bytes = NULL);
+	// Check whether the *block* that would contain the data exists
 	bool contains(SymbolId symbol_id, TimeId time_id) const;
 	Status get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const;
 	Status range(const std::vector<SymbolId>& symbol_ids,
@@ -212,6 +214,8 @@ private:
 	uint32_t next_page_id_;
 	uint32_t current_segment_id_;
 	std::map<std::pair<TimeId, SymbolId>, Locator> index_;
+	// Secondary in-memory index: symbol_id -> set of time_block_ids.
+	std::map<SymbolId, std::set<TimeId>> symbol_blocks_;
 };
 
 // VaultStore holds compacted immutable blocks ordered by symbol history. Its
