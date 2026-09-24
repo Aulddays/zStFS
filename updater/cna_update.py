@@ -23,6 +23,12 @@ def main(argv):
     # # print(symbols[:10])
     # symbols = [{'code': 'sh600004', 'name': '白云机场', 'list_date': '20030428'}]
     cna_updatedata_daily(symbols)
+    
+    symbols = cna_etf_list()
+    common.put_symbols(symbols, "cna")
+    # print(symbols[0])
+    cna_updatedata_daily(symbols)
+    
     return 0
 
 # newest market open date for cna 
@@ -195,6 +201,41 @@ def cna_stock_list():
         return marketorder[code[:2]], code
     records = sorted(data.values(), key=lambda x:corder(x["code"]))
     logging.info(f"CNA stocks {len(records)}")
+    return records
+
+
+def cna_etf_list():
+    records = []
+    logging.info("Fetching ETF list...")
+    df = common.safe_call(akshare.fund_etf_category_sina, symbol="ETF基金")
+    if df is None:
+        logging.warning("fund_etf_category_sina failed")
+        return None
+    for _, row in df.iterrows():
+        code, exchange, __ = common.cna_code(str(row["代码"]))
+        records.append({
+            "code": code,
+            "name": common.cna_fixname(row["名称"]),
+            "security_type": "etf",
+            "exchange": exchange,
+        })
+    logging.info(f"CNA ETFs: {len(df)}")
+    logging.info("Fetching LOF list...")
+    df = common.safe_call(akshare.fund_etf_category_sina, symbol="LOF基金")
+    if df is None:
+        logging.warning("fund_etf_category_sina failed")
+        return []
+    records = []
+    for _, row in df.iterrows():
+        code, exchange, __ = common.cna_code(str(row["代码"]))
+        records.append({
+            "code": code,
+            "name": row["名称"],
+            "security_type": "lof",
+            "exchange": exchange,
+        })
+    logging.info(f"CNA LOFs: {len(df)}")
+    records.sort(key=lambda x: x["code"])
     return records
 
 
