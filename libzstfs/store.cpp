@@ -593,6 +593,67 @@ Status ActiveStore::collect_before(TimeId time_id,
 	return Status::Ok();
 }
 
+Status ActiveStore::seal_foreach(TimeId time_id,
+				 const std::function<Status(const StockTimeBlock&)> &callback)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (!replay_status_.ok())
+		return replay_status_;
+	Status status = flush_locked();
+	if (!status.ok())
+		return status;
+	const TimeId cutoff_day = time_day(time_id);
+	const TimeId block_days = frequency_ == Frequency::Daily ?
+		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	bool any = false;
+	for (std::map<TimeId, ActiveTimeBlock>::const_iterator block = blocks_.begin();
+	     block != blocks_.end(); ++block)
+	{
+		if (time_day(block->first) + block_days > cutoff_day)
+			continue;
+		for (std::map<SymbolId, ActiveStockBlock>::const_iterator stock =
+		     block->second.stocks.begin(); stock != block->second.stocks.end(); ++stock)
+		{
+			StockTimeBlock completed = {};
+			completed.key.symbol_id = stock->first;
+			completed.key.time_block_id = block->first;
+			completed.positions = stock->second.positions;
+			for (size_t i = 0; i < stock->second.present.size(); ++i)
+			{
+				if (!stock->second.present[i])
+					continue;
+				const TimeId day = time_day(stock->second.time_ids[i]);
+				const TimeId day_offset = day - time_day(block->first);
+				if (day_offset < 64)
+					completed.day_presence |= static_cast<uint64_t>(1) << day_offset;
+			}
+			status = callback(completed);
+			if (!status.ok())
+				return status;
+			any = true;
+		}
+	}
+	(void)any;
+	return Status::Ok();
+}
+
+bool ActiveStore::has_sealable_blocks(TimeId time_id) const
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (!replay_status_.ok())
+		return false;
+	const TimeId cutoff_day = time_day(time_id);
+	const TimeId block_days = frequency_ == Frequency::Daily ?
+		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	for (std::map<TimeId, ActiveTimeBlock>::const_iterator block = blocks_.begin();
+	     block != blocks_.end(); ++block)
+	{
+		if (time_day(block->first) + block_days <= cutoff_day && !block->second.stocks.empty())
+			return true;
+	}
+	return false;
+}
+
 Status ActiveStore::remove_before(TimeId time_id) {
 	// This ownership commit must be synchronized with writes and timer flushes.
 	std::lock_guard<std::mutex> lock(mutex_);
@@ -1010,7 +1071,9 @@ StagingStore::StagingStore(Frequency frequency,
 	  runtime_market_id_(runtime_market_id),
 	  status_(Status::Ok()),
 	  next_page_id_(1),
-	  current_segment_id_(1) {
+	  current_segment_id_(1),
+	  accept_stream_(NULL)
+{
 	status_ = load();
 }
 
@@ -1315,6 +1378,180 @@ Status StagingStore::accept(const std::vector<StockTimeBlock>& blocks,
 		}
 		return write_index();
 	}
+
+// Streaming accept state. Holds the current in-progress page of pending
+// records and the locators of already-flushed pages. Index updates are
+// deferred to accept_commit() so a mid-stream failure leaves the in-memory
+// index untouched.
+struct StagingStore::AcceptStream
+{
+	std::vector<PendingStagingRecord> page_records;
+	std::set<std::pair<TimeId, SymbolId>> seen_keys;
+	bool has_data;
+	// Locators for pages already written to disk, keyed by (time_block_id, symbol_id).
+	// Committed to index_ and symbol_blocks_ atomically in accept_commit().
+	std::map<std::pair<TimeId, SymbolId>, Locator> pending_locators;
+	std::map<SymbolId, std::set<TimeId>> pending_symbol_blocks;
+};
+
+Status StagingStore::accept_begin()
+{
+	if (!status_.ok())
+		return status_;
+	if (accept_stream_ != NULL)
+		return Status::Error(ErrorCode::InvalidArgument, "staging accept already in progress");
+	accept_stream_ = new AcceptStream();
+	accept_stream_->has_data = false;
+	return Status::Ok();
+}
+
+Status StagingStore::accept_add_block(const StockTimeBlock &block)
+{
+	if (!status_.ok())
+		return status_;
+	if (accept_stream_ == NULL)
+		return Status::Error(ErrorCode::InvalidArgument, "staging accept not in progress");
+
+	const std::pair<TimeId, SymbolId> key(block.key.time_block_id, block.key.symbol_id);
+	if (!accept_stream_->seen_keys.insert(key).second)
+		return Status::Error(ErrorCode::Conflict, "duplicate block in staging batch");
+	if (index_.find(key) != index_.end())
+		return Status::Ok();
+
+	PendingStagingRecord record;
+	Status status = MakePendingStagingRecord(calendar_, frequency_, block, NULL, &record);
+	if (!status.ok())
+		return status;
+	accept_stream_->page_records.push_back(record);
+	accept_stream_->has_data = true;
+
+	// Flush when the in-progress page reaches the target size.
+	std::vector<uint8_t> page_bytes;
+	status = SerializeStagingPage(next_page_id_, frequency_,
+		accept_stream_->page_records, &page_bytes);
+	if (!status.ok())
+		return status;
+	if (page_bytes.size() >= kStagingPageTargetBytes)
+	{
+		status = flush_pending_page();
+		if (!status.ok())
+			return status;
+		accept_stream_->page_records.clear();
+	}
+	return Status::Ok();
+}
+
+Status StagingStore::accept_commit()
+{
+	if (!status_.ok())
+		return status_;
+	if (accept_stream_ == NULL)
+		return Status::Error(ErrorCode::InvalidArgument, "staging accept not in progress");
+
+	Status status = Status::Ok();
+	if (!accept_stream_->page_records.empty())
+	{
+		status = flush_pending_page();
+		if (!status.ok())
+		{
+			// Pages already flushed to disk are orphaned (not in the
+			// persistent index). This is a space leak, not a correctness
+			// issue — but we abort here because the caller should know.
+			PELOG_LOG((PLV_ERROR, "staging accept_commit: flush failed: %s\n",
+				status.message().c_str()));
+			delete accept_stream_;
+			accept_stream_ = NULL;
+			std::abort();
+		}
+	}
+	bool had_data = accept_stream_->has_data;
+	if (had_data)
+	{
+		// Commit all accumulated locators to the in-memory index atomically.
+		for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it =
+		     accept_stream_->pending_locators.begin();
+		     it != accept_stream_->pending_locators.end(); ++it)
+		{
+			index_[it->first] = it->second;
+		}
+		for (std::map<SymbolId, std::set<TimeId>>::const_iterator it =
+		     accept_stream_->pending_symbol_blocks.begin();
+		     it != accept_stream_->pending_symbol_blocks.end(); ++it)
+		{
+			symbol_blocks_[it->first].insert(it->second.begin(), it->second.end());
+		}
+	}
+	delete accept_stream_;
+	accept_stream_ = NULL;
+	if (had_data)
+		return write_index();
+	return Status::Ok();
+}
+
+// Flush the current in-progress page from accept_stream_ to disk and
+// register its locators in the in-memory index. The page records are
+// sorted before serialization to match the on-disk (time_block_id,
+// symbol_id) ordering that ParseStagingPage expects.
+Status StagingStore::flush_pending_page()
+{
+	if (accept_stream_ == NULL || accept_stream_->page_records.empty())
+		return Status::Ok();
+
+	std::vector<PendingStagingRecord> &page_records = accept_stream_->page_records;
+	// Ensure records are in (time_block_id, symbol_id) order so the page
+	// directory matches the on-disk layout used by ParseStagingPage.
+	std::sort(page_records.begin(), page_records.end(), PendingStagingOrder);
+
+	std::vector<uint8_t> page_bytes;
+	Status status = SerializeStagingPage(next_page_id_, frequency_, page_records, &page_bytes);
+	if (!status.ok())
+		return status;
+
+	const std::string segment_path = StagingSegmentPath(path_, current_segment_id_);
+	struct stat information;
+	uint64_t offset = 0;
+	if (stat(segment_path.c_str(), &information) == 0)
+	{
+		offset = static_cast<uint64_t>(information.st_size);
+		if (offset >= kStagingSegmentTargetBytes)
+		{
+			++current_segment_id_;
+			offset = 0;
+		}
+	}
+	else if (errno != ENOENT)
+		return Status::Error(ErrorCode::IoError, "cannot inspect staging segment");
+	const std::string output_path = StagingSegmentPath(path_, current_segment_id_);
+	FILE *fp = std::fopen(output_path.c_str(), "ab");
+	if (fp == NULL)
+		return Status::Error(ErrorCode::IoError, "cannot append staging page");
+	size_t written = std::fwrite(page_bytes.data(), 1, page_bytes.size(), fp);
+	std::fclose(fp);
+	if (written != page_bytes.size())
+		return Status::Error(ErrorCode::IoError, "cannot write staging page");
+
+	// Verify by parsing back the page we just wrote.
+	std::vector<ParsedStagingRecord> parsed;
+	uint32_t parsed_page_id = 0;
+	status = ParseStagingPage(calendar_, frequency_, page_bytes, &parsed, &parsed_page_id);
+	if (!status.ok() || parsed.size() != page_records.size())
+	{
+		return !status.ok() ? status : Status::Error(ErrorCode::CorruptData,
+			"staging page record count changed");
+	}
+	for (size_t record = 0; record < page_records.size(); ++record)
+	{
+		const std::pair<TimeId, SymbolId> key(page_records[record].block.key.time_block_id,
+			page_records[record].block.key.symbol_id);
+		Locator locator = {current_segment_id_, offset,
+			static_cast<uint32_t>(page_bytes.size()), static_cast<uint32_t>(record)};
+		accept_stream_->pending_locators[key] = locator;
+		accept_stream_->pending_symbol_blocks[page_records[record].block.key.symbol_id].insert(
+			page_records[record].block.key.time_block_id);
+	}
+	++next_page_id_;
+	return Status::Ok();
+}
 
 // Check whether the *block* that would contain the data exists
 bool StagingStore::contains(SymbolId symbol_id, TimeId time_id) const {

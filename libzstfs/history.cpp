@@ -15,7 +15,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
+#include <malloc.h>
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
@@ -564,14 +566,8 @@ Status History::seal_before(const std::string &time)
 	if (!status.ok())
 		return status;
 
-	// Collect what we're about to seal first; if there's nothing to do, skip
-	// the marker entirely so no recovery state is created for a no-op.
-	std::vector<StockTimeBlock> sealed;
-	std::vector<ActiveBar> sealed_bars;
-	status = active_->collect_before(time_id, &sealed, &sealed_bars);
-	if (!status.ok())
-		return status;
-	if (sealed.empty())
+	// Quick check: if there's nothing to seal, skip the marker entirely.
+	if (!active_->has_sealable_blocks(time_id))
 		return Status::Ok();
 
 	// Atomically create the seal transaction marker. After this point, a crash
@@ -580,15 +576,42 @@ Status History::seal_before(const std::string &time)
 	if (!status.ok())
 		return status;
 
-	status = staging_->accept(sealed);
+	// Stream blocks from ActiveStore directly into StagingStore. The callback
+	// is invoked for each sealed block while ActiveStore's mutex is held, so
+	// only one block's positions are copied at a time — memory overhead stays
+	// roughly equal to one page of encoded records instead of the full batch.
+	status = staging_->accept_begin();
 	if (!status.ok())
 	{
-		// Staging failed before any durable change took effect (accept either
-		// fully commits via index swap or leaves no index-visible data).
-		// Clean up the marker and report the error.
 		RemoveSealMarker(frequency_path_);
 		return status;
 	}
+	size_t sealed_count = 0;
+	status = active_->seal_foreach(time_id,
+		[&](const StockTimeBlock &block) -> Status
+		{
+			Status s = staging_->accept_add_block(block);
+			if (!s.ok())
+			{
+				// Streaming accept failure means either an I/O error or a
+				// data corruption error. The in-memory index is untouched
+				// (pending locators are not committed yet), but some pages
+				// may already be on disk as orphans. This is fatal — log
+				// and abort rather than leave the store in an inconsistent
+				// partially-sealed state.
+				PELOG_LOG((PLV_ERROR, "seal accept_add_block failed: %s\n",
+					s.message().c_str()));
+				std::abort();
+			}
+			++sealed_count;
+			return Status::Ok();
+		});
+	if (!status.ok())
+		return status;
+	status = staging_->accept_commit();
+	if (!status.ok())
+		return status;
+	PELOG_LOG((PLV_INFO, "seal accept: blocks=%zu\n", sealed_count));
 	status = active_->remove_before(time_id);
 	if (!status.ok())
 	{
@@ -597,7 +620,12 @@ Status History::seal_before(const std::string &time)
 		return status;
 	}
 	// Seal is fully committed. Remove the transaction marker.
-	return RemoveSealMarker(frequency_path_);
+	status = RemoveSealMarker(frequency_path_);
+	if (!status.ok())
+		return status;
+	// Force release freed memory back to the OS.
+	malloc_trim(128 * 1024);
+	return Status::Ok();
 }
 
 // =============================================================================

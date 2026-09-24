@@ -122,6 +122,16 @@ public:
 	Status collect_before(TimeId time_id,
 	                      std::vector<StockTimeBlock>* sealed,
 	                      std::vector<ActiveBar>* sealed_bars);
+	// Streams sealed blocks one at a time to the given callback. Holds the
+	// ActiveStore mutex for the entire duration, so the callback must not
+	// re-enter ActiveStore. Each callback invocation receives a temporary
+	// StockTimeBlock whose positions reference a single stock-block only;
+	// the callback must not retain the reference after returning.
+	Status seal_foreach(TimeId time_id,
+	                    const std::function<Status(const StockTimeBlock &)> &callback);
+	// Returns true if there is at least one complete block before time_id
+	// that would be sealed.
+	bool has_sealable_blocks(TimeId time_id) const;
 	Status remove_before(TimeId time_id);
 	Status replay_status() const;
 
@@ -162,6 +172,13 @@ public:
 	// frame for blocks[i]; otherwise the frame is encoded from positions.
 	Status accept(const std::vector<StockTimeBlock>& blocks,
 	              const std::vector<std::vector<uint8_t> >* frame_bytes = NULL);
+	// Streaming accept: begin adds no data, add_block ingests one block
+	// (flushing a page whenever the size target is reached), and commit
+	// writes the final page plus the index. Memory overhead is roughly one
+	// in-progress page worth of encoded records instead of the full batch.
+	Status accept_begin();
+	Status accept_add_block(const StockTimeBlock &block);
+	Status accept_commit();
 	// Check whether the *block* that would contain the data exists
 	bool contains(SymbolId symbol_id, TimeId time_id) const;
 	Status get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const;
@@ -195,7 +212,12 @@ private:
 		uint32_t record_index;
 	};
 
+	struct AcceptStream;  // opaque streaming accept state (defined in store.cpp)
+
 	Status load();
+	// Flush the current in-progress page from accept_stream_ to disk and
+	// register its locators in the in-memory index.
+	Status flush_pending_page();
 	Status write_index() const;
 	// Loads raw page bytes from the compressed cache or disk. Does not
 	// decode page content.
@@ -216,6 +238,7 @@ private:
 	std::map<std::pair<TimeId, SymbolId>, Locator> index_;
 	// Secondary in-memory index: symbol_id -> set of time_block_ids.
 	std::map<SymbolId, std::set<TimeId>> symbol_blocks_;
+	AcceptStream *accept_stream_;
 };
 
 // VaultStore holds compacted immutable blocks ordered by symbol history. Its
