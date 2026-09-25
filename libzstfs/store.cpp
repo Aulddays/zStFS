@@ -200,66 +200,114 @@ ActiveStore::ActiveStore(Frequency frequency,
 		flush_interval_milliseconds),
 	  dirty_bytes_(0),
 	  stop_flush_timer_(false) {
-	std::ifstream input(path_.c_str(), std::ios::binary);
-	if (!input) {
+	FILE *fp = fopen(path_.c_str(), "rb");
+	if (fp == NULL)
+	{
 		flush_timer_ = std::thread(&ActiveStore::run_flush_timer, this);
 		return;
 	}
-	std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)),
-					   std::istreambuf_iterator<char>());
-	const size_t complete_bytes = bytes.size() - bytes.size() % kActiveRecordBytes;
-	if (complete_bytes != bytes.size()) {
-		// A partial append has no record semantics. Remove it before a future
-		// flush so the next complete record cannot be appended after bad bytes.
-		input.close();
-		std::ofstream repaired(path_.c_str(), std::ios::binary | std::ios::trunc);
-		if (!repaired) {
+	fseek(fp, 0, SEEK_END);
+	long file_size = ftell(fp);
+	rewind(fp);
+	if (file_size < 0)
+	{
+		fclose(fp);
+		replay_status_ = Status::Error(ErrorCode::IoError, "cannot read active log size");
+		return;
+	}
+	const size_t complete_bytes =
+		static_cast<size_t>(file_size) - static_cast<size_t>(file_size) % kActiveRecordBytes;
+
+	// If a partial record is present at the tail, truncate it away before
+	// replaying. A half-written record has no valid semantics and would cause
+	// the next flush to append after corrupt bytes.
+	if (complete_bytes != static_cast<size_t>(file_size))
+	{
+		std::vector<uint8_t> prefix(complete_bytes);
+		if (complete_bytes > 0 &&
+			fread(prefix.data(), 1, complete_bytes, fp) != complete_bytes)
+		{
+			fclose(fp);
+			replay_status_ = Status::Error(ErrorCode::IoError, "cannot read active log prefix");
+			return;
+		}
+		fclose(fp);
+		fp = fopen(path_.c_str(), "wb");
+		if (fp == NULL)
+		{
 			replay_status_ = Status::Error(ErrorCode::IoError,
 				"cannot repair truncated active log");
 			return;
 		}
-		if (complete_bytes > 0) {
-			repaired.write(reinterpret_cast<const char*>(&bytes[0]), complete_bytes);
-		}
-		repaired.flush();
-		if (!repaired) {
+		if (complete_bytes > 0 &&
+			fwrite(prefix.data(), 1, complete_bytes, fp) != complete_bytes)
+		{
+			fclose(fp);
 			replay_status_ = Status::Error(ErrorCode::IoError,
 				"cannot finish active log repair");
 			return;
 		}
+		fflush(fp);
+		fclose(fp);
+		// Reopen for streaming replay below.
+		fp = fopen(path_.c_str(), "rb");
+		if (fp == NULL)
+		{
+			replay_status_ = Status::Error(ErrorCode::IoError,
+				"cannot reopen active log after repair");
+			return;
+		}
 	}
-	for (size_t offset = 0; offset < complete_bytes; offset += kActiveRecordBytes) {
-		ActiveRecord record;
-		replay_status_ = ParseActiveRecord(bytes, offset, &record);
-		if (!replay_status_.ok()) {
+	// Stream records in chunks. Avoids loading the entire log into a single
+	// buffer, which cuts peak RSS roughly by the file size (600+ MB for a
+	// full daily market).
+	const size_t kBufRecords = 4096;
+	std::vector<uint8_t> buf(kBufRecords * kActiveRecordBytes);
+	size_t remaining = complete_bytes;
+	while (remaining > 0)
+	{
+		size_t to_read = remaining < buf.size() ? remaining : buf.size();
+		size_t got = fread(buf.data(), 1, to_read, fp);
+		if (got != to_read)
+		{
+			fclose(fp);
+			replay_status_ = Status::Error(ErrorCode::IoError, "short read of active log");
 			return;
 		}
-		if (record.frequency != frequency_) {
-			continue;
-		}
-		std::string local_time;
-		replay_status_ = LocalTime(calendar_, frequency_, record.time_id, &local_time);
-		if (!replay_status_.ok()) {
-			return;
-		}
-		TimeId time_id = 0;
-		TimeId block_id = 0;
-		BlockOff block_offset = 0;
-		replay_status_ = ResolveTime(calendar_, frequency_, local_time,
-							 &time_id, &block_id, &block_offset);
-		if (!replay_status_.ok() || time_id != record.time_id) {
-			if (replay_status_.ok()) {
-				replay_status_ = Status::Error(ErrorCode::CorruptData,
-					"active record does not map to its stored time");
+		size_t count = got / kActiveRecordBytes;
+		for (size_t i = 0; i < count; ++i)
+		{
+			ActiveRecord record;
+			replay_status_ = ParseActiveRecord(buf, i * kActiveRecordBytes, &record);
+			if (!replay_status_.ok())
+			{
+				fclose(fp);
+				return;
 			}
-			return;
+			if (record.frequency != frequency_)
+			{
+				continue;
+			}
+			TimeId block_id = 0;
+			BlockOff block_offset = 0;
+			replay_status_ = calendar_.block_offset(frequency_, record.time_id,
+													&block_id, &block_offset);
+			if (!replay_status_.ok())
+			{
+				fclose(fp);
+				return;
+			}
+			replay_status_ = put(record.symbol_id, record.time_id, block_id, block_offset,
+								 record.bar, true);
+			if (!replay_status_.ok())
+			{
+				fclose(fp);
+				return;
+			}
 		}
-		replay_status_ = put(record.symbol_id, time_id, block_id, block_offset,
-							 record.bar, true);
-		if (!replay_status_.ok()) {
-			return;
-		}
+		remaining -= got;
 	}
+	fclose(fp);
 	flush_timer_ = std::thread(&ActiveStore::run_flush_timer, this);
 }
 

@@ -97,18 +97,14 @@ int main() {
 	assert(calendar.block_length(zstfs::Frequency::Hourly, 0, &block_length).ok());
 	assert(block_length == 256);
 
-	assert(calendar.set_closed("19000102").ok());
-	assert(calendar.slots("19000102", &slots).ok());
-	assert(slots.empty());
-	assert(calendar.block_length(zstfs::Frequency::Hourly, 0, &block_length).ok());
-	assert(block_length == 252);
-
+	// Closed days are represented by missing bars, not by slot table overrides.
+	// Verify save/load preserves the market type.
 	const std::string calendar_path = "/tmp/zstfs-calendar-test.bin";
 	assert(calendar.save(calendar_path).ok());
 	zstfs::Calendar restored_calendar("CNA");
 	assert(restored_calendar.load(calendar_path).ok());
-	assert(restored_calendar.slots("19000102", &slots).ok());
-	assert(slots.empty());
+	assert(restored_calendar.slots("19000101", &slots).ok());
+	assert(slots.size() == 4);
 
 	assert(zstfs::register_market_type("custom", CustomSlots).ok());
 	zstfs::Calendar custom("custom");

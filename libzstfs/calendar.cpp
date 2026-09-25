@@ -306,12 +306,6 @@ Status Calendar::slots(const std::string& value,
 	if (!status.ok()) {
 		return status;
 	}
-	std::map<std::string, std::vector<HourSlot> >::const_iterator override_found =
-		override_slots_.find(value);
-	if (override_found != override_slots_.end()) {
-		*out = override_found->second;
-		return Status::Ok();
-	}
 	return GetSlots(market_type_, value, out);
 }
 
@@ -319,60 +313,153 @@ Status Calendar::slots(const std::string& value,
 // days and shorter slot layouts therefore consume no artificial 256-slot space.
 Status Calendar::block_offset(Frequency frequency,
                                 const std::string& value,
-                                TimeId* block_id,
-                                BlockOff* block_offset) const {
-	if (block_id == NULL || block_offset == NULL) {
+                                TimeId *out_block_id,
+                                BlockOff *out_block_offset) const
+{
+	if (out_block_id == NULL || out_block_offset == NULL)
+		return Status::Error(ErrorCode::InvalidArgument, "block outputs are required");
+	// Convert the string to a TimeId, then delegate to the TimeId overload.
+	// This keeps all block-positioning logic in a single place.
+	if (frequency == Frequency::Daily)
+	{
+		TimeId tid = 0;
+		Status status = time_id(value, &tid);
+		if (!status.ok())
+			return status;
+		return block_offset(frequency, tid, out_block_id, out_block_offset);
+	}
+	// Hourly: parse date + optional time portion, then build a TimeId.
+	std::string date_value = value.substr(0, 8);
+	TimeId day_tid = 0;
+	Status status = time_id(date_value, &day_tid);
+	if (!status.ok())
+		return status;
+	HourSlot slot = 0;
+	if (value.size() > 8)
+	{
+		status = hour_slot(value, &slot);
+		if (!status.ok())
+			return status;
+	}
+	TimeId tid = hourly_bar_id(time_day(day_tid), slot);
+	return block_offset(frequency, tid, out_block_id, out_block_offset);
+}
+
+Status Calendar::block_offset(Frequency frequency,
+	TimeId time_id,
+	TimeId *block_id,
+	BlockOff *block_offset) const
+{
+	if (block_id == NULL || block_offset == NULL)
+	{
 		return Status::Error(ErrorCode::InvalidArgument, "block outputs are required");
 	}
-	std::string date_value = frequency == Frequency::Daily ? value : value.substr(0, 8);
-	TimeId value_day_time_id = 0;
-	Status status = time_id(date_value, &value_day_time_id);
-	if (!status.ok()) {
-		return status;
-	}
-	const TimeId day_number = time_day(value_day_time_id);
+	const TimeId day_number = time_day(time_id);
 	const TimeId block_day_length = frequency == Frequency::Daily
 		? kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
-	const BlockOff day_offset = day_number % block_day_length;
-	*block_id = value_day_time_id -
-		static_cast<TimeId>(day_offset) * kTimeIdDayStep;
-	if (frequency == Frequency::Daily) {
+	const BlockOff day_offset = static_cast<BlockOff>(day_number % block_day_length);
+	const TimeId block_day = day_number - day_offset;
+	*block_id = block_day * kTimeIdDayStep;
+
+	if (frequency == Frequency::Daily)
+	{
+		if (time_slot(time_id) != 0)
+		{
+			return Status::Error(ErrorCode::InvalidArgument,
+				"daily time_id has a non-zero slot");
+		}
 		*block_offset = day_offset;
 		return Status::Ok();
 	}
 
-	HourSlot requested_slot = 0;
-	bool has_time = value.size() > 8;
-	if (has_time)	// else: no hourly part, just use slot=0
+	// Hourly: compute the compact offset within the block.
+	const HourSlot slot = time_slot(time_id);
+	const TimeId target_day_id = daily_bar_id(time_day(time_id));
+	std::string block_start_date;
+	Status status = date(*block_id, &block_start_date);
+	if (!status.ok())
+		return status;
+	std::string target_date;
+	status = date(target_day_id, &target_date);
+	if (!status.ok())
+		return status;
+	std::vector<HourSlot> first_day_slots;
+	status = slots(block_start_date, &first_day_slots);
+	if (!status.ok())
+		return status;
+	std::vector<HourSlot> target_day_slots;
+	status = slots(target_date, &target_day_slots);
+	if (!status.ok())
+		return status;
+
+	// Fast path: if the first day and target day have the same slot count,
+	// the block has a uniform daily slot layout (no schedule change within
+	// the block). This is the common case since schedule changes are rare
+	// (years apart) and a block is only 64 trading days.
+	if (first_day_slots.size() == target_day_slots.size() && day_offset > 0)
 	{
-		status = hour_slot(value, &requested_slot);
-		if (!status.ok())
-			return status;
+		// Still need to verify slot validity and find its index in the day.
+		if (slot == 0)
+		{
+			*block_offset = static_cast<BlockOff>(
+				day_offset * first_day_slots.size());
+			return Status::Ok();
+		}
+		std::vector<HourSlot>::const_iterator found =
+			std::find(target_day_slots.begin(), target_day_slots.end(), slot);
+		if (found == target_day_slots.end())
+		{
+			return Status::Error(ErrorCode::NotFound,
+				"hour slot is outside the market slots");
+		}
+		*block_offset = static_cast<BlockOff>(
+			day_offset * first_day_slots.size() + (found - target_day_slots.begin()));
+		return Status::Ok();
 	}
+	if (day_offset == 0)
+	{
+		if (slot == 0)
+		{
+			*block_offset = 0;
+			return Status::Ok();
+		}
+		std::vector<HourSlot>::const_iterator found =
+			std::find(target_day_slots.begin(), target_day_slots.end(), slot);
+		if (found == target_day_slots.end())
+		{
+			return Status::Error(ErrorCode::NotFound,
+				"hour slot is outside the market slots");
+		}
+		*block_offset = static_cast<BlockOff>(found - target_day_slots.begin());
+		return Status::Ok();
+	}
+
+	// Slow path: the block crosses a schedule change. Sum slots day by day.
 	std::vector<HourSlot> date_slots;
 	BlockOff compact_offset = 0;
 	TimeId current_day_time_id = *block_id;
-	for (BlockOff offset = 0; offset <= day_offset; ++offset) {
+	for (BlockOff offset = 0; offset <= day_offset; ++offset)
+	{
 		std::string current_date;
 		status = date(current_day_time_id, &current_date);
-		if (!status.ok()) {
+		if (!status.ok())
 			return status;
-		}
 		status = slots(current_date, &date_slots);
-		if (!status.ok()) {
+		if (!status.ok())
 			return status;
-		}
-		if (offset == day_offset) {
-			if (!has_time)
+		if (offset == day_offset)
+		{
+			if (slot == 0)
 			{
 				*block_offset = compact_offset;
 				return Status::Ok();
 			}
 			std::vector<HourSlot>::const_iterator found =
-				std::find(date_slots.begin(), date_slots.end(), requested_slot);
-			if (found == date_slots.end()) {
+				std::find(date_slots.begin(), date_slots.end(), slot);
+			if (found == date_slots.end())
+			{
 				return Status::Error(ErrorCode::NotFound,
-				                     "hour slot is outside the market slots");
+					"hour slot is outside the market slots");
 			}
 			compact_offset += static_cast<BlockOff>(found - date_slots.begin());
 			*block_offset = compact_offset;
@@ -400,6 +487,32 @@ Status Calendar::block_length(Frequency frequency,
 		*out = block_day_length;
 		return Status::Ok();
 	}
+	// Fast path: compare first and last day of the block. If slot counts
+	// match, the whole block uses the same daily layout (no schedule change
+	// inside the 64-day block), so length is just days * slots_per_day.
+	std::string first_date;
+	Status status = date(block_id, &first_date);
+	if (!status.ok())
+		return status;
+	TimeId last_day_id = block_id + (block_day_length - 1) * kTimeIdDayStep;
+	std::string last_date;
+	status = date(last_day_id, &last_date);
+	if (!status.ok())
+		return status;
+	std::vector<HourSlot> first_slots;
+	status = slots(first_date, &first_slots);
+	if (!status.ok())
+		return status;
+	std::vector<HourSlot> last_slots;
+	status = slots(last_date, &last_slots);
+	if (!status.ok())
+		return status;
+	if (first_slots.size() == last_slots.size())
+	{
+		*out = static_cast<BlockOff>(block_day_length * first_slots.size());
+		return Status::Ok();
+	}
+	// Slow path: block crosses a schedule change, sum day by day.
 	BlockOff total = 0;
 	TimeId current_day_time_id = block_id;
 	for (BlockOff offset = 0; offset < block_day_length; ++offset) {
@@ -420,38 +533,15 @@ Status Calendar::block_length(Frequency frequency,
 	return Status::Ok();
 }
 
-Status Calendar::set_closed(const std::string& value) {
-	TimeId ignored_time_id = 0;
-	Status status = time_id(value, &ignored_time_id);
-	if (!status.ok()) {
-		return status;
-	}
-	override_slots_[value] = std::vector<HourSlot>();
-	return Status::Ok();
-}
-
-Status Calendar::set_slots(const std::string& value,
-                                   const std::vector<HourSlot>& slots) {
-	TimeId ignored_time_id = 0;
-	Status status = time_id(value, &ignored_time_id);
-	if (!status.ok()) {
-		return status;
-	}
-	if (!ValidSlots(slots)) {
-		return Status::Error(ErrorCode::InvalidArgument,
-		                     "invalid slot layout");
-	}
-	override_slots_[value] = slots;
-	return Status::Ok();
-}
-
 // Calendar load/save functions and helpers
 static const uint16_t kCalendarVersion = 1;
 
-// calendar.bin saves three sections:
+// calendar.bin saves two sections:
 //   1. format header: magic, version, reserved field;
-//   2. market type name; it selects, but does not store, the compiled default slots;
-//   3. date overrides: each date and its ordered HHM slot list.
+//   2. market type name; it selects the compiled slot rule function.
+// Slot layouts are determined by the market type's compiled rule, which may
+// vary by date range for historical schedule changes. There is no per-date
+// override table.
 Status Calendar::save(const std::string& file_path) const {
 	std::vector<uint8_t> data;
 	data.push_back('Z');
@@ -462,20 +552,6 @@ Status Calendar::save(const std::string& file_path) const {
 	PutU16(&data, 0);
 	if (!PutString(&data, market_type_)) {
 		return Status::Error(ErrorCode::InvalidArgument, "market type is too long");
-	}
-	PutU32(&data, static_cast<uint32_t>(override_slots_.size()));
-	for (std::map<std::string, std::vector<HourSlot> >::const_iterator it =
-		     override_slots_.begin(); it != override_slots_.end(); ++it) {
-		std::vector<uint8_t> record;
-		if (!PutString(&record, it->first) ||
-		    it->second.size() > std::numeric_limits<uint16_t>::max()) {
-			return Status::Error(ErrorCode::InvalidArgument,
-			                     "calendar record is too large");
-		}
-		PutU16(&record, static_cast<uint16_t>(it->second.size()));
-		record.insert(record.end(), it->second.begin(), it->second.end());
-		PutU32(&data, static_cast<uint32_t>(record.size()));
-		data.insert(data.end(), record.begin(), record.end());
 	}
 
 	std::ofstream output(file_path.c_str(), std::ios::binary | std::ios::trunc);
@@ -496,7 +572,7 @@ Status Calendar::load(const std::string& file_path) {
 	}
 	std::vector<uint8_t> data((std::istreambuf_iterator<char>(input)),
 	                          std::istreambuf_iterator<char>());
-	if (data.size() < 12 || data[0] != 'Z' || data[1] != 'C' ||
+	if (data.size() < 8 || data[0] != 'Z' || data[1] != 'C' ||
 	    data[2] != 'A' || data[3] != 'L') {
 		return Status::Error(ErrorCode::CorruptData, "invalid calendar file header");
 	}
@@ -504,48 +580,15 @@ Status Calendar::load(const std::string& file_path) {
 	uint16_t version = 0;
 	uint16_t reserved = 0;
 	std::string file_type;
-	uint32_t record_count = 0;
 	if (!GetU16(data, &offset, &version) || !GetU16(data, &offset, &reserved) ||
 	    !GetString(data, &offset, &file_type) ||
-	    !GetU32(data, &offset, &record_count) ||
 	    version != kCalendarVersion || file_type != market_type_) {
 		return Status::Error(ErrorCode::CorruptData,
 		                     "unsupported or mismatched calendar file");
 	}
-
-	std::map<std::string, std::vector<HourSlot> > loaded;
-	for (uint32_t index = 0; index < record_count; ++index) {
-		uint32_t record_size = 0;
-		if (!GetU32(data, &offset, &record_size) ||
-		    offset + record_size > data.size()) {
-			return Status::Error(ErrorCode::CorruptData,
-			                     "truncated calendar record");
-		}
-		std::vector<uint8_t> record(data.begin() + offset,
-		                            data.begin() + offset + record_size);
-		offset += record_size;
-		size_t record_offset = 0;
-		std::string date_value;
-		uint16_t slot_count = 0;
-		if (!GetString(record, &record_offset, &date_value) ||
-		    !GetU16(record, &record_offset, &slot_count) ||
-		    record_offset + slot_count != record.size()) {
-			return Status::Error(ErrorCode::CorruptData,
-			                     "invalid calendar record");
-		}
-		std::vector<HourSlot> slots(record.begin() + record_offset, record.end());
-		TimeId ignored_time_id = 0;
-		Status status = time_id(date_value, &ignored_time_id);
-		if (!status.ok() || !ValidSlots(slots) ||
-		    !loaded.insert(std::make_pair(date_value, slots)).second) {
-			return Status::Error(ErrorCode::CorruptData,
-			                     "invalid calendar date override");
-		}
-	}
 	if (offset != data.size()) {
 		return Status::Error(ErrorCode::CorruptData, "trailing calendar data");
 	}
-	override_slots_.swap(loaded);
 	return Status::Ok();
 }
 

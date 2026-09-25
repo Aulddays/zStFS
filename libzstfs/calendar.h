@@ -67,16 +67,11 @@ public:
 	                  HourSlot slot,
 	                  std::string* out) const;
 
-	// An explicit date override takes precedence over the market type's normal
-	// slots. An empty slot list means that the weekday is closed. The normal rule
-	// itself may select different layouts by date; once a layout applies to a past
-	// date, its rule must remain unchanged and later layouts are appended with a
-	// future effective date.
+	// Returns the market's intraday slot list for the given date. The market
+	// type rule determines the layout; it may vary by date range for historical
+	// schedule changes. Returns an empty vector when the market is closed that day.
 	Status slots(const std::string& date,
 	             std::vector<HourSlot>* out) const;
-	Status set_closed(const std::string& date);
-	Status set_slots(const std::string& date,
-	                 const std::vector<HourSlot>& slots);
 
 	// Each frequency uses its own fixed trading-day block length. The block ID
 	// identifies the block's first day; BlockOff identifies a location within its
@@ -86,18 +81,24 @@ public:
 	                    const std::string& local_time,
 	                    TimeId* block_id,
 	                    BlockOff* block_offset) const;
+	// Compute block coordinates directly from a TimeId without going through
+	// a local-time string. Same result as the string overload after a round
+	// trip through date()/time_id(), but avoids string allocation and parsing.
+	Status block_offset(Frequency frequency,
+		TimeId time_id,
+		TimeId *block_id,
+		BlockOff *block_offset) const;
 	Status block_length(Frequency frequency,
 	                    TimeId block_id,
 	                    BlockOff* out) const;
 
-	// Only date-specific overrides are persisted. Normal slots remain in the
-	// compiled market type, so the file does not contain a full date table.
+	// Persistence: only the market type name is stored; slot rules are compiled
+	// into the binary and looked up by name at load time.
 	Status load(const std::string& file_path);
 	Status save(const std::string& file_path) const;
 
 private:
 	std::string market_type_;
-	std::map<std::string, std::vector<HourSlot> > override_slots_;
 };
 
 // Implementations receive a validated weekday date and must replace `out` with
