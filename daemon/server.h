@@ -48,12 +48,17 @@ public:
 	void stop();
 	void submit(const HttpRequest& request);
 
+	// Blocks until Markets is fully constructed (data loaded)
+	zstfs::Status wait_ready();
+
 private:
 	void run();
 	HttpResponse handle(const HttpRequest& request);
 
 	DaemonConfig config_;
 	std::unique_ptr<zstfs::Markets> markets_;
+	zstfs::Status ready_status_;
+	bool ready_;
 	std::mutex mutex_;
 	std::condition_variable condition_;
 	std::queue<HttpRequest> requests_;

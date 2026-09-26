@@ -22,7 +22,9 @@ int main(int argc, char** argv)
 	if (!status.ok())
 		PELOG_ERROR_RETURN((PLV_ERROR, "Config error: %s\n", status.message().c_str()), -1);
 
+	PELOG_LOG((PLV_INFO, "zstfsd Starting\n"));
 	zstfsd::HttpServer server(config);
-	PELOG_LOG((PLV_INFO, "zstfsd listening on %s:%d\n", config.listen_addr.c_str(), (int)config.listen_port));
-	return server.run();
+	int ret = server.run();
+	PELOG_LOG((PLV_INFO, "zstfsd Finish\n"));
+	return ret;
 }

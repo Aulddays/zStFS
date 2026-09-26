@@ -980,7 +980,8 @@ private:
 }  // namespace
 
 RequestWorker::RequestWorker(const DaemonConfig& config)
-	: config_(config), stopping_(false) {}
+	: config_(config), ready_status_(zstfs::Status::Error(zstfs::ErrorCode::NotImplemented, "")),
+	  ready_(false), stopping_(false) {}
 
 RequestWorker::~RequestWorker() { stop(); }
 
@@ -996,6 +997,13 @@ void RequestWorker::stop() {
 	}
 	condition_.notify_all();
 	if (thread_.joinable()) thread_.join();
+}
+
+zstfs::Status RequestWorker::wait_ready()
+{
+	std::unique_lock<std::mutex> lock(mutex_);
+	condition_.wait(lock, [this]() { return ready_ || stopping_; });
+	return ready_status_;
 }
 
 void RequestWorker::submit(const HttpRequest& request) {
@@ -1015,7 +1023,19 @@ void RequestWorker::run() {
 			config_.compressed_cache_bytes > 0 ? config_.compressed_cache_bytes : zstfs::CompressedCacheBytes(),
 			config_.decoded_cache_bytes > 0 ? config_.decoded_cache_bytes : zstfs::DecodedCacheBytes());
 	}
+	PELOG_LOG((PLV_INFO, "loading markets data...\n"));
+	time_t t0 = time(NULL);
 	markets_.reset(new zstfs::Markets(config_.root_path, config_.markets));
+	time_t t1 = time(NULL);
+	zstfs::Status status = markets_->status();
+	PELOG_LOG((PLV_INFO, "markets data loaded in %ld s, status=%s\n",
+		(long)(t1 - t0), status.ok() ? "ok" : status.message().c_str()));
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		ready_status_ = status;
+		ready_ = true;
+	}
+	condition_.notify_all();
 	for (;;) {
 		HttpRequest request;
 		{
@@ -1062,12 +1082,24 @@ HttpResponse RequestWorker::handle(const HttpRequest &request)
 class HttpServer::Impl {
 public:
 	explicit Impl(const DaemonConfig& config)
-		: acceptor_(io_, asio::ip::tcp::endpoint(
-			asio::ip::make_address(config.listen_addr), config.listen_port)),
-		  worker_(config), stopped_(false) {}
+		: config_(config), worker_(config), stopped_(false) {}
 
 	int run() {
+		// Start the worker thread and wait for data loading to finish before
+		// opening the listening socket.
 		worker_.start();
+		zstfs::Status ready_status = worker_.wait_ready();
+		if (!ready_status.ok())
+		{
+			PELOG_LOG((PLV_ERROR, "markets failed to load: %s\n", ready_status.message().c_str()));
+			worker_.stop();
+			return 1;
+		}
+		// Construct the acceptor now — this opens and binds the listening socket.
+		acceptor_.reset(new asio::ip::tcp::acceptor(io_, asio::ip::tcp::endpoint(
+			asio::ip::make_address(config_.listen_addr), config_.listen_port)));
+		PELOG_LOG((PLV_INFO, "zstfsd listening on %s:%d\n",
+			config_.listen_addr.c_str(), (int)config_.listen_port));
 		accept();
 		signals_ = std::unique_ptr<asio::signal_set>(new asio::signal_set(io_, SIGINT, SIGTERM));
 		signals_->async_wait([this](const asio::error_code&, int) { stop(); });
@@ -1080,21 +1112,22 @@ public:
 		if (stopped_) return;
 		stopped_ = true;
 		asio::error_code ignored;
-		acceptor_.close(ignored);
+		if (acceptor_) acceptor_->close(ignored);
 		worker_.stop();
 		io_.stop();
 	}
 
 private:
 	void accept() {
-		acceptor_.async_accept([this](const asio::error_code& error, asio::ip::tcp::socket socket) {
+		acceptor_->async_accept([this](const asio::error_code& error, asio::ip::tcp::socket socket) {
 			if (!error) std::make_shared<Session>(std::move(socket), &io_, &worker_)->start();
 			if (!stopped_) accept();
 		});
 	}
 
+	DaemonConfig config_;
 	asio::io_context io_;
-	asio::ip::tcp::acceptor acceptor_;
+	std::unique_ptr<asio::ip::tcp::acceptor> acceptor_;
 	std::unique_ptr<asio::signal_set> signals_;
 	RequestWorker worker_;
 	bool stopped_;
