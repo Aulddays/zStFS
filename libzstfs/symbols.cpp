@@ -252,28 +252,11 @@ Status Symbols::upsert(const Symbol& symbol, SymbolId* out_id, bool* updated) {
 	if (existing_code != by_code_.end()) {
 		self_id = existing_code->second;
 	}
-	// For updates we also need to validate against the index with this symbol's
-	// old codes removed, since the primary code may be changing. Build a
-	// temporary candidate index for that check.
+	// Validate symbol fields against the live code index. self_id skips the
+	// symbol's own entries so updates do not collide with themselves.
 	Status validated = ValidateSymbolFields(symbol, self_id, by_code_);
-	if (!validated.ok() && self_id == kInvalidSymbolId) {
+	if (!validated.ok())
 		return validated;
-	}
-	if (self_id != kInvalidSymbolId) {
-		std::map<std::string, SymbolId> candidate_codes = by_code_;
-		for (std::map<std::string, SymbolId>::iterator it = candidate_codes.begin();
-		     it != candidate_codes.end();) {
-			if (it->second == self_id) {
-				candidate_codes.erase(it++);
-			} else {
-				++it;
-			}
-		}
-		Status revalidated = ValidateSymbolFields(symbol, self_id, candidate_codes);
-		if (!revalidated.ok()) {
-			return revalidated;
-		}
-	}
 	if (self_id == kInvalidSymbolId && next_id_ == kInvalidSymbolId) {
 		return Status::Error(ErrorCode::Conflict,
 		                     "symbol identifier space is exhausted");
