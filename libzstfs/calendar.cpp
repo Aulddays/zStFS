@@ -260,6 +260,38 @@ Status Calendar::date(TimeId value, std::string* out) const {
 	return Status::Ok();
 }
 
+Status Calendar::nearest_trading_day(const std::string &date_str,
+									std::string *out,
+									int max_days_back) const
+{
+	if (out == NULL || max_days_back < 0)
+	{
+		return Status::Error(ErrorCode::InvalidArgument,
+							"nearest_trading_day: invalid arguments");
+	}
+	DateParts date_parts;
+	if (!ParseDate(date_str, &date_parts))
+		return Status::Error(ErrorCode::InvalidArgument, "invalid input date");
+	int ordinal = DaysBeforeDate(date_parts);
+	for (int i = 0; i <= max_days_back; ++i, --ordinal)
+	{
+		if (ordinal < 0)
+			break;
+		if (IsWeekendOrdinal(ordinal))
+			continue;
+		DateParts parts = {};
+		if (!DateFromOrdinal(ordinal, &parts))
+			continue;
+		char buffer[9];
+		std::snprintf(buffer, sizeof(buffer), "%04d%02d%02d",
+		              parts.year, parts.month, parts.day);
+		*out = buffer;
+		return Status::Ok();
+	}
+	return Status::Error(ErrorCode::NotFound,
+	                     "no trading day found within the search range");
+}
+
 Status Calendar::hour_slot(const std::string& value, HourSlot* out) const {
 	std::string date_value;
 	int hour = 0;

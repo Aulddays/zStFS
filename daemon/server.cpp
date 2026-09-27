@@ -306,7 +306,8 @@ bool ParseBar(const json& object, zstfs::Bar* bar, std::string* error) {
 		if (!object["symbol_id"].is_number_unsigned())
 		{
 			*error = "symbol_id must be an unsigned integer";
-			return false;
+			PELOG_ERROR_RETURN((PLV_WARNING,
+				 "Invalid bar symbol_id: %s\n", object.dump().c_str()), false);
 		}
 		const uint64_t symbol_id = object["symbol_id"].get<uint64_t>();
 		if (symbol_id == 0 || symbol_id > 0xffffffffULL)
@@ -317,20 +318,26 @@ bool ParseBar(const json& object, zstfs::Bar* bar, std::string* error) {
 		bar->symbol_id = static_cast<zstfs::SymbolId>(symbol_id);
 	}
 	if (!object.contains("frequency") || !object["frequency"].is_string() ||
-			!ParseFrequency(object["frequency"].get<std::string>(), &bar->frequency)) {
+			!ParseFrequency(object["frequency"].get<std::string>(), &bar->frequency))
+	{
 		*error = "frequency must be daily or hourly";
-		return false;
+		PELOG_ERROR_RETURN((PLV_WARNING,
+				"Invalid bar frequency: %s\n", object.dump().c_str()), false);
 	}
 	if (!object.contains("time") || !object["time"].is_string() ||
-			object["time"].get<std::string>().empty()) {
+			object["time"].get<std::string>().empty())
+	{
 		*error = "time is required";
-		return false;
+		PELOG_ERROR_RETURN((PLV_WARNING,
+				"Invalid bar time missing: %s\n", object.dump().c_str()), false);
 	}
 	bar->time = object["time"].get<std::string>();
 	if (!object.contains("state") || !object["state"].is_string() ||
-			!ParseState(object["state"].get<std::string>(), &bar->state)) {
+			!ParseState(object["state"].get<std::string>(), &bar->state))
+	{
 		*error = "state is invalid";
-		return false;
+		PELOG_ERROR_RETURN((PLV_WARNING,
+				"Invalid bar states: %s\n", object.dump().c_str()), false);
 	}
 	if (bar->state != zstfs::BarState::Normal) {
 		bar->open = bar->high = bar->low = bar->close = bar->volume = 0.0;
@@ -339,9 +346,11 @@ bool ParseBar(const json& object, zstfs::Bar* bar, std::string* error) {
 	const char* names[] = {"open", "high", "low", "close", "volume"};
 	float* values[] = {&bar->open, &bar->high, &bar->low, &bar->close, &bar->volume};
 	for (size_t i = 0; i < 5; ++i) {
-		if (!object.contains(names[i]) || !object[names[i]].is_number()) {
+		if (!object.contains(names[i]) || !object[names[i]].is_number())
+		{
 			*error = std::string(names[i]) + " must be a number";
-			return false;
+			PELOG_ERROR_RETURN((PLV_WARNING,
+				 "Invalid bar %s: %s\n", names[i], object.dump().c_str()), false);
 		}
 		*values[i] = object[names[i]].get<float>();
 	}

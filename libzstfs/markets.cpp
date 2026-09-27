@@ -218,8 +218,20 @@ Status Markets::seal_all_before(const std::string& today_local, int trading_days
 		// number of trading days back. The cutoff date is the same for both
 		// daily and hourly since they share the daily TimeId coordinate.
 		zstfs::TimeId today_id = 0;
-		Status status = it->second->calendar_.get() == NULL ? Status::Ok() :
-			it->second->calendar_->time_id(today_local, &today_id);
+		Status status = Status::Ok();
+		if (it->second->calendar_.get() != NULL)
+		{
+			std::string trading_day;
+			status = it->second->calendar_->nearest_trading_day(
+				today_local, &trading_day);
+			if (!status.ok())
+			{
+				if (first_error.ok())
+					first_error = status;
+				continue;
+			}
+			status = it->second->calendar_->time_id(trading_day, &today_id);
+		}
 		if (!status.ok() && first_error.ok()) {
 			first_error = status;
 			continue;
