@@ -29,6 +29,12 @@ def main(argv):
     # print(symbols[0])
     cna_updatedata_daily(symbols)
     
+    symbols = cnof_list()
+    common.put_symbols(symbols, "cnof")
+    # print(symbols[:5])
+    # symbols = [{'code': 'of000001', 'name': '华夏成长混合', 'values': {'20260924': 3.868, '20260923': 3.897}}]
+    cnof_updatedata(symbols)
+
     return 0
 
 # newest market open date for cna 
@@ -206,35 +212,26 @@ def cna_stock_list():
 
 def cna_etf_list():
     records = []
-    logging.info("Fetching ETF list...")
-    df = common.safe_call(akshare.fund_etf_category_sina, symbol="ETF基金")
-    if df is None:
-        logging.warning("fund_etf_category_sina failed")
-        return None
-    for _, row in df.iterrows():
-        code, exchange, __ = common.cna_code(str(row["代码"]))
-        records.append({
-            "code": code,
-            "name": common.cna_fixname(row["名称"]),
-            "security_type": "etf",
-            "exchange": exchange,
-        })
-    logging.info(f"CNA ETFs: {len(df)}")
-    logging.info("Fetching LOF list...")
-    df = common.safe_call(akshare.fund_etf_category_sina, symbol="LOF基金")
-    if df is None:
-        logging.warning("fund_etf_category_sina failed")
-        return []
-    records = []
-    for _, row in df.iterrows():
-        code, exchange, __ = common.cna_code(str(row["代码"]))
-        records.append({
-            "code": code,
-            "name": row["名称"],
-            "security_type": "lof",
-            "exchange": exchange,
-        })
-    logging.info(f"CNA LOFs: {len(df)}")
+    cats = [
+        ("ETF", "ETF基金", "etf"),
+        ("LOF", "LOF基金", "lof"),
+        # ("Closed-end Fund", "封闭式基金", "cef"), # ignore CEFs
+    ]
+    for cat in cats:
+        logging.info("Fetching CNA %s list...", cat[0])
+        df = common.safe_call(akshare.fund_etf_category_sina, symbol=cat[1])
+        if df is None:
+            logging.warning("fund_etf_category_sina failed")
+            return None
+        for _, row in df.iterrows():
+            code, exchange, __ = common.cna_code(str(row["代码"]))
+            records.append({
+                "code": code,
+                "name": common.cna_fixname(row["名称"]),
+                "security_type": cat[2],
+                "exchange": exchange,
+            })
+        logging.info("CNA %ss: %d", cat[0], len(df))
     records.sort(key=lambda x: x["code"])
     return records
 
@@ -253,7 +250,7 @@ def cna_updatedata_daily(symbols):
         else:
             start_date = "19000101"
         if start_date > _cna_date:
-            logging.info("%s already up to date %s", name, start_date)
+            logging.info("%s already up to date %s", name, _cna_date)
             continue
         # Try tx first, except for BJ
         apilist = ["tx", "sina"]
@@ -268,7 +265,7 @@ def cna_updatedata_daily(symbols):
         # put server
         if data is not None and len(data) > 0:
             common.put_bars(data, "cna")
-        logging.info("%s put %d bars", name, len(data))
+        logging.info("%s put %d bars", name, len(data) if data is not None else 0)
         time.sleep(1)
         if start_date[:4] != _cna_date[:4]:
             time.sleep(1)
@@ -312,6 +309,133 @@ def cna_getdata_daily(code, name, start_date, end_date, api="tx"):
             "volume": int(row["volume"]),
         })
     return data
+
+
+def cnof_list():
+    logging.info("Fetching CN open-end fund list...")
+    records = defaultdict(dict)
+    df_name = common.safe_call(akshare.fund_name_em)
+    # print(df_name)
+    if df_name is not None:
+        for _, row in df_name.iterrows():
+            code, __, __ = common.cna_code(str(row["基金代码"]), "of")
+            records[code] = {
+                "code": code,
+                "name": common.cna_fixname(row["基金简称"]),
+                "security_type": "open_fund",
+                "industry": row["基金类型"],
+            }
+    # 
+    df_daily = common.safe_call(akshare.fund_open_fund_daily_em)
+    if df_daily is None:
+        logging.warning("fund_open_fund_daily_em failed")
+        return []
+    # parse columns, and get value keys
+    vkeys = []
+    for key in df_daily.columns.tolist():
+        if key.endswith("-累计净值"):
+            keydate = key.rsplit("-", 1)[0]
+            keydate = keydate.replace("-", "")
+            if len(keydate) == 8 and keydate.isdigit():
+                vkeys.append((key, keydate))
+    # print(df_daily.info())
+    # print(df_daily)
+    for _, row in df_daily.iterrows():
+        code, __, __ = common.cna_code(str(row["基金代码"]), "of")
+        values = {}
+        for key, keydate in vkeys:
+            value = common.fixfloat(row[key])
+            if isinstance(value, float):
+                values[keydate] = value
+        records[code].update({
+            "code": code,
+            "name": common.cna_fixname(row["基金简称"]),
+            "security_type": "open_fund",
+            "values": values,
+        })
+    alllen = len(records)
+    records = [v for k, v in records.items() if "values" in v]
+    logging.info(f"CN open-end funds: {len(records)}:{alllen}")
+    records.sort(key=lambda x: x["code"])
+    return records
+
+
+def cnof_updatedata(symbols):
+    opendates = sorted(_cna_open_dates) # sorted open dates
+    openmap = dict((date, i) for i, date in enumerate(opendates))   # dates -> index in sorted
+    allthresh = opendates[0]    # thresh that 3-mon covers
+    for symbol in symbols:
+        name = f"{symbol["code"]}:{symbol["name"]}" if "name" in symbol else symbol["code"]
+        if "values" not in symbol or len(symbol["values"]) == 0:
+            logging.info("%s Skip no value", name)
+            continue
+        # get server date to determine start date for the symbol
+        regdata = common.get_bar("cnof", symbol["code"], "daily")
+        newdate = None
+        # print(regdata)
+        records = []
+        period = None
+        if len(regdata) > 0:    # if server has data
+            newdate = regdata["time"]
+            # logging.info("regdata %s", regdata)
+            # test whether symbol["values"] are enough
+            if (newdate in symbol["values"] or
+                    newdate in openmap and openmap[newdate] >= len(openmap) - 1 or
+                    newdate in openmap and opendates[openmap[newdate] + 1] in symbol["values"]):
+                for date, value in symbol["values"].items():    # add values
+                    if date > newdate:
+                        records.append({
+                            "code": symbol["code"],
+                            "frequency": "daily",
+                            "state": "normal",
+                            "time": date, "open": value, "high": value, "low": value, "close": value,
+                            "volume": 0,
+                        })
+                if len(records) == 0:
+                    logging.info("%s already up to date %s", name, newdate)
+                    continue
+            elif newdate >= allthresh:
+                period = "3月"
+            else:
+                period = "成立来"
+        else:
+            period = "成立来"
+        if period is not None:
+            logging.trace("Fetching data %s: %s", name, period)
+            df = common.safe_call(akshare.fund_open_fund_info_em, symbol["code"][2:], "累计净值走势", period)
+            if df is None:
+                logging.warning("Failed %s: %s", name, period)
+                time.sleep(5)
+            else:
+                # print(df.info())
+                # print(df)
+                for __, row in df.iterrows():
+                    date = row["净值日期"].strftime("%Y%m%d")
+                    if newdate is not None and date <= newdate:
+                        continue
+                    if row["净值日期"].isoweekday() >= 6:
+                        logging.warning("%s %s is weekend %d",
+                                        name, date, row["净值日期"].isoweekday())
+                        continue
+                    value = common.fixfloat(row["累计净值"])
+                    if value is None:
+                        logging.warning("%s %s invalid value: %s", name, date, row.to_dict())
+                        continue
+                    records.append({
+                        "code": symbol["code"],
+                        "frequency": "daily",
+                        "state": "normal",
+                        "time": date, "open": value, "high": value, "low": value, "close": value,
+                        "volume": 0,
+                    })
+        records.sort(key=lambda x: x["time"])
+        # print(len(records), records[0], records[-1], end="\n")
+
+        if records is not None and len(records) > 0:
+            common.put_bars(records, "cnof")
+        logging.info("%s put %d bars", name, len(records) if records is not None else 0)
+        if period is not None:
+            time.sleep(1)
 
 
 if __name__ == "__main__":
