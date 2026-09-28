@@ -6,6 +6,7 @@
 //
 #include "codec.h"
 #include "calendar.h"
+#include <zstfs/pe_log.h>
 
 #include <algorithm>
 #include <cmath>
@@ -116,12 +117,29 @@ static bool GetPacked(const std::vector<uint8_t>& bytes, size_t* cursor, size_t 
 	return true;
 }
 
-static bool FitsSignedCode(double value, int64_t* code) {
-	if (!std::isfinite(value) || value < static_cast<double>(std::numeric_limits<int64_t>::min()) ||
-		value > static_cast<double>(std::numeric_limits<int64_t>::max())) {
+// Find the integer code that minimizes |base + code * tick - value|.
+// llround((value - base) / tick) is almost always correct, except for when the
+// fractional part of the ratio lands near 0.5. So we test
+// the floor and ceil candidates in that case.
+static bool BestDeltaCode(double value, double base, double tick, int64_t *code)
+{
+	const double ratio = (value - base) / tick;
+	if (!std::isfinite(ratio) || ratio < static_cast<double>(std::numeric_limits<int64_t>::min()) ||
+		ratio > static_cast<double>(std::numeric_limits<int64_t>::max()))
+	{
 		return false;
 	}
-	*code = static_cast<int64_t>(std::llround(value));
+	double int_part = 0.0;
+	const double frac = std::modf(ratio, &int_part);
+	if (frac < -0.55 || (frac > -0.45 && frac < 0.45) || frac > 0.55)	// Far from 0.5 — llround is safe.
+		*code = static_cast<int64_t>(std::llround(ratio));
+	else	// Near the 0.5 boundary — compare ceil/floor candidates
+	{
+		const int64_t n_floor = static_cast<int64_t>(int_part);
+		const double err_floor = std::abs(base + n_floor * tick - value);
+		const double err_ceil = std::abs(base + (n_floor + 1) * tick - value);
+		*code = err_floor <= err_ceil ? n_floor : n_floor + 1;
+	}
 	return true;
 }
 
@@ -220,34 +238,62 @@ Status EncodeBarBlockFrame(const std::vector<BlockBar>& input, BarBlockFrame* ou
 			int64_t open_code = 0;
 			int64_t high_code = 0;
 			int64_t low_code = 0;
-			if (!FitsSignedCode((source.close - stored_anchor) / tick, &close_code) || close_code < 0) {
+			// close_code is always non-negative because stored_anchor = nextafter(min, -inf).
+			if (!BestDeltaCode(source.close, stored_anchor, tick, &close_code) || close_code < 0)
+			{
 				raw = true;
 				break;
 			}
-			const double close = stored_anchor + close_code * tick;
-			if (!FitsSignedCode((source.open - close) / tick, &open_code)) {
+			const double close = stored_anchor + close_code * tick;	// encoded close
+
+			if (source.open == source.close)	// Shortcut for source.open == source.close
+				open_code = 0;
+			else if (!BestDeltaCode(source.open, close, tick, &open_code))	// Normal route
+			{
 				raw = true;
 				break;
 			}
-			const double open = close + open_code * tick;
-		if (RelativeError(source.close, close) > kBarBlockPriceEpsilon ||
-			RelativeError(source.open, open) > kBarBlockPriceEpsilon) {
-			raw = true;
-			break;
-		}
-			if (!FitsSignedCode((source.high - std::max(open, close)) / tick, &high_code) || high_code < 0 ||
-				!FitsSignedCode((std::min(open, close) - source.low) / tick, &low_code) || low_code < 0) {
+			const double open = close + open_code * tick;	// encoded open
+
+			if (RelativeError(source.close, close) > kBarBlockPriceEpsilon ||
+				RelativeError(source.open, open) > kBarBlockPriceEpsilon) {
 				raw = true;
 				break;
 			}
-			const double high = std::max(open, close) + high_code * tick;
-		const double low = std::min(open, close) - low_code * tick;
-		if (RelativeError(source.high, high) > kBarBlockPriceEpsilon ||
-			RelativeError(source.low, low) > kBarBlockPriceEpsilon) {
-			raw = true;
-			break;
-		}
-		close_codes.push_back(static_cast<uint64_t>(close_code));
+
+			const double max_oc = std::max(open, close);
+			const double min_oc = std::min(open, close);
+			// high_code is the upward delta from max(open, close) to high.
+			const float source_max_oc = std::max(source.open, source.close);
+			if (source.high == source_max_oc)	// shortcut for high == open/close
+				high_code = 0;
+			else if (!BestDeltaCode(source.high, max_oc, tick, &high_code))	// Normal route
+			{
+				raw = true;
+				break;
+			}
+			const double high = max_oc + high_code * tick;	// encoded high
+
+			// low_code is the downward delta from min(open, close) to low,
+			// stored as a non-negative integer.
+			const float source_min_oc = std::min(source.open, source.close);
+			if (source.low == source_min_oc)	// shortcut for low == open/close
+				low_code = 0;
+			else if (!BestDeltaCode(source.low, min_oc, tick, &low_code))	// Normal route
+			{
+				raw = true;
+				break;
+			}
+			else
+				low_code = -low_code;	// loc_code from BestDeltaCode should be reverted
+			const double low = min_oc - low_code * tick;
+
+			if (RelativeError(source.high, high) > kBarBlockPriceEpsilon ||
+				RelativeError(source.low, low) > kBarBlockPriceEpsilon) {
+				raw = true;
+				break;
+			}
+			close_codes.push_back(static_cast<uint64_t>(close_code));
 			open_codes.push_back(ZigZagCode(open_code));
 			high_codes.push_back(ZigZagCode(high_code));
 			low_codes.push_back(ZigZagCode(low_code));
@@ -410,7 +456,9 @@ Status DecodeBarBlockFrame(const BarBlockFrame& frame, std::vector<BlockBar>* po
 	const bool raw = (flags & kBarBlockRawValues) != 0;
 	const bool has_zero = (flags & kBarBlockHasZeroVolume) != 0;
 	if (raw) {
-		if (close_bits != 0 || open_bits != 0 || high_bits != 0 || low_bits != 0 || volume_bits != 0 || has_zero ||
+		// has_zero is a quantized-volume flag and is ignored in raw mode —
+		// every bar carries its full float volume regardless.
+		if (close_bits != 0 || open_bits != 0 || high_bits != 0 || low_bits != 0 || volume_bits != 0 ||
 			frame.bytes.size() - cursor != normal.size() * 5 * sizeof(float)) {
 			return Status::Error(ErrorCode::CorruptData, "invalid raw bar block frame");
 		}
