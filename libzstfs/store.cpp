@@ -1176,7 +1176,6 @@ Status StagingStore::load() {
 	current_segment_id_ = 1;
 
 	// Load index first; if valid we skip full segment scan and verify lazily.
-	std::map<std::pair<TimeId, SymbolId>, Locator> persisted_index;
 	bool persisted_index_valid = false;
 	std::vector<uint8_t> index_bytes;
 	if (ReadFile(path_ + "/staging-index", &index_bytes)) {
@@ -1194,8 +1193,8 @@ Status StagingStore::load() {
 			version == kStagingVersion && stored_frequency == static_cast<uint8_t>(frequency_) &&
 			reserved == 0 && index_bytes.size() == 12 + static_cast<size_t>(count) * 28) {
 			persisted_index_valid = true;
-			uint32_t max_page_id = 0;
 			uint32_t max_segment = 0;
+			index_.reserve(count);
 			for (uint32_t i = 0; i < count; ++i) {
 				uint32_t block_id = 0;
 				uint32_t symbol_id = 0;
@@ -1206,29 +1205,52 @@ Status StagingStore::load() {
 					!GetU64(index_bytes, &cursor, &locator.page_offset) ||
 					!GetU32(index_bytes, &cursor, &locator.page_length) ||
 					!GetU32(index_bytes, &cursor, &locator.record_index) ||
-					symbol_id == kInvalidSymbolId ||
-					!persisted_index.insert(std::make_pair(
-						std::make_pair(block_id, symbol_id), locator)).second) {
+					symbol_id == kInvalidSymbolId)
+				{
+					PELOG_LOG((PLV_ERROR, "Staging index read failed: %s\n", path_.c_str()));
 					persisted_index_valid = false;
 					break;
 				}
+				// Index file must be sorted by (block_id, symbol_id). Verify
+				// ordering as we read — duplicates fail the same check.
+				if (!index_.empty() &&
+					(index_.back().time_block_id > block_id ||
+					(index_.back().time_block_id == block_id &&
+					index_.back().symbol_id >= symbol_id)))
+				{
+					PELOG_LOG((PLV_ERROR, "Staging index not sorted: %s\n", path_.c_str()));
+					persisted_index_valid = false;
+					break;
+				}
+				index_.emplace_back(IndexEntry{block_id, symbol_id, locator});
 				max_segment = std::max(max_segment, locator.segment_id);
 				// We don't know page_id from index alone; set a safe lower bound.
 			}
-			if (persisted_index_valid) {
-				index_ = persisted_index;
+			if (persisted_index_valid)
+			{
 				current_segment_id_ = max_segment == 0 ? 1 : max_segment;
 				// next_page_id_ is only used by accept() to assign new ids; we
 				// recover it on the first full rebuild path below.
 				next_page_id_ = 1;
 				// Build the secondary symbol index from the primary index.
-				for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it =
-					 index_.begin(); it != index_.end(); ++it)
+				// build `symbol_blocks_ index` based on `index_`
+				std::map<SymbolId, std::vector<TimeId>> temp_symbol_blocks;
+				for (size_t i = 0; i < index_.size(); ++i)
 				{
-					symbol_blocks_[it->first.second].insert(it->first.first);
+					temp_symbol_blocks[index_[i].symbol_id].push_back(
+						index_[i].time_block_id);
+				}
+				symbol_blocks_.reserve(temp_symbol_blocks.size());
+				for (auto it = temp_symbol_blocks.cbegin(); it != temp_symbol_blocks.cend(); ++it)
+				{
+					SymbolBlockEntry entry = {};
+					entry.symbol_id = it->first;
+					entry.block_ids = it->second;
+					symbol_blocks_.emplace_back(entry);
 				}
 				return Status::Ok();
-			}
+			}	// if (persisted_index_valid)
+			index_.clear();	// if !persisted_index_valid
 		}
 	}
 	// Fallback: rebuild index by scanning segment files.
@@ -1275,27 +1297,60 @@ Status StagingStore::load() {
 				return status;
 			}
 			for (size_t record = 0; record < parsed.size(); ++record) {
-				const std::pair<TimeId, SymbolId> key(parsed[record].block.key.time_block_id,
-					parsed[record].block.key.symbol_id);
-				if (index_.find(key) != index_.end()) {
-					return Status::Error(ErrorCode::CorruptData, "duplicate staged block");
-				}
 				Locator locator = {segment_id, static_cast<uint64_t>(offset),
 					static_cast<uint32_t>(page_length), static_cast<uint32_t>(record)};
-				index_[key] = locator;
-				symbol_blocks_[parsed[record].block.key.symbol_id].insert(
-					parsed[record].block.key.time_block_id);
+				IndexEntry entry = {parsed[record].block.key.time_block_id,
+					parsed[record].block.key.symbol_id, locator};
+				index_.emplace_back(entry);
 			}
 			next_page_id_ = std::max(next_page_id_, page_id + 1);
 			offset += page_length;
 		}
 		current_segment_id_ = segment_id;
 	}
+	// Sort rebuilt index and check for duplicates.
+	std::sort(index_.begin(), index_.end());
+	for (size_t i = 1; i < index_.size(); ++i)
+	{
+		if (index_[i - 1].time_block_id == index_[i].time_block_id &&
+			index_[i - 1].symbol_id == index_[i].symbol_id)
+		{
+			PELOG_LOG((PLV_ERROR, "Duplicate staged block %s\n", path_.c_str()));
+			return Status::Error(ErrorCode::CorruptData, "duplicate staged block");
+		}
+	}
+	// Build secondary symbol index (same approach as the fast path).
+	std::map<SymbolId, std::vector<TimeId>> temp_symbol_blocks;
+	for (size_t i = 0; i < index_.size(); ++i)
+	{
+		temp_symbol_blocks[index_[i].symbol_id].push_back(index_[i].time_block_id);
+	}
+	symbol_blocks_.reserve(temp_symbol_blocks.size());
+	for (std::map<SymbolId, std::vector<TimeId>>::const_iterator it =
+		 temp_symbol_blocks.begin(); it != temp_symbol_blocks.end(); ++it)
+	{
+		SymbolBlockEntry entry = {};
+		entry.symbol_id = it->first;
+		entry.block_ids = it->second;
+		symbol_blocks_.emplace_back(entry);
+	}
 	return write_index();
 }
 
 Status StagingStore::write_index() const {
+	const std::string temporary_path = path_ + "/staging-index.tmp";
+	const std::string index_path = path_ + "/staging-index";
+	FILE *fp = fopen(temporary_path.c_str(), "wb");
+	if (fp == NULL)
+	{
+		PELOG_LOG((PLV_ERROR, "Cannot open %s to write\n", temporary_path.c_str()));
+		return Status::Error(ErrorCode::IoError, "cannot write staging index");
+	}
+
 	std::vector<uint8_t> bytes;
+	bytes.reserve(32);
+
+	// Write header
 	PutU8(&bytes, 'Z');
 	PutU8(&bytes, 'S');
 	PutU8(&bytes, 'I');
@@ -1304,25 +1359,36 @@ Status StagingStore::write_index() const {
 	PutU8(&bytes, static_cast<uint8_t>(frequency_));
 	PutU16(&bytes, 0);
 	PutU32(&bytes, static_cast<uint32_t>(index_.size()));
-	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator entry = index_.begin();
-		 entry != index_.end(); ++entry) {
-		PutU32(&bytes, entry->first.first);
-		PutU32(&bytes, entry->first.second);
-		PutU32(&bytes, entry->second.segment_id);
-		PutU64(&bytes, entry->second.page_offset);
-		PutU32(&bytes, entry->second.page_length);
-		PutU32(&bytes, entry->second.record_index);
+	if (fwrite(bytes.data(), 1, bytes.size(), fp) != bytes.size())
+	{
+		PELOG_LOG((PLV_ERROR, "Write header failed %s\n", temporary_path.c_str()));
+		fclose(fp);
+		std::remove(temporary_path.c_str());
+		return Status::Error(ErrorCode::IoError, "cannot write staging index header");
 	}
-	const std::string temporary_path = path_ + "/staging-index.tmp";
-	const std::string index_path = path_ + "/staging-index";
-	std::ofstream output(temporary_path.c_str(), std::ios::binary | std::ios::trunc);
-	if (!output) {
-		return Status::Error(ErrorCode::IoError, "cannot write staging index");
+
+	for (const auto &entry: index_)
+	{
+		bytes.clear();
+		PutU32(&bytes, entry.time_block_id);
+		PutU32(&bytes, entry.symbol_id);
+		PutU32(&bytes, entry.locator.segment_id);
+		PutU64(&bytes, entry.locator.page_offset);
+		PutU32(&bytes, entry.locator.page_length);
+		PutU32(&bytes, entry.locator.record_index);
+		if (fwrite(bytes.data(), 1, bytes.size(), fp) != bytes.size())
+		{
+			PELOG_LOG((PLV_ERROR, "Write item failed %s\n", temporary_path.c_str()));
+			fclose(fp);
+			std::remove(temporary_path.c_str());
+			return Status::Error(ErrorCode::IoError, "cannot write staging index entry");
+		}
 	}
-	output.write(reinterpret_cast<const char*>(&bytes[0]), bytes.size());
-	output.flush();
-	output.close();
-	if (!output || std::rename(temporary_path.c_str(), index_path.c_str()) != 0) {
+
+	fclose(fp);
+	if (std::rename(temporary_path.c_str(), index_path.c_str()) != 0)
+	{
+		PELOG_LOG((PLV_ERROR, "Publish staging index failed %s\n", index_path.c_str()));
 		std::remove(temporary_path.c_str());
 		return Status::Error(ErrorCode::IoError, "cannot publish staging index");
 	}
@@ -1345,9 +1411,8 @@ Status StagingStore::accept(const std::vector<StockTimeBlock>& blocks,
 		if (!batch_keys.insert(key).second) {
 			return Status::Error(ErrorCode::Conflict, "duplicate block in staging batch");
 		}
-		if (index_.find(key) != index_.end()) {
+		if (find_entry(blocks[i].key.time_block_id, blocks[i].key.symbol_id) != NULL)
 			continue;
-		}
 		PendingStagingRecord record;
 		const std::vector<uint8_t>* source_frame = frame_bytes == NULL || (*frame_bytes)[i].empty() ?
 			NULL : &(*frame_bytes)[i];
@@ -1414,18 +1479,35 @@ Status StagingStore::accept(const std::vector<StockTimeBlock>& blocks,
 				"staging page record count changed");
 		}
 		for (size_t record = 0; record < pages[page].size(); ++record) {
-			const std::pair<TimeId, SymbolId> key(pages[page][record].block.key.time_block_id,
-				pages[page][record].block.key.symbol_id);
-			Locator locator = {current_segment_id_, offset, static_cast<uint32_t>(page_bytes.size()),
-				static_cast<uint32_t>(record)};
-			index_[key] = locator;
-			symbol_blocks_[pages[page][record].block.key.symbol_id].insert(
-				pages[page][record].block.key.time_block_id);
-			}
-			++next_page_id_;
+			IndexEntry entry = {};
+			entry.time_block_id = pages[page][record].block.key.time_block_id;
+			entry.symbol_id = pages[page][record].block.key.symbol_id;
+			entry.locator.segment_id = current_segment_id_;
+			entry.locator.page_offset = offset;
+			entry.locator.page_length = static_cast<uint32_t>(page_bytes.size());
+			entry.locator.record_index = static_cast<uint32_t>(record);
+			index_.push_back(entry);
 		}
-		return write_index();
+		++next_page_id_;
 	}
+	// Rebuild index and secondary index after bulk insert
+	std::sort(index_.begin(), index_.end());
+	// Rebuild symbol_blocks_ - the secondary index.
+	symbol_blocks_.clear();
+	std::map<SymbolId, std::vector<TimeId>> temp_symbol_blocks;
+	for (size_t i = 0; i < index_.size(); ++i)
+		temp_symbol_blocks[index_[i].symbol_id].push_back(index_[i].time_block_id);
+	symbol_blocks_.reserve(temp_symbol_blocks.size());
+	for (std::map<SymbolId, std::vector<TimeId>>::const_iterator it =
+		 temp_symbol_blocks.begin(); it != temp_symbol_blocks.end(); ++it)
+	{
+		SymbolBlockEntry sb_entry = {};
+		sb_entry.symbol_id = it->first;
+		sb_entry.block_ids = std::move(it->second);
+		symbol_blocks_.emplace_back(std::move(sb_entry));
+	}
+	return write_index();
+}
 
 // Streaming accept state. Holds the current in-progress page of pending
 // records and the locators of already-flushed pages. Index updates are
@@ -1436,10 +1518,10 @@ struct StagingStore::AcceptStream
 	std::vector<PendingStagingRecord> page_records;
 	std::set<std::pair<TimeId, SymbolId>> seen_keys;
 	bool has_data;
-	// Locators for pages already written to disk, keyed by (time_block_id, symbol_id).
-	// Committed to index_ and symbol_blocks_ atomically in accept_commit().
-	std::map<std::pair<TimeId, SymbolId>, Locator> pending_locators;
-	std::map<SymbolId, std::set<TimeId>> pending_symbol_blocks;
+	// Locators for pages already written to disk.
+	// Sorted by (time_block_id, symbol_id) — flushed pages are already
+	// in PendingStagingOrder so entries append in sorted order.
+	std::vector<IndexEntry> pending_locators;
 };
 
 Status StagingStore::accept_begin()
@@ -1463,7 +1545,7 @@ Status StagingStore::accept_add_block(const StockTimeBlock &block)
 	const std::pair<TimeId, SymbolId> key(block.key.time_block_id, block.key.symbol_id);
 	if (!accept_stream_->seen_keys.insert(key).second)
 		return Status::Error(ErrorCode::Conflict, "duplicate block in staging batch");
-	if (index_.find(key) != index_.end())
+	if (find_entry(block.key.time_block_id, block.key.symbol_id) != NULL)
 		return Status::Ok();
 
 	PendingStagingRecord record;
@@ -1515,18 +1597,27 @@ Status StagingStore::accept_commit()
 	bool had_data = accept_stream_->has_data;
 	if (had_data)
 	{
-		// Commit all accumulated locators to the in-memory index atomically.
-		for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it =
-		     accept_stream_->pending_locators.begin();
-		     it != accept_stream_->pending_locators.end(); ++it)
+		// Append pending entries and re-sort the primary index.
+		index_.insert(index_.end(),
+			accept_stream_->pending_locators.begin(),
+			accept_stream_->pending_locators.end());
+		std::sort(index_.begin(), index_.end());
+		// Rebuild secondary index from the sorted primary index.
+		symbol_blocks_.clear();
+		std::map<SymbolId, std::vector<TimeId>> temp_symbol_blocks;
+		for (size_t i = 0; i < index_.size(); ++i)
 		{
-			index_[it->first] = it->second;
+			temp_symbol_blocks[index_[i].symbol_id].push_back(
+				index_[i].time_block_id);
 		}
-		for (std::map<SymbolId, std::set<TimeId>>::const_iterator it =
-		     accept_stream_->pending_symbol_blocks.begin();
-		     it != accept_stream_->pending_symbol_blocks.end(); ++it)
+		symbol_blocks_.reserve(temp_symbol_blocks.size());
+		for (std::map<SymbolId, std::vector<TimeId>>::const_iterator it =
+			 temp_symbol_blocks.begin(); it != temp_symbol_blocks.end(); ++it)
 		{
-			symbol_blocks_[it->first].insert(it->second.begin(), it->second.end());
+			SymbolBlockEntry sb_entry = {};
+			sb_entry.symbol_id = it->first;
+			sb_entry.block_ids = std::move(it->second);
+			symbol_blocks_.emplace_back(std::move(sb_entry));
 		}
 	}
 	delete accept_stream_;
@@ -1589,16 +1680,33 @@ Status StagingStore::flush_pending_page()
 	}
 	for (size_t record = 0; record < page_records.size(); ++record)
 	{
-		const std::pair<TimeId, SymbolId> key(page_records[record].block.key.time_block_id,
-			page_records[record].block.key.symbol_id);
-		Locator locator = {current_segment_id_, offset,
-			static_cast<uint32_t>(page_bytes.size()), static_cast<uint32_t>(record)};
-		accept_stream_->pending_locators[key] = locator;
-		accept_stream_->pending_symbol_blocks[page_records[record].block.key.symbol_id].insert(
-			page_records[record].block.key.time_block_id);
+		IndexEntry entry = {};
+		entry.time_block_id = page_records[record].block.key.time_block_id;
+		entry.symbol_id = page_records[record].block.key.symbol_id;
+		entry.locator.segment_id = current_segment_id_;
+		entry.locator.page_offset = offset;
+		entry.locator.page_length = static_cast<uint32_t>(page_bytes.size());
+		entry.locator.record_index = static_cast<uint32_t>(record);
+		accept_stream_->pending_locators.push_back(entry);
 	}
 	++next_page_id_;
 	return Status::Ok();
+}
+
+const StagingStore::IndexEntry *StagingStore::find_entry(
+	TimeId time_block_id, SymbolId symbol_id) const
+{
+	IndexEntry key = {};
+	key.time_block_id = time_block_id;
+	key.symbol_id = symbol_id;
+	auto it = std::lower_bound(index_.begin(), index_.end(), key);
+	if (it != index_.end() &&
+		it->time_block_id == time_block_id &&
+		it->symbol_id == symbol_id)
+	{
+		return &(*it);
+	}
+	return NULL;
 }
 
 // Check whether the *block* that would contain the data exists
@@ -1612,8 +1720,7 @@ bool StagingStore::contains(SymbolId symbol_id, TimeId time_id) const {
 		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
 	const TimeId block_day = time_day(time_id) - (time_day(time_id) % block_days);
 	const TimeId block_id = daily_bar_id(block_day);
-	const std::pair<TimeId, SymbolId> key(block_id, symbol_id);
-	return index_.find(key) != index_.end();
+	return find_entry(block_id, symbol_id) != NULL;
 }
 
 Status StagingStore::get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const {
@@ -1629,21 +1736,18 @@ Status StagingStore::get(SymbolId symbol_id, TimeId time_id, BlockBar* out) cons
 		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
 	const TimeId block_day = time_day(time_id) - (time_day(time_id) % block_days);
 	const TimeId block_id = daily_bar_id(block_day);
-	const std::pair<TimeId, SymbolId> key(block_id, symbol_id);
-	std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.find(key);
-	if (it == index_.end()) {
+	const IndexEntry *entry = find_entry(block_id, symbol_id);
+	if (entry == NULL)
 		return Status::Error(ErrorCode::NotFound, "staged bar was not found");
-	}
 	std::vector<ParsedStagingRecord> records;
-	Status status = load_page(it->second.segment_id, it->second.page_offset,
-		it->second.page_length, &records);
+	Status status = load_page(entry->locator.segment_id, entry->locator.page_offset,
+		entry->locator.page_length, &records);
 	if (!status.ok()) {
 		return status;
 	}
-	if (it->second.record_index >= records.size()) {
+	if (entry->locator.record_index >= records.size())
 		return Status::Error(ErrorCode::CorruptData, "staging record index out of range");
-	}
-	const ParsedStagingRecord& record = records[it->second.record_index];
+	const ParsedStagingRecord& record = records[entry->locator.record_index];
 	for (size_t i = 0; i < record.bars.size(); ++i) {
 		if (record.bars[i].time_id == time_id) {
 			*out = record.bars[i].bar;
@@ -1674,34 +1778,35 @@ Status StagingStore::range(const std::vector<SymbolId>& symbol_ids,
 	const TimeId begin_block_id = daily_bar_id(begin_block_day);
 	const TimeId end_day = time_day(end);
 	std::set<std::pair<uint32_t, uint64_t>> visited_pages;
-	for (std::set<SymbolId>::const_iterator s = requested.begin();
-		 s != requested.end(); ++s) {
-		std::map<SymbolId, std::set<TimeId>>::const_iterator symbol_it =
-			symbol_blocks_.find(*s);
-		if (symbol_it == symbol_blocks_.end()) {
+	for (auto s = requested.cbegin(); s != requested.cend(); ++s)
+	{
+		// Binary search for symbol in symbol_blocks_.
+		SymbolBlockEntry sym_key = {};
+		sym_key.symbol_id = *s;
+		auto sym_it = std::lower_bound(symbol_blocks_.begin(), symbol_blocks_.end(), sym_key);
+		if (sym_it == symbol_blocks_.end() || sym_it->symbol_id != *s)
+		{
+			PELOG_LOG((PLV_ERROR, "Invalid symbol id %u", (unsigned int)*s));
 			continue;
 		}
-		const std::set<TimeId>& blocks = symbol_it->second;
-		for (std::set<TimeId>::const_iterator block_it =
-			 blocks.lower_bound(begin_block_id);
-			 block_it != blocks.end(); ++block_it) {
-			if (time_day(*block_it) > end_day) {
+		const std::vector<TimeId> &blocks = sym_it->block_ids;
+		// Binary search for the first block >= begin_block_id.
+		auto blk_it = std::lower_bound(blocks.begin(), blocks.end(), begin_block_id);
+		for (auto bi = blk_it; bi != blocks.end(); ++bi)
+		{
+			if (time_day(*bi) > end_day)
 				break;
-			}
-			const std::pair<TimeId, SymbolId> key(*block_it, *s);
-			std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator idx_it =
-				index_.find(key);
-			if (idx_it == index_.end()) {
+			const IndexEntry *entry = find_entry(*bi, *s);
+			if (entry == NULL)
 				continue;
-			}
 			const std::pair<uint32_t, uint64_t> page_key(
-				idx_it->second.segment_id, idx_it->second.page_offset);
+				entry->locator.segment_id, entry->locator.page_offset);
 			if (!visited_pages.insert(page_key).second) {
 				continue;
 			}
 			std::vector<ParsedStagingRecord> records;
-			Status status = load_page(idx_it->second.segment_id,
-				idx_it->second.page_offset, idx_it->second.page_length, &records);
+			Status status = load_page(entry->locator.segment_id,
+				entry->locator.page_offset, entry->locator.page_length, &records);
 			if (!status.ok()) {
 				return status;
 			}
@@ -1732,27 +1837,26 @@ Status StagingStore::latest_time(SymbolId symbol_id, TimeId *out) const
 	{
 		return Status::Error(ErrorCode::InvalidArgument, "invalid latest_time arguments");
 	}
-	std::map<SymbolId, std::set<TimeId>>::const_iterator symbol_it =
-		symbol_blocks_.find(symbol_id);
-	if (symbol_it == symbol_blocks_.end() || symbol_it->second.empty())
+	// Binary search for symbol in symbol_blocks_.
+	SymbolBlockEntry sym_key = {};
+	sym_key.symbol_id = symbol_id;
+	auto sym_it = std::lower_bound(symbol_blocks_.begin(), symbol_blocks_.end(), sym_key);
+	if (sym_it == symbol_blocks_.end() || sym_it->symbol_id != symbol_id ||
+		sym_it->block_ids.empty())
 	{
 		return Status::Error(ErrorCode::NotFound, "no staging history for symbol");
 	}
+	const std::vector<TimeId>& blocks = sym_it->block_ids;
 	// Walk blocks from newest to oldest until we find one with bar data.
 	// The newest block normally has data, so only one page load is needed.
-	for (std::set<TimeId>::const_reverse_iterator block_it = symbol_it->second.rbegin();
-		 block_it != symbol_it->second.rend(); ++block_it)
+	for (auto bi = blocks.rbegin(); bi != blocks.rend(); ++bi)
 	{
-		const std::pair<TimeId, SymbolId> key(*block_it, symbol_id);
-		std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator idx_it =
-			index_.find(key);
-		if (idx_it == index_.end())
-		{
+		const IndexEntry *entry = find_entry(*bi, symbol_id);
+		if (entry == NULL)
 			continue;
-		}
 		std::vector<ParsedStagingRecord> records;
-		Status status = load_page(idx_it->second.segment_id, idx_it->second.page_offset,
-			idx_it->second.page_length, &records);
+		Status status = load_page(entry->locator.segment_id, entry->locator.page_offset,
+			entry->locator.page_length, &records);
 		if (!status.ok())
 		{
 			return status;
@@ -1797,13 +1901,14 @@ Status StagingStore::snapshot(std::vector<StockTimeBlock>* blocks,
 	// Walk index in order; load each page once and extract records in index order.
 	std::set<std::pair<uint32_t, uint64_t> > visited_pages;
 	std::map<std::pair<TimeId, SymbolId>, ParsedStagingRecord> by_key;
-	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
-		 it != index_.end(); ++it) {
-		const std::pair<uint32_t, uint64_t> page_key(it->second.segment_id, it->second.page_offset);
+	for (size_t i = 0; i < index_.size(); ++i)
+	{
+		const Locator &loc = index_[i].locator;
+		const std::pair<uint32_t, uint64_t> page_key(loc.segment_id, loc.page_offset);
 		if (visited_pages.insert(page_key).second) {
 			std::vector<ParsedStagingRecord> records;
-			Status status = load_page(it->second.segment_id, it->second.page_offset,
-				it->second.page_length, &records);
+			Status status = load_page(loc.segment_id, loc.page_offset,
+				loc.page_length, &records);
 			if (!status.ok()) {
 				return status;
 			}
@@ -1815,10 +1920,11 @@ Status StagingStore::snapshot(std::vector<StockTimeBlock>* blocks,
 		}
 	}
 	// Emit in index order so snapshot matches index ordering.
-	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
-		 it != index_.end(); ++it) {
+	for (size_t i = 0; i < index_.size(); ++i)
+	{
+		const std::pair<TimeId, SymbolId> key(index_[i].time_block_id, index_[i].symbol_id);
 		std::map<std::pair<TimeId, SymbolId>, ParsedStagingRecord>::iterator found =
-			by_key.find(it->first);
+			by_key.find(key);
 		if (found == by_key.end()) {
 			return Status::Error(ErrorCode::CorruptData, "staging snapshot missing record");
 		}
@@ -1934,15 +2040,15 @@ Status StagingStore::snapshot(std::vector<BlockKey> *keys,
 	// them in index order below.
 	std::set<std::pair<uint32_t, uint64_t> > visited_pages;
 	std::map<std::pair<TimeId, SymbolId>, RawStagingRecord> by_key;
-	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
-		 it != index_.end(); ++it)
+	for (size_t i = 0; i < index_.size(); ++i)
 	{
-		const std::pair<uint32_t, uint64_t> page_key(it->second.segment_id, it->second.page_offset);
+		const Locator &loc = index_[i].locator;
+		const std::pair<uint32_t, uint64_t> page_key(loc.segment_id, loc.page_offset);
 		if (visited_pages.insert(page_key).second)
 		{
 			std::vector<uint8_t> page_bytes;
-			Status status = load_page_bytes(it->second.segment_id, it->second.page_offset,
-				it->second.page_length, &page_bytes);
+			Status status = load_page_bytes(loc.segment_id, loc.page_offset,
+				loc.page_length, &page_bytes);
 			if (!status.ok())
 				return status;
 			std::vector<RawStagingRecord> records;
@@ -1959,11 +2065,12 @@ Status StagingStore::snapshot(std::vector<BlockKey> *keys,
 		}
 	}
 	// Emit in index order.
-	for (std::map<std::pair<TimeId, SymbolId>, Locator>::const_iterator it = index_.begin();
-		 it != index_.end(); ++it)
+	for (size_t i = 0; i < index_.size(); ++i)
 	{
+		const std::pair<TimeId, SymbolId> key(
+			index_[i].time_block_id, index_[i].symbol_id);
 		std::map<std::pair<TimeId, SymbolId>, RawStagingRecord>::iterator found =
-			by_key.find(it->first);
+			by_key.find(key);
 		if (found == by_key.end())
 			return Status::Error(ErrorCode::CorruptData, "staging raw snapshot missing record");
 		keys->push_back(found->second.key);

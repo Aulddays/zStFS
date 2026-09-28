@@ -129,13 +129,13 @@ static bool BestDeltaCode(double value, double base, double tick, int64_t *code)
 	{
 		return false;
 	}
-	double int_part = 0.0;
-	const double frac = std::modf(ratio, &int_part);
-	if (frac < -0.55 || (frac > -0.45 && frac < 0.45) || frac > 0.55)	// Far from 0.5 — llround is safe.
+	const double floor_ratio = std::floor(ratio);
+	const double frac = ratio - floor_ratio;	// frac is always >= 0, even for value < base
+	if (frac < 0.45 || frac > 0.55)	// Far from 0.5 — llround is safe.
 		*code = static_cast<int64_t>(std::llround(ratio));
-	else	// Near the 0.5 boundary — compare ceil/floor candidates
+	else	// Near the 0.5 boundary — compare floor/ceil candidates
 	{
-		const int64_t n_floor = static_cast<int64_t>(int_part);
+		const int64_t n_floor = static_cast<int64_t>(floor_ratio);
 		const double err_floor = std::abs(base + n_floor * tick - value);
 		const double err_ceil = std::abs(base + (n_floor + 1) * tick - value);
 		*code = err_floor <= err_ceil ? n_floor : n_floor + 1;

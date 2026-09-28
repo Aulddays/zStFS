@@ -212,6 +212,31 @@ private:
 		uint32_t record_index;
 	};
 
+	// Primary index entry, sorted by (time_block_id, symbol_id).
+	struct IndexEntry
+	{
+		TimeId time_block_id;
+		SymbolId symbol_id;
+		Locator locator;
+		bool operator<(const IndexEntry &other) const
+		{
+			if (time_block_id != other.time_block_id)
+				return time_block_id < other.time_block_id;
+			return symbol_id < other.symbol_id;
+		}
+	};
+
+	// Secondary index: per-symbol list of time_block_ids (ascending).
+	struct SymbolBlockEntry
+	{
+		SymbolId symbol_id;
+		std::vector<TimeId> block_ids;
+		bool operator<(const SymbolBlockEntry &other) const
+		{
+			return symbol_id < other.symbol_id;
+		}
+	};
+
 	struct AcceptStream;  // opaque streaming accept state (defined in store.cpp)
 
 	Status load();
@@ -227,6 +252,9 @@ private:
 	// shared decoded cache (and compressed cache as fallback).
 	Status load_page(uint32_t segment_id, uint64_t page_offset, uint32_t page_length,
 		std::vector<ParsedStagingRecord>* records) const;
+	// Binary search index_ for (time_block_id, symbol_id). Returns the
+	// entry pointer or NULL if not found.
+	const IndexEntry *find_entry(TimeId time_block_id, SymbolId symbol_id) const;
 
 	Frequency frequency_;
 	const Calendar& calendar_;
@@ -235,9 +263,8 @@ private:
 	Status status_;
 	uint32_t next_page_id_;
 	uint32_t current_segment_id_;
-	std::map<std::pair<TimeId, SymbolId>, Locator> index_;
-	// Secondary in-memory index: symbol_id -> set of time_block_ids.
-	std::map<SymbolId, std::set<TimeId>> symbol_blocks_;
+	std::vector<IndexEntry> index_;
+	std::vector<SymbolBlockEntry> symbol_blocks_;
 	AcceptStream *accept_stream_;
 };
 
