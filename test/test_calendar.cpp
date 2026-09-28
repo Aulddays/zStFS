@@ -82,15 +82,15 @@ int main() {
 	assert(calendar.block_offset(zstfs::Frequency::Hourly,
 	                               "19000101-1130", &block_id, &offset).code() ==
 	       zstfs::ErrorCode::NotFound);
-	assert(calendar.date(zstfs::daily_bar_id(zstfs::kDailyTimeBlockDayLength),
+	assert(calendar.date(zstfs::daily_bar_id(zstfs::kTimeBlockDayLength),
 	                     &date).ok());
 	assert(calendar.block_offset(zstfs::Frequency::Daily,
 	                               date, &block_id, &offset).ok());
-	assert(block_id == zstfs::daily_bar_id(zstfs::kDailyTimeBlockDayLength) &&
+	assert(block_id == zstfs::daily_bar_id(zstfs::kTimeBlockDayLength) &&
 	       offset == 0);
 	assert(calendar.block_offset(zstfs::Frequency::Hourly,
 	                               date + "-0930", &block_id, &offset).ok());
-	assert(block_id == zstfs::daily_bar_id(zstfs::kHourlyTimeBlockDayLength) &&
+	assert(block_id == zstfs::daily_bar_id(zstfs::kTimeBlockDayLength) &&
 	       offset == 0);
 
 	zstfs::BlockOff block_length = 0;

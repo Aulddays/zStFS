@@ -387,8 +387,7 @@ Status Calendar::block_offset(Frequency frequency,
 		return Status::Error(ErrorCode::InvalidArgument, "block outputs are required");
 	}
 	const TimeId day_number = time_day(time_id);
-	const TimeId block_day_length = frequency == Frequency::Daily
-		? kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	const TimeId block_day_length = kTimeBlockDayLength;
 	const BlockOff day_offset = static_cast<BlockOff>(day_number % block_day_length);
 	const TimeId block_day = day_number - day_offset;
 	*block_id = block_day * kTimeIdDayStep;
@@ -509,8 +508,7 @@ Status Calendar::block_length(Frequency frequency,
 	if (out == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "block length output is required");
 	}
-	const TimeId block_day_length = frequency == Frequency::Daily
-		? kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	const TimeId block_day_length = kTimeBlockDayLength;
 	if (time_slot(block_id) != 0 || time_day(block_id) % block_day_length != 0) {
 		return Status::Error(ErrorCode::InvalidArgument,
 		                     "invalid time block identifier");

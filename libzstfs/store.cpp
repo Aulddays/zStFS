@@ -607,8 +607,7 @@ Status ActiveStore::collect_before(TimeId time_id,
 	sealed->clear();
 	sealed_bars->clear();
 	const TimeId cutoff_day = time_day(time_id);
-	const TimeId block_days = frequency_ == Frequency::Daily ?
-		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	const TimeId block_days = kTimeBlockDayLength;
 	for (std::map<TimeId, ActiveTimeBlock>::iterator block = blocks_.begin();
 		 block != blocks_.end();) {
 		if (time_day(block->first) + block_days > cutoff_day) {
@@ -651,8 +650,7 @@ Status ActiveStore::seal_foreach(TimeId time_id,
 	if (!status.ok())
 		return status;
 	const TimeId cutoff_day = time_day(time_id);
-	const TimeId block_days = frequency_ == Frequency::Daily ?
-		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	const TimeId block_days = kTimeBlockDayLength;
 	bool any = false;
 	for (std::map<TimeId, ActiveTimeBlock>::const_iterator block = blocks_.begin();
 	     block != blocks_.end(); ++block)
@@ -691,8 +689,7 @@ bool ActiveStore::has_sealable_blocks(TimeId time_id) const
 	if (!replay_status_.ok())
 		return false;
 	const TimeId cutoff_day = time_day(time_id);
-	const TimeId block_days = frequency_ == Frequency::Daily ?
-		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	const TimeId block_days = kTimeBlockDayLength;
 	for (std::map<TimeId, ActiveTimeBlock>::const_iterator block = blocks_.begin();
 	     block != blocks_.end(); ++block)
 	{
@@ -709,8 +706,7 @@ Status ActiveStore::remove_before(TimeId time_id) {
 		return replay_status_;
 	}
 	const TimeId cutoff_day = time_day(time_id);
-	const TimeId block_days = frequency_ == Frequency::Daily ?
-		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	const TimeId block_days = kTimeBlockDayLength;
 	const std::string temporary_path = path_ + ".tmp";
 	std::ofstream output(temporary_path.c_str(), std::ios::binary | std::ios::trunc);
 	if (!output)
@@ -867,7 +863,8 @@ Status StagingTimeIds(const Calendar& calendar,
 		}
 		return Status::Ok();
 	}
-	for (TimeId day_offset = 0; day_offset < kHourlyTimeBlockDayLength; ++day_offset) {
+	for (TimeId day_offset = 0; day_offset < kTimeBlockDayLength; ++day_offset)
+	{
 		const TimeId day_id = daily_bar_id(first_day + day_offset);
 		std::string date;
 		Status status = calendar.date(day_id, &date);
@@ -1716,8 +1713,7 @@ bool StagingStore::contains(SymbolId symbol_id, TimeId time_id) const {
 	}
 	// Compute which 64-day block the time_id falls into, then look up
 	// the (block_id, symbol_id) key directly in O(log n).
-	const TimeId block_days = frequency_ == Frequency::Daily ?
-		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	const TimeId block_days = kTimeBlockDayLength;
 	const TimeId block_day = time_day(time_id) - (time_day(time_id) % block_days);
 	const TimeId block_id = daily_bar_id(block_day);
 	return find_entry(block_id, symbol_id) != NULL;
@@ -1732,8 +1728,7 @@ Status StagingStore::get(SymbolId symbol_id, TimeId time_id, BlockBar* out) cons
 	}
 	// Compute the 64-day block containing time_id and locate the record by
 	// (block_id, symbol_id) in O(log n).
-	const TimeId block_days = frequency_ == Frequency::Daily ?
-		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	const TimeId block_days = kTimeBlockDayLength;
 	const TimeId block_day = time_day(time_id) - (time_day(time_id) % block_days);
 	const TimeId block_id = daily_bar_id(block_day);
 	const IndexEntry *entry = find_entry(block_id, symbol_id);
@@ -1772,8 +1767,7 @@ Status StagingStore::range(const std::vector<SymbolId>& symbol_ids,
 	// For each requested symbol, use the secondary symbol index to binary-search
 	// the first block that could overlap [begin, end], then walk forward until
 	// the block start passes end. This avoids scanning unrelated symbols.
-	const TimeId block_days = frequency_ == Frequency::Daily ?
-		kDailyTimeBlockDayLength : kHourlyTimeBlockDayLength;
+	const TimeId block_days = kTimeBlockDayLength;
 	const TimeId begin_block_day = time_day(begin) - (time_day(begin) % block_days);
 	const TimeId begin_block_id = daily_bar_id(begin_block_day);
 	const TimeId end_day = time_day(end);
@@ -2194,7 +2188,7 @@ static bool VaultBlockContainsTime(TimeId first_block_id,
 	// Locator endpoints name block starts. The final block therefore covers its
 	// full 64-day calendar address range rather than only its first day.
 	return day >= time_day(first_block_id) &&
-		day < time_day(last_block_id) + kDailyTimeBlockDayLength;
+		day < time_day(last_block_id) + kTimeBlockDayLength;
 }
 
 static size_t VaultBarsBytes(const std::vector<ActiveBar>& bars) {
@@ -2895,7 +2889,7 @@ Status VaultStore::get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const 
 		}
 		std::vector<ActiveBar> bars;
 		const TimeId block_day = time_day(time_id) -
-			(time_day(time_id) % kDailyTimeBlockDayLength);
+			(time_day(time_id) % kTimeBlockDayLength);
 		const TimeId block_id = daily_bar_id(block_day);
 		status = DecodeVaultBlock(calendar_, frequency_, runtime_market_id_, locator.segment_id,
 			locator.blob_offset, bytes, symbol_id, block_id, &bars, NULL);
@@ -2931,7 +2925,7 @@ Status VaultStore::range(const std::vector<SymbolId>& symbol_ids,
 	for (size_t i = 0; i < index_.size(); ++i) {
 		const Locator& locator = index_[i];
 		if (requested.find(locator.symbol_id) == requested.end() ||
-			time_day(locator.last_time_block_id) + kDailyTimeBlockDayLength <= time_day(begin) ||
+			time_day(locator.last_time_block_id) + kTimeBlockDayLength <= time_day(begin) ||
 			time_day(locator.first_time_block_id) > time_day(end)) {
 			continue;
 		}
@@ -2942,8 +2936,16 @@ Status VaultStore::range(const std::vector<SymbolId>& symbol_ids,
 			corrupt = true;
 			continue;
 		}
+		const TimeId begin_day = time_day(begin);
+		const TimeId end_day = time_day(end);
 		for (TimeId block_id = locator.first_time_block_id; block_id <= locator.last_time_block_id;
-			 block_id = daily_bar_id(time_day(block_id) + 64)) {
+			block_id = daily_bar_id(time_day(block_id) + kTimeBlockDayLength))
+		{
+			const TimeId block_day = time_day(block_id);
+			if (block_day + kTimeBlockDayLength <= begin_day)
+				continue;	// Block ends before begin: skip
+			if (block_day > end_day)
+				break;	// Block starts after end: stop
 			std::vector<ActiveBar> bars;
 			status = DecodeVaultBlock(calendar_, frequency_, runtime_market_id_, locator.segment_id,
 				locator.blob_offset, bytes, locator.symbol_id, block_id, &bars, NULL);
@@ -2958,7 +2960,7 @@ Status VaultStore::range(const std::vector<SymbolId>& symbol_ids,
 					out->push_back(bars[j]);
 				}
 			}
-			if (block_id > std::numeric_limits<TimeId>::max() - kTimeIdDayStep * 64) {
+			if (block_id > std::numeric_limits<TimeId>::max() - kTimeIdDayStep * kTimeBlockDayLength) {
 				break;
 			}
 		}
@@ -3009,14 +3011,15 @@ Status VaultStore::latest_time(SymbolId symbol_id, TimeId *out) const
 	TimeId max_time = 0;
 	bool found = false;
 	for (TimeId block_id = best.first_time_block_id; block_id <= best.last_time_block_id;
-		 block_id = daily_bar_id(time_day(block_id) + 64))
+		 block_id = daily_bar_id(time_day(block_id) + kTimeBlockDayLength))
 	{
 		std::vector<ActiveBar> bars;
 		Status decode_status = DecodeVaultBlock(calendar_, frequency_, runtime_market_id_,
 			best.segment_id, best.blob_offset, bytes, symbol_id, block_id, &bars, NULL);
 		if (!decode_status.ok())
 		{
-			if (decode_status.code() == ErrorCode::NotFound) continue;
+			if (decode_status.code() == ErrorCode::NotFound)
+				continue;
 			return Status::Error(ErrorCode::CorruptData, decode_status.message());
 		}
 		for (size_t j = 0; j < bars.size(); ++j)
@@ -3027,10 +3030,8 @@ Status VaultStore::latest_time(SymbolId symbol_id, TimeId *out) const
 				found = true;
 			}
 		}
-		if (block_id > std::numeric_limits<TimeId>::max() - kTimeIdDayStep * 64)
-		{
+		if (block_id > std::numeric_limits<TimeId>::max() - kTimeIdDayStep * kTimeBlockDayLength)
 			break;
-		}
 	}
 	if (!found)
 	{
@@ -3043,13 +3044,9 @@ Status VaultStore::latest_time(SymbolId symbol_id, TimeId *out) const
 // Reconstruct logical blocks from explicit bars when copying an immutable
 // store. The persistent codecs already retain complete positions, but this
 // helper keeps compaction independent from their private blob/page directories.
-TimeId CompactionBlockDayLength(Frequency frequency) {
-	return frequency == Frequency::Daily ? kDailyTimeBlockDayLength :
-		kHourlyTimeBlockDayLength;
-}
-
-TimeId CompactionBlockId(Frequency frequency, TimeId time_id) {
-	const TimeId length = CompactionBlockDayLength(frequency);
+TimeId CompactionBlockId(Frequency frequency, TimeId time_id)
+{
+	const TimeId length = kTimeBlockDayLength;
 	return daily_bar_id((time_day(time_id) / length) * length);
 }
 
@@ -3140,7 +3137,7 @@ Status VaultStore::snapshot(std::vector<StockTimeBlock>* blocks,
 		}
 		for (TimeId block_id = locator.first_time_block_id;
 			 block_id <= locator.last_time_block_id;
-			 block_id = daily_bar_id(time_day(block_id) + kDailyTimeBlockDayLength)) {
+			 block_id = daily_bar_id(time_day(block_id) + kTimeBlockDayLength)) {
 			std::vector<ActiveBar> decoded;
 			std::vector<uint8_t> frame;
 			status = DecodeVaultBlock(calendar_, frequency_, runtime_market_id_, locator.segment_id,

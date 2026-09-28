@@ -20,9 +20,10 @@ typedef uint32_t TimeId;
 // block's daily or hourly layout. The two values must not be added directly.
 typedef uint16_t BlockOff;
 
-const TimeId kDailyTimeBlockDayLength = 64;
-const TimeId kHourlyTimeBlockDayLength = 64;
+// Number of trading days per time block (same for daily and hourly frequencies).
+const TimeId kTimeBlockDayLength = 64;
 const TimeId kEpochTimeId = 0;
+// TimeId step between consecutive trading days (low 8 bits = intraday slot).
 const TimeId kTimeIdDayStep = 1 << 8;
 
 // Every time coordinate reserves the low byte for the ten-minute HHM slot. A

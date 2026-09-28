@@ -393,7 +393,6 @@ Status StagingTimeIds(const Calendar& calendar,
                       std::vector<TimeId>* out);
 
 TimeId CompactionBlockId(Frequency frequency, TimeId time_id);
-TimeId CompactionBlockDayLength(Frequency frequency);
 
 }  // namespace zstfs
 
