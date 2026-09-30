@@ -2084,7 +2084,7 @@ Status StagingStore::snapshot(std::vector<BlockKey> *keys,
 // ZVB6 only supplies durable framing and selective disk locations.
 // =============================================================================
 
-static const uint8_t kVaultVersion = 2;
+static const uint8_t kVaultVersion = 3;
 static const size_t kVaultBlobMaxBytes = 256 * 1024;
 static const uint64_t kVaultSegmentTargetBytes = 256ULL * 1024 * 1024;
 // Unified page cache shared by Vault and Staging stores. Both stores use the
@@ -2534,11 +2534,27 @@ VaultStore::VaultStore(Frequency frequency,
 	status_ = load();
 }
 
+void VaultStore::rebuild_block_offsets()
+{
+	block_offsets_.resize(index_.size() + 1);
+	uint32_t total = 0;
+	for (size_t i = 0; i < index_.size(); ++i)
+	{
+		block_offsets_[i] = total;
+		total += index_[i].block_count;
+	}
+	block_offsets_[index_.size()] = total;
+}
+
 Status VaultStore::load() {
 	index_.clear();
+	block_meta_.clear();
+	block_offsets_.clear();
 	current_segment_id_ = 1;
 	const std::string index_path = path_ + "/vault-index";
-	if (access(index_path.c_str(), F_OK) != 0) {
+	if (access(index_path.c_str(), F_OK) != 0)
+	{
+		rebuild_block_offsets();
 		return Status::Ok();
 	}
 	std::vector<uint8_t> bytes;
@@ -2550,28 +2566,53 @@ Status VaultStore::load() {
 	uint8_t version = 0;
 	uint8_t stored_frequency = 0;
 	uint16_t reserved = 0;
-	uint32_t count = 0;
+	uint32_t blob_count = 0;
+	uint32_t total_block_count = 0;
 	if (!GetU8(bytes, &offset, &magic[0]) || !GetU8(bytes, &offset, &magic[1]) ||
 		!GetU8(bytes, &offset, &magic[2]) || !GetU8(bytes, &offset, &magic[3]) ||
 		!GetU8(bytes, &offset, &version) || !GetU8(bytes, &offset, &stored_frequency) ||
-		!GetU16(bytes, &offset, &reserved) || !GetU32(bytes, &offset, &count) ||
+		!GetU16(bytes, &offset, &reserved) || !GetU32(bytes, &offset, &blob_count) ||
+		!GetU32(bytes, &offset, &total_block_count) ||
 		magic[0] != 'Z' || magic[1] != 'V' || magic[2] != 'I' || magic[3] != '6' ||
-		version != kVaultVersion || stored_frequency != static_cast<uint8_t>(frequency_)) {
+		version != kVaultVersion || stored_frequency != static_cast<uint8_t>(frequency_))
+	{
 		return Status::Error(ErrorCode::CorruptData, "invalid vault index");
 	}
-	for (uint32_t i = 0; i < count; ++i) {
+	index_.reserve(blob_count);
+	for (uint32_t i = 0; i < blob_count; ++i)
+	{
 		Locator locator = {};
+		uint16_t locator_reserved = 0;
 		if (!GetU32(bytes, &offset, &locator.symbol_id) || !GetU32(bytes, &offset, &locator.first_time_block_id) ||
 			!GetU32(bytes, &offset, &locator.last_time_block_id) || !GetU32(bytes, &offset, &locator.segment_id) ||
 			!GetU64(bytes, &offset, &locator.blob_offset) || !GetU32(bytes, &offset, &locator.blob_length) ||
+			!GetU16(bytes, &offset, &locator.block_count) || !GetU16(bytes, &offset, &locator_reserved) ||
 			locator.symbol_id == kInvalidSymbolId || locator.blob_length == 0 ||
-			locator.blob_length > kVaultBlobMaxBytes) {
+			locator.blob_length > kVaultBlobMaxBytes)
+		{
 			return Status::Error(ErrorCode::CorruptData, "invalid vault locator");
 		}
 		index_.push_back(locator);
 		current_segment_id_ = std::max(current_segment_id_, locator.segment_id);
 	}
-	if (offset != bytes.size()) {
+	// Read packed block metadata: 4 bytes per block
+	//   high 16 bits: block_index (day_number / kTimeBlockDayLength)
+	//   low  16 bits: position_count
+	block_meta_.resize(total_block_count);
+	for (uint32_t i = 0; i < total_block_count; ++i)
+	{
+		uint16_t block_idx = 0;
+		uint16_t pos_count = 0;
+		if (!GetU16(bytes, &offset, &block_idx) || !GetU16(bytes, &offset, &pos_count))
+		{
+			PELOG_LOG((PLV_ERROR, "VaultStore::load invalid vault block index\n"));
+			return Status::Error(ErrorCode::CorruptData, "invalid vault block index");
+		}
+		block_meta_[i] = (static_cast<uint32_t>(block_idx) << 16) | static_cast<uint32_t>(pos_count);
+	}
+	if (offset != bytes.size())
+	{
+		PELOG_LOG((PLV_ERROR, "VaultStore::load invalid vault index bytes\n"));
 		return Status::Error(ErrorCode::CorruptData, "trailing vault index bytes");
 	}
 	for (size_t i = 1; i < index_.size(); ++i) {
@@ -2581,6 +2622,7 @@ Status VaultStore::load() {
 			return Status::Error(ErrorCode::CorruptData, "vault index is not sorted");
 		}
 	}
+	rebuild_block_offsets();
 	return Status::Ok();
 }
 
@@ -2589,13 +2631,25 @@ Status VaultStore::write_index() const {
 	PutU8(&bytes, 'Z'); PutU8(&bytes, 'V'); PutU8(&bytes, 'I'); PutU8(&bytes, '6');
 	PutU8(&bytes, kVaultVersion); PutU8(&bytes, static_cast<uint8_t>(frequency_)); PutU16(&bytes, 0);
 	PutU32(&bytes, static_cast<uint32_t>(index_.size()));
-	for (size_t i = 0; i < index_.size(); ++i) {
+	PutU32(&bytes, static_cast<uint32_t>(block_meta_.size()));
+	for (size_t i = 0; i < index_.size(); ++i)
+	{
 		PutU32(&bytes, index_[i].symbol_id);
 		PutU32(&bytes, index_[i].first_time_block_id);
 		PutU32(&bytes, index_[i].last_time_block_id);
 		PutU32(&bytes, index_[i].segment_id);
 		PutU64(&bytes, index_[i].blob_offset);
 		PutU32(&bytes, index_[i].blob_length);
+		PutU16(&bytes, index_[i].block_count);
+		PutU16(&bytes, 0);
+	}
+	// Write packed block metadata (4 bytes per block).
+	for (size_t i = 0; i < block_meta_.size(); ++i)
+	{
+		uint16_t block_idx = static_cast<uint16_t>(block_meta_[i] >> 16);
+		uint16_t pos_count = static_cast<uint16_t>(block_meta_[i] & 0xFFFF);
+		PutU16(&bytes, block_idx);
+		PutU16(&bytes, pos_count);
 	}
 	const std::string temporary_path = path_ + "/vault-index.tmp";
 	std::ofstream output(temporary_path.c_str(), std::ios::binary | std::ios::trunc);
@@ -2633,6 +2687,7 @@ Status VaultStore::ingest(const std::vector<StockTimeBlock>& blocks,
 		by_symbol[blocks[i].key.symbol_id].push_back(pending);
 	}
 	std::vector<Locator> added;
+	std::vector<uint32_t> added_block_meta;  // packed block_meta entries for added blobs
 	const auto append_blob = [&](const std::vector<VaultPendingBlock>& group,
 								const std::vector<uint8_t>& blob) -> Status {
 		const std::string segment_path = VaultSegmentPath(path_, current_segment_id_);
@@ -2659,7 +2714,16 @@ Status VaultStore::ingest(const std::vector<StockTimeBlock>& blocks,
 		locator.segment_id = current_segment_id_;
 		locator.blob_offset = segment_size;
 		locator.blob_length = static_cast<uint32_t>(blob.size());
+		locator.block_count = static_cast<uint16_t>(group.size());
 		added.push_back(locator);
+		for (size_t b = 0; b < group.size(); ++b)
+		{
+			TimeId bid = group[b].block.key.time_block_id;
+			uint16_t block_idx = static_cast<uint16_t>(time_day(bid) / kTimeBlockDayLength);
+			uint16_t pos_count = static_cast<uint16_t>(group[b].block.positions.size());
+			added_block_meta.push_back(
+				(static_cast<uint32_t>(block_idx) << 16) | static_cast<uint32_t>(pos_count));
+		}
 		return Status::Ok();
 	};
 	for (std::map<SymbolId, std::vector<VaultPendingBlock> >::iterator symbol = by_symbol.begin();
@@ -2705,11 +2769,63 @@ Status VaultStore::ingest(const std::vector<StockTimeBlock>& blocks,
 			group.clear();
 		}
 	}
-	index_.insert(index_.end(), added.begin(), added.end());
-	std::sort(index_.begin(), index_.end(), [](const Locator& left, const Locator& right) {
-		return left.symbol_id != right.symbol_id ? left.symbol_id < right.symbol_id :
-			left.first_time_block_id < right.first_time_block_id;
-	});
+	// Merge sorted index_ + sorted added (and corresponding block_meta_ + added_block_meta).
+	// Both are sorted by (symbol_id, first_time_block_id).
+	std::vector<Locator> new_index;
+	std::vector<uint32_t> new_block_meta;
+	new_index.reserve(index_.size() + added.size());
+	new_block_meta.reserve(block_meta_.size() + added_block_meta.size());
+	size_t i = 0, j = 0;
+	// i_block: current position in block_meta_ (matches blob index i)
+	// j_block: current position in added_block_meta (matches blob index j)
+	uint32_t i_block = 0, j_block = 0;
+	while (i < index_.size() && j < added.size())
+	{
+		bool left_less = index_[i].symbol_id < added[j].symbol_id ||
+			(index_[i].symbol_id == added[j].symbol_id &&
+			index_[i].first_time_block_id < added[j].first_time_block_id);
+		if (left_less)
+		{
+			new_index.push_back(index_[i]);
+			uint32_t next_i_block = block_offsets_[i + 1];
+			for (uint32_t k = i_block; k < next_i_block; ++k)
+				new_block_meta.push_back(block_meta_[k]);
+			i_block = next_i_block;
+			++i;
+		}
+		else
+		{
+			new_index.push_back(added[j]);
+			uint16_t count = added[j].block_count;
+			for (uint16_t k = 0; k < count; ++k)
+				new_block_meta.push_back(added_block_meta[j_block + k]);
+			j_block += count;
+			++j;
+		}
+	}
+	// Append remaining old blobs
+	while (i < index_.size())
+	{
+		new_index.push_back(index_[i]);
+		uint32_t next_i_block = block_offsets_[i + 1];
+		for (uint32_t k = i_block; k < next_i_block; ++k)
+			new_block_meta.push_back(block_meta_[k]);
+		i_block = next_i_block;
+		++i;
+	}
+	// Append remaining new blobs
+	while (j < added.size())
+	{
+		new_index.push_back(added[j]);
+		uint16_t count = added[j].block_count;
+		for (uint16_t k = 0; k < count; ++k)
+			new_block_meta.push_back(added_block_meta[j_block + k]);
+		j_block += count;
+		++j;
+	}
+	index_.swap(new_index);
+	block_meta_.swap(new_block_meta);
+	rebuild_block_offsets();
 	return write_index();
 }
 
@@ -2861,107 +2977,182 @@ static Status DecodeVaultBlock(const Calendar& calendar,
 	return Status::Ok();
 }
 
-bool VaultStore::contains(SymbolId symbol_id, TimeId time_id) const {
-	BlockBar bar;
-	return get(symbol_id, time_id, &bar).ok();
+bool VaultStore::contains(SymbolId symbol_id, TimeId time_id) const
+{
+	if (symbol_id == kInvalidSymbolId || !status_.ok())
+		return false;
+	const TimeId target_day = time_day(time_id);
+	const uint16_t target_block_idx =
+		static_cast<uint16_t>(target_day / kTimeBlockDayLength);
+	// Binary search index_ for the first blob of this symbol.
+	// index_ is sorted by (symbol_id, first_time_block_id).
+	const size_t first = std::lower_bound(index_.begin(), index_.end(), symbol_id,
+		[](const Locator &loc, SymbolId sid) { return loc.symbol_id < sid; }) - index_.begin();
+	// Walk all blobs for this symbol, binary-searching each one's block_meta.
+	for (size_t i = first; i < index_.size() && index_[i].symbol_id == symbol_id; ++i)
+	{
+		const Locator &loc = index_[i];
+		// Quick range check against blob bounds first (avoid binary search if out of range).
+		const TimeId first_day = time_day(loc.first_time_block_id);
+		const TimeId last_day = time_day(loc.last_time_block_id) + kTimeBlockDayLength - 1;
+		if (target_day < first_day || target_day > last_day)
+			continue;
+		const uint32_t *begin = &block_meta_[block_offsets_[i]];
+		const uint32_t *end = &block_meta_[block_offsets_[i + 1]];
+		const uint32_t *found = std::lower_bound(begin, end,
+			static_cast<uint32_t>(target_block_idx) << 16,
+			[](uint32_t meta, uint32_t target) {
+				return (meta >> 16) < (target >> 16);
+			});
+		if (found != end && static_cast<uint16_t>((*found) >> 16) == target_block_idx)
+			return true;
+	}
+	return false;
 }
 
-Status VaultStore::get(SymbolId symbol_id, TimeId time_id, BlockBar* out) const {
-	if (out == NULL || symbol_id == kInvalidSymbolId) {
+Status VaultStore::get(SymbolId symbol_id, TimeId time_id, BlockBar *out) const
+{
+	if (out == NULL || symbol_id == kInvalidSymbolId)
+	{
 		return Status::Error(ErrorCode::InvalidArgument, "vault read output and symbol are required");
 	}
-	if (!status_.ok()) {
+	if (!status_.ok())
+	{
 		return status_;
 	}
-	Status first_error = Status::Error(ErrorCode::NotFound, "vault bar was not found");
-	for (size_t i = 0; i < index_.size(); ++i) {
-		const Locator& locator = index_[i];
-		if (locator.symbol_id != symbol_id || !VaultBlockContainsTime(locator.first_time_block_id,
-			locator.last_time_block_id, time_id)) {
+	const TimeId block_day = time_day(time_id) -
+		(time_day(time_id) % kTimeBlockDayLength);
+	const TimeId block_id = daily_bar_id(block_day);
+	const uint16_t target_block_idx =
+		static_cast<uint16_t>(block_day / kTimeBlockDayLength);
+	const uint32_t target_meta = static_cast<uint32_t>(target_block_idx) << 16;
+	// Binary search index_ for the first blob of this symbol.
+	const size_t first = std::lower_bound(index_.begin(), index_.end(), symbol_id,
+		[](const Locator &loc, SymbolId sid) { return loc.symbol_id < sid; }) - index_.begin();
+	// Walk all blobs for this symbol, check block existence in memory before reading disk.
+	for (size_t i = first; i < index_.size() && index_[i].symbol_id == symbol_id; ++i)
+	{
+		const Locator &locator = index_[i];
+		if (!VaultBlockContainsTime(locator.first_time_block_id,
+			locator.last_time_block_id, time_id))
+		{
 			continue;
 		}
+		// In-memory binary search: confirm this block actually exists in the blob.
+		const uint32_t *begin = &block_meta_[block_offsets_[i]];
+		const uint32_t *end = &block_meta_[block_offsets_[i + 1]];
+		const uint32_t *found = std::lower_bound(begin, end, target_meta,
+			[](uint32_t meta, uint32_t target) {
+				return (meta >> 16) < (target >> 16);
+			});
+		if (found == end || static_cast<uint16_t>((*found) >> 16) != target_block_idx)
+			continue;  // Block not present in this blob, skip disk read
 		std::vector<uint8_t> bytes;
 		Status status = ReadVaultBlob(path_, runtime_market_id_, frequency_, locator.segment_id,
 			locator.blob_offset, locator.blob_length, &bytes);
-		if (!status.ok()) {
+		if (!status.ok())
+		{
 			return status.code() == ErrorCode::IoError ? status :
 				Status::Error(ErrorCode::CorruptData, status.message());
 		}
 		std::vector<ActiveBar> bars;
-		const TimeId block_day = time_day(time_id) -
-			(time_day(time_id) % kTimeBlockDayLength);
-		const TimeId block_id = daily_bar_id(block_day);
 		status = DecodeVaultBlock(calendar_, frequency_, runtime_market_id_, locator.segment_id,
 			locator.blob_offset, bytes, symbol_id, block_id, &bars, NULL);
-		if (!status.ok()) {
-			if (status.code() == ErrorCode::NotFound) {
+		if (!status.ok())
+		{
+			if (status.code() == ErrorCode::NotFound)
 				continue;
-			}
 			return Status::Error(ErrorCode::CorruptData, status.message());
 		}
-		for (size_t j = 0; j < bars.size(); ++j) {
-			if (bars[j].time_id == time_id) {
+		for (size_t j = 0; j < bars.size(); ++j)
+		{
+			if (bars[j].time_id == time_id)
+			{
 				*out = bars[j].bar;
 				return Status::Ok();
 			}
 		}
 	}
-	return first_error;
+	return Status::Error(ErrorCode::NotFound, "vault bar was not found");
 }
 
 Status VaultStore::range(const std::vector<SymbolId>& symbol_ids,
 					 TimeId begin,
 					 TimeId end,
-					 std::vector<ActiveBar>* out) const {
-	if (out == NULL || begin > end) {
+					 std::vector<ActiveBar>* out) const
+{
+	if (out == NULL || begin > end)
+	{
 		return Status::Error(ErrorCode::InvalidArgument, "invalid vault range");
 	}
 	out->clear();
-	if (!status_.ok()) {
+	if (!status_.ok())
 		return status_;
-	}
-	std::set<SymbolId> requested(symbol_ids.begin(), symbol_ids.end());
+	const TimeId begin_day = time_day(begin);
+	const TimeId end_day = time_day(end);
+	const uint16_t begin_block_idx =
+		static_cast<uint16_t>(begin_day / kTimeBlockDayLength);
+	const uint16_t end_block_idx =
+		static_cast<uint16_t>(end_day / kTimeBlockDayLength);
 	bool corrupt = false;
-	for (size_t i = 0; i < index_.size(); ++i) {
-		const Locator& locator = index_[i];
-		if (requested.find(locator.symbol_id) == requested.end() ||
-			time_day(locator.last_time_block_id) + kTimeBlockDayLength <= time_day(begin) ||
-			time_day(locator.first_time_block_id) > time_day(end)) {
+	const uint32_t begin_meta = static_cast<uint32_t>(begin_block_idx) << 16;
+	// For each requested symbol, binary-search its blob range in index_,
+	// then iterate only existing blocks via the in-memory block_meta index.
+	for (size_t s = 0; s < symbol_ids.size(); ++s)
+	{
+		SymbolId symbol_id = symbol_ids[s];
+		if (symbol_id == kInvalidSymbolId)
 			continue;
-		}
-		std::vector<uint8_t> bytes;
-		Status status = ReadVaultBlob(path_, runtime_market_id_, frequency_, locator.segment_id,
-			locator.blob_offset, locator.blob_length, &bytes);
-		if (!status.ok()) {
-			corrupt = true;
-			continue;
-		}
-		const TimeId begin_day = time_day(begin);
-		const TimeId end_day = time_day(end);
-		for (TimeId block_id = locator.first_time_block_id; block_id <= locator.last_time_block_id;
-			block_id = daily_bar_id(time_day(block_id) + kTimeBlockDayLength))
+		// Binary search for the first blob of this symbol.
+		const size_t first = std::lower_bound(index_.begin(), index_.end(), symbol_id,
+			[](const Locator &loc, SymbolId sid) { return loc.symbol_id < sid; }) - index_.begin();
+		// Walk all blobs for this symbol that overlap [begin, end].
+		for (size_t i = first; i < index_.size() && index_[i].symbol_id == symbol_id; ++i)
 		{
-			const TimeId block_day = time_day(block_id);
-			if (block_day + kTimeBlockDayLength <= begin_day)
-				continue;	// Block ends before begin: skip
-			if (block_day > end_day)
-				break;	// Block starts after end: stop
-			std::vector<ActiveBar> bars;
-			status = DecodeVaultBlock(calendar_, frequency_, runtime_market_id_, locator.segment_id,
-				locator.blob_offset, bytes, locator.symbol_id, block_id, &bars, NULL);
-			if (!status.ok()) {
-				if (status.code() != ErrorCode::NotFound) {
-					corrupt = true;
-				}
+			const Locator &locator = index_[i];
+			if (time_day(locator.last_time_block_id) + kTimeBlockDayLength <= begin_day ||
+				time_day(locator.first_time_block_id) > end_day)
+			{
 				continue;
 			}
-			for (size_t j = 0; j < bars.size(); ++j) {
-				if (bars[j].time_id >= begin && bars[j].time_id <= end) {
-					out->push_back(bars[j]);
-				}
+			std::vector<uint8_t> bytes;
+			Status status = ReadVaultBlob(path_, runtime_market_id_, frequency_,
+				locator.segment_id, locator.blob_offset, locator.blob_length, &bytes);
+			if (!status.ok())
+			{
+				corrupt = true;
+				continue;
 			}
-			if (block_id > std::numeric_limits<TimeId>::max() - kTimeIdDayStep * kTimeBlockDayLength) {
-				break;
+			// Binary search block_meta for the first block >= begin_block_idx.
+			const uint32_t *blk_begin = &block_meta_[block_offsets_[i]];
+			const uint32_t *blk_end = &block_meta_[block_offsets_[i + 1]];
+			const uint32_t *blk = std::lower_bound(blk_begin, blk_end, begin_meta,
+				[](uint32_t meta, uint32_t target) {
+					return (meta >> 16) < (target >> 16);
+				});
+			// Iterate only existing blocks up to end_block_idx.
+			for (; blk < blk_end; ++blk)
+			{
+				uint16_t block_idx = static_cast<uint16_t>((*blk) >> 16);
+				if (block_idx > end_block_idx)
+					break;
+				TimeId block_id = static_cast<TimeId>(block_idx) *
+					kTimeBlockDayLength * kTimeIdDayStep;
+				std::vector<ActiveBar> bars;
+				status = DecodeVaultBlock(calendar_, frequency_, runtime_market_id_,
+					locator.segment_id, locator.blob_offset, bytes,
+					locator.symbol_id, block_id, &bars, NULL);
+				if (!status.ok())
+				{
+					if (status.code() != ErrorCode::NotFound)
+						corrupt = true;
+					continue;
+				}
+				for (size_t j = 0; j < bars.size(); ++j)
+				{
+					if (bars[j].time_id >= begin && bars[j].time_id <= end)
+						out->push_back(bars[j]);
+				}
 			}
 		}
 	}
@@ -2971,10 +3162,8 @@ Status VaultStore::range(const std::vector<SymbolId>& symbol_ids,
 
 Status VaultStore::latest_time(SymbolId symbol_id, TimeId *out) const
 {
-	// The vault index is a flat vector ordered by symbol. Walk it to find the
-	// locator with the highest last_time_block_id for this symbol, then load
-	// that blob and scan for the maximum time_id. In the common case the
-	// symbol has one blob and we pay exactly one blob load.
+	// Find the last blob for this symbol using the in-memory block index,
+	// then decode only the last block of that blob.
 	if (!status_.ok())
 	{
 		return status_;
@@ -2983,23 +3172,26 @@ Status VaultStore::latest_time(SymbolId symbol_id, TimeId *out) const
 	{
 		return Status::Error(ErrorCode::InvalidArgument, "invalid latest_time arguments");
 	}
-	int best_index = -1;
-	TimeId best_last_block = 0;
-	for (size_t i = 0; i < index_.size(); ++i)
-	{
-		const Locator &locator = index_[i];
-		if (locator.symbol_id != symbol_id) continue;
-		if (best_index == -1 || locator.last_time_block_id > best_last_block)
-		{
-			best_index = static_cast<int>(i);
-			best_last_block = locator.last_time_block_id;
-		}
-	}
-	if (best_index == -1)
+	// Binary search for the first and last blob of this symbol.
+	const size_t first = std::lower_bound(index_.begin(), index_.end(), symbol_id,
+		[](const Locator &loc, SymbolId sid) { return loc.symbol_id < sid; }) - index_.begin();
+	if (first >= index_.size() || index_[first].symbol_id != symbol_id)
 	{
 		return Status::Error(ErrorCode::NotFound, "no vault history for symbol");
 	}
-	const Locator &best = index_[best_index];
+	const size_t last = std::upper_bound(index_.begin() + first, index_.end(), symbol_id,
+		[](SymbolId sid, const Locator &loc) { return sid < loc.symbol_id; }) - index_.begin() - 1;
+	const Locator &best = index_[last];
+	// The last block's block_index is the last entry in the blob's block_meta range.
+	uint32_t blk_start = block_offsets_[last];
+	uint32_t blk_end = block_offsets_[last + 1];
+	if (blk_start == blk_end)
+	{
+		return Status::Error(ErrorCode::NotFound, "no vault history for symbol");
+	}
+	uint16_t last_block_idx = static_cast<uint16_t>(block_meta_[blk_end - 1] >> 16);
+	TimeId last_block_id = static_cast<TimeId>(last_block_idx) * kTimeBlockDayLength * kTimeIdDayStep;
+	// Decode only the last block.
 	std::vector<uint8_t> bytes;
 	Status status = ReadVaultBlob(path_, runtime_market_id_, frequency_, best.segment_id,
 		best.blob_offset, best.blob_length, &bytes);
@@ -3008,32 +3200,22 @@ Status VaultStore::latest_time(SymbolId symbol_id, TimeId *out) const
 		return status.code() == ErrorCode::IoError ? status :
 			Status::Error(ErrorCode::CorruptData, status.message());
 	}
-	TimeId max_time = 0;
-	bool found = false;
-	for (TimeId block_id = best.first_time_block_id; block_id <= best.last_time_block_id;
-		 block_id = daily_bar_id(time_day(block_id) + kTimeBlockDayLength))
+	std::vector<ActiveBar> bars;
+	Status decode_status = DecodeVaultBlock(calendar_, frequency_, runtime_market_id_,
+		best.segment_id, best.blob_offset, bytes, symbol_id, last_block_id, &bars, NULL);
+	if (!decode_status.ok())
 	{
-		std::vector<ActiveBar> bars;
-		Status decode_status = DecodeVaultBlock(calendar_, frequency_, runtime_market_id_,
-			best.segment_id, best.blob_offset, bytes, symbol_id, block_id, &bars, NULL);
-		if (!decode_status.ok())
-		{
-			if (decode_status.code() == ErrorCode::NotFound)
-				continue;
-			return Status::Error(ErrorCode::CorruptData, decode_status.message());
-		}
-		for (size_t j = 0; j < bars.size(); ++j)
-		{
-			if (bars[j].time_id > max_time)
-			{
-				max_time = bars[j].time_id;
-				found = true;
-			}
-		}
-		if (block_id > std::numeric_limits<TimeId>::max() - kTimeIdDayStep * kTimeBlockDayLength)
-			break;
+		if (decode_status.code() == ErrorCode::NotFound)
+			return Status::Error(ErrorCode::NotFound, "no vault history for symbol");
+		return Status::Error(ErrorCode::CorruptData, decode_status.message());
 	}
-	if (!found)
+	TimeId max_time = 0;
+	for (size_t j = 0; j < bars.size(); ++j)
+	{
+		if (bars[j].time_id > max_time)
+			max_time = bars[j].time_id;
+	}
+	if (max_time == 0)
 	{
 		return Status::Error(ErrorCode::NotFound, "no vault history for symbol");
 	}
@@ -3176,11 +3358,18 @@ Status VaultStore::snapshot(std::vector<BlockKey> *keys,
 		return Status::Error(ErrorCode::InvalidArgument, "vault raw snapshot outputs are required");
 	if (!status_.ok())
 		return status_;
+	const size_t total_blocks = block_meta_.size();
 	keys->clear();
 	day_presence->clear();
 	position_counts->clear();
 	frame_bytes->clear();
+	keys->reserve(total_blocks);
+	day_presence->reserve(total_blocks);
+	position_counts->reserve(total_blocks);
+	frame_bytes->reserve(total_blocks);
 	// Walk the index in order, reading each blob once.
+	// Keys and position_counts use the in-memory block index for exact pre-allocation
+	// and verification; day_presence and frame bytes still come from blob data.
 	for (size_t i = 0; i < index_.size(); ++i)
 	{
 		const Locator &locator = index_[i];

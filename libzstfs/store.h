@@ -314,10 +314,22 @@ private:
 		uint32_t segment_id;
 		uint64_t blob_offset;
 		uint32_t blob_length;
+		uint16_t block_count;
 	};
+
+	// Packed per-block metadata (4 bytes each):
+	//   high 16 bits: block_index = time_day(time_block_id) / kTimeBlockDayLength
+	//   low  16 bits: position_count (number of bars in the block)
+	// Entries are grouped by blob in index_ order; block_offsets_ maps
+	// blob index -> start offset in this vector.
+	std::vector<uint32_t> block_meta_;
+	// block_offsets_[i] = first entry in block_meta_ for blob i.
+	// block_offsets_.size() == index_.size() + 1 (sentinel).
+	std::vector<uint32_t> block_offsets_;
 
 	Status load();
 	Status write_index() const;
+	void rebuild_block_offsets();
 
 	Frequency frequency_;
 	const Calendar& calendar_;
@@ -395,4 +407,3 @@ Status StagingTimeIds(const Calendar& calendar,
 TimeId CompactionBlockId(Frequency frequency, TimeId time_id);
 
 }  // namespace zstfs
-
