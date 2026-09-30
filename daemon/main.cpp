@@ -21,6 +21,14 @@ int main(int argc, char** argv)
 	zstfs::Status status = zstfsd::LoadDaemonConfig(argv[1], &config);
 	if (!status.ok())
 		PELOG_ERROR_RETURN((PLV_ERROR, "Config error: %s\n", status.message().c_str()), -1);
+	
+	// setup logging
+	if (!config.logfile.empty())	// default: log to stderr
+	{
+		pelog_setfile_rotate(config.logrotate_filesize_kb, config.logrotate_history_num,
+			config.logfile.c_str(), config.loglinebuf);
+	}
+	pelog_setlevel(config.loglevel.c_str());
 
 	PELOG_LOG((PLV_INFO, "zstfsd Starting\n"));
 	zstfsd::HttpServer server(config);

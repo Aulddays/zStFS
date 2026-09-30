@@ -85,6 +85,13 @@ zstfs::Status LoadDaemonConfig(const std::string& config_path, DaemonConfig* out
 	zstfs::Status status = zstfs::LoadMarketsConfig(config_path, &result.markets);
 	if (!status.ok()) return status;
 
+	// logging
+	result.logfile = config_get_string(&cfg, "logfile", "");
+	result.logrotate_filesize_kb = config_get_int(&cfg, "logrotate_filesize_kb", -1);
+	result.logrotate_history_num = config_get_int(&cfg, "logrotate_history_num", -1);
+	result.loglinebuf = config_get_bool(&cfg, "loglinebuf", false);
+	result.loglevel = config_get_string(&cfg, "loglevel", "TRC");
+
 	*out = result;
 	return zstfs::Status::Ok();
 }

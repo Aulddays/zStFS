@@ -30,6 +30,13 @@ struct DaemonConfig {
 
 	// Configured markets.
 	std::vector<zstfs::MarketDef> markets;
+
+	// logs
+	std::string logfile;
+	size_t logrotate_filesize_kb = -1;
+	int logrotate_history_num = -1;
+	bool loglinebuf = false;
+	std::string loglevel = "TRC";
 };
 
 // Loads and parses the daemon configuration file at config_path. Returns Ok
