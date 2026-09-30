@@ -88,7 +88,8 @@ struct ActiveBar {
 // variable with the same lock and releases it only while sleeping. Destruction
 // first marks the timer stopped under the lock, wakes and joins the timer, then
 // performs the final flush after no other thread can access the store.
-class ActiveStore {
+class ActiveStore
+{
 public:
 	ActiveStore(Frequency frequency,
 	            const Calendar& calendar,
@@ -97,38 +98,30 @@ public:
 	            uint64_t flush_interval_milliseconds = 300 * 1000);
 	~ActiveStore();
 
-	Status put(SymbolId symbol_id,
-	           TimeId time_id,
-	           TimeId block_id,
-	           BlockOff block_offset,
-	           const BlockBar& bar,
-	           bool replay);
+	Status put(SymbolId symbol_id, TimeId time_id, const BlockBar &bar, bool replay);
 	bool contains(SymbolId symbol_id, TimeId time_id) const;
-	Status get(SymbolId symbol_id,
-	           TimeId block_id,
-	           BlockOff block_offset,
-	           BlockBar* out) const;
-	Status range(const std::vector<SymbolId>& symbol_ids,
-	             TimeId begin,
-	             TimeId end,
-	             std::vector<ActiveBar>* out) const;
+	Status get(SymbolId symbol_id, TimeId time_id, BlockBar *out) const;
+	Status range(const std::vector<SymbolId> &symbol_ids,
+				TimeId begin, TimeId end,
+				std::vector<ActiveBar> *out) const;
 	// latest_time finds the most recent TimeId at which the given symbol
 	// has any data in this store. Returns NotFound when absent.
-	Status latest_time(SymbolId symbol_id, TimeId* out) const;
+	// If limit > 0 and the latest would be <= limit, returns NotFound.
+	Status latest_time(SymbolId symbol_id, TimeId *out, TimeId limit = 0) const;
 	Status flush_if_needed();
 	Status flush();
 	// collect_before snapshots complete blocks without changing their Active
 	// ownership. History removes them only after Staging has published them.
 	Status collect_before(TimeId time_id,
-	                      std::vector<StockTimeBlock>* sealed,
-	                      std::vector<ActiveBar>* sealed_bars);
+						std::vector<StockTimeBlock> *sealed,
+						std::vector<ActiveBar> *sealed_bars);
 	// Streams sealed blocks one at a time to the given callback. Holds the
 	// ActiveStore mutex for the entire duration, so the callback must not
 	// re-enter ActiveStore. Each callback invocation receives a temporary
 	// StockTimeBlock whose positions reference a single stock-block only;
 	// the callback must not retain the reference after returning.
 	Status seal_foreach(TimeId time_id,
-	                    const std::function<Status(const StockTimeBlock &)> &callback);
+					const std::function<Status(const StockTimeBlock &)> &callback);
 	// Returns true if there is at least one complete block before time_id
 	// that would be sealed.
 	bool has_sealable_blocks(TimeId time_id) const;
@@ -140,7 +133,7 @@ private:
 	void run_flush_timer();
 
 	Frequency frequency_;
-	const Calendar& calendar_;
+	const Calendar &calendar_;
 	std::string path_;
 	std::map<TimeId, ActiveTimeBlock> blocks_;
 	Status replay_status_;
@@ -160,7 +153,8 @@ struct ParsedStagingRecord;
 // frames and the presence bitmap needed to distinguish padded Missing values
 // from explicitly written Missing bars. Page data is loaded on demand through
 // the shared compressed+decoded cache; the index alone is always resident.
-class StagingStore {
+class StagingStore
+{
 public:
 	StagingStore(Frequency frequency,
 	             const Calendar& calendar,
@@ -188,7 +182,8 @@ public:
 	             std::vector<ActiveBar>* out) const;
 	// latest_time finds the most recent TimeId at which the given symbol
 	// has any data in this store. Returns NotFound when absent.
-	Status latest_time(SymbolId symbol_id, TimeId* out) const;
+	// If limit > 0 and the latest would be <= limit, returns NotFound.
+	Status latest_time(SymbolId symbol_id, TimeId *out, TimeId limit = 0) const;
 	// snapshot exposes complete logical records to the offline compactor without
 	// exposing the persistent Staging page layout outside this implementation.
 	// When requested, frame_bytes is aligned with blocks and contains immutable
@@ -272,7 +267,8 @@ private:
 // ingest entry point is intentionally internal: a later compactor can pass its
 // sorted completed blocks directly without coupling the Vault layout to the
 // mutable Active or time-oriented Staging stores.
-class VaultStore {
+class VaultStore
+{
 public:
 	VaultStore(Frequency frequency,
 	           const Calendar& calendar,
@@ -291,7 +287,8 @@ public:
 	             std::vector<ActiveBar>* out) const;
 	// latest_time finds the most recent TimeId at which the given symbol
 	// has any data in this store. Returns NotFound when absent.
-	Status latest_time(SymbolId symbol_id, TimeId* out) const;
+	// If limit > 0 and the latest would be <= limit, returns NotFound.
+	Status latest_time(SymbolId symbol_id, TimeId *out, TimeId limit = 0) const;
 	// snapshot reconstructs complete logical records from immutable Vault blobs.
 	// frame_bytes, when requested, is aligned with blocks for byte-preserving
 	// compaction into a replacement Vault generation.

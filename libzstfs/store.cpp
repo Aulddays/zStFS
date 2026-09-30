@@ -187,19 +187,20 @@ bool ActiveBarOrder(const ActiveBar& left, const ActiveBar& right) {
 }
 
 ActiveStore::ActiveStore(Frequency frequency,
-				 const Calendar& calendar,
-				 const std::string& market_path,
-				 size_t flush_bytes,
-				 uint64_t flush_interval_milliseconds)
-	: frequency_(frequency),
-	  calendar_(calendar),
-	  path_(market_path + "/active.data"),
-	  replay_status_(Status::Ok()),
-	  flush_bytes_(flush_bytes == 0 ? 1 : flush_bytes),
-	  flush_interval_milliseconds_(flush_interval_milliseconds == 0 ? 1 :
-		flush_interval_milliseconds),
-	  dirty_bytes_(0),
-	  stop_flush_timer_(false) {
+			const Calendar &calendar,
+			const std::string &market_path,
+			size_t flush_bytes,
+			uint64_t flush_interval_milliseconds)
+		: frequency_(frequency),
+			calendar_(calendar),
+			path_(market_path + "/active.data"),
+			replay_status_(Status::Ok()),
+			flush_bytes_(flush_bytes == 0 ? 1 : flush_bytes),
+			flush_interval_milliseconds_(flush_interval_milliseconds == 0 ? 1 :
+			flush_interval_milliseconds),
+			dirty_bytes_(0),
+			stop_flush_timer_(false)
+{
 	FILE *fp = fopen(path_.c_str(), "rb");
 	if (fp == NULL)
 	{
@@ -297,8 +298,7 @@ ActiveStore::ActiveStore(Frequency frequency,
 				fclose(fp);
 				return;
 			}
-			replay_status_ = put(record.symbol_id, record.time_id, block_id, block_offset,
-								 record.bar, true);
+			replay_status_ = put(record.symbol_id, record.time_id, record.bar, true);
 			if (!replay_status_.ok())
 			{
 				fclose(fp);
@@ -324,12 +324,8 @@ ActiveStore::~ActiveStore() {
 	flush();
 }
 
-Status ActiveStore::put(SymbolId symbol_id,
-				TimeId time_id,
-				TimeId block_id,
-				BlockOff block_offset,
-				const BlockBar& bar,
-				bool replay) {
+Status ActiveStore::put(SymbolId symbol_id, TimeId time_id, const BlockBar &bar, bool replay)
+{
 	// This write must be synchronized with reads, sealing, and timer flushes.
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (!replay_status_.ok()) {
@@ -338,8 +334,13 @@ Status ActiveStore::put(SymbolId symbol_id,
 	if (symbol_id == kInvalidSymbolId || !ValidState(bar.state) || !ValidBar(bar)) {
 		return Status::Error(ErrorCode::InvalidArgument, "invalid active bar");
 	}
+	TimeId block_id = 0;
+	BlockOff block_offset = 0;
+	Status status = calendar_.block_offset(frequency_, time_id, &block_id, &block_offset);
+	if (!status.ok())
+		return status;
 	BlockOff block_length = 0;
-	Status status = calendar_.block_length(frequency_, block_id, &block_length);
+	status = calendar_.block_length(frequency_, block_id, &block_length);
 	if (!status.ok()) {
 		return status;
 	}
@@ -397,10 +398,8 @@ bool ActiveStore::contains(SymbolId symbol_id, TimeId time_id) const {
 	return false;
 }
 
-Status ActiveStore::get(SymbolId symbol_id,
-				TimeId block_id,
-				BlockOff block_offset,
-				BlockBar* out) const {
+Status ActiveStore::get(SymbolId symbol_id, TimeId time_id, BlockBar *out) const
+{
 	// This read must be synchronized with writes, sealing, and timer flushes.
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (out == NULL || symbol_id == kInvalidSymbolId) {
@@ -409,6 +408,11 @@ Status ActiveStore::get(SymbolId symbol_id,
 	if (!replay_status_.ok()) {
 		return replay_status_;
 	}
+	TimeId block_id = 0;
+	BlockOff block_offset = 0;
+	Status status = calendar_.block_offset(frequency_, time_id, &block_id, &block_offset);
+	if (!status.ok())
+		return status;
 	std::map<TimeId, ActiveTimeBlock>::const_iterator block = blocks_.find(block_id);
 	if (block == blocks_.end() || block_offset >= block->second.position_count) {
 		return Status::Error(ErrorCode::NotFound, "active bar was not found");
@@ -458,7 +462,7 @@ Status ActiveStore::range(const std::vector<SymbolId>& symbol_ids,
 	return Status::Ok();
 }
 
-Status ActiveStore::latest_time(SymbolId symbol_id, TimeId *out) const
+Status ActiveStore::latest_time(SymbolId symbol_id, TimeId *out, TimeId limit) const
 {
 	// Walk blocks in reverse order and find the last position at which the
 	// symbol has data. The in-memory block map and per-stock presence vector
@@ -473,9 +477,11 @@ Status ActiveStore::latest_time(SymbolId symbol_id, TimeId *out) const
 	{
 		return Status::Error(ErrorCode::InvalidArgument, "invalid latest_time arguments");
 	}
-	for (std::map<TimeId, ActiveTimeBlock>::const_reverse_iterator block = blocks_.rbegin();
-		 block != blocks_.rend(); ++block)
+	for (auto block = blocks_.crbegin(); block != blocks_.crend(); ++block)
 	{
+		// If this block's start time is already <= limit, no newer data exists.
+		if (limit > 0 && block->first <= limit)
+			break;
 		std::map<SymbolId, ActiveStockBlock>::const_iterator stock =
 			block->second.stocks.find(symbol_id);
 		if (stock == block->second.stocks.end()) continue;
@@ -484,7 +490,10 @@ Status ActiveStore::latest_time(SymbolId symbol_id, TimeId *out) const
 		{
 			if (stock->second.present[i])
 			{
-				*out = stock->second.time_ids[i];
+				TimeId t = stock->second.time_ids[i];
+				if (limit > 0 && t <= limit)
+					continue;
+				*out = t;
 				return Status::Ok();
 			}
 		}
@@ -1819,10 +1828,11 @@ Status StagingStore::range(const std::vector<SymbolId>& symbol_ids,
 	return Status::Ok();
 }
 
-Status StagingStore::latest_time(SymbolId symbol_id, TimeId *out) const
+Status StagingStore::latest_time(SymbolId symbol_id, TimeId *out, TimeId limit) const
 {
 	// Use the symbol secondary index to find the latest block in O(log n),
 	// then load that single page and scan for the maximum time_id.
+	// If limit > 0 and the last block's time_block_id <= limit, skip page load.
 	if (!status_.ok())
 	{
 		return status_;
@@ -1841,10 +1851,17 @@ Status StagingStore::latest_time(SymbolId symbol_id, TimeId *out) const
 		return Status::Error(ErrorCode::NotFound, "no staging history for symbol");
 	}
 	const std::vector<TimeId>& blocks = sym_it->block_ids;
+	const TimeId block_span = kTimeBlockDayLength * kTimeIdDayStep;
+	// Fast path: if the newest block's full range ends <= limit, skip page load.
+	// Max possible time in a block = block_start + block_span - 1.
+	if (limit > 0 && blocks.back() + block_span - 1 <= limit)
+		return Status::Error(ErrorCode::NotFound, "no staging history for symbol");
 	// Walk blocks from newest to oldest until we find one with bar data.
 	// The newest block normally has data, so only one page load is needed.
 	for (auto bi = blocks.rbegin(); bi != blocks.rend(); ++bi)
 	{
+		if (limit > 0 && *bi + block_span - 1 <= limit)
+			break;
 		const IndexEntry *entry = find_entry(*bi, symbol_id);
 		if (entry == NULL)
 			continue;
@@ -1869,7 +1886,7 @@ Status StagingStore::latest_time(SymbolId symbol_id, TimeId *out) const
 				}
 			}
 		}
-		if (found)
+		if (found && max_time > limit)
 		{
 			*out = max_time;
 			return Status::Ok();
@@ -3160,10 +3177,12 @@ Status VaultStore::range(const std::vector<SymbolId>& symbol_ids,
 	return corrupt ? Status::Error(ErrorCode::CorruptData, "one or more vault blocks are corrupt") : Status::Ok();
 }
 
-Status VaultStore::latest_time(SymbolId symbol_id, TimeId *out) const
+Status VaultStore::latest_time(SymbolId symbol_id, TimeId *out, TimeId limit) const
 {
 	// Find the last blob for this symbol using the in-memory block index,
 	// then decode only the last block of that blob.
+	// If limit > 0 and even the last block's full range cannot exceed it,
+	// return NotFound directly without any disk read.
 	if (!status_.ok())
 	{
 		return status_;
@@ -3189,8 +3208,12 @@ Status VaultStore::latest_time(SymbolId symbol_id, TimeId *out) const
 	{
 		return Status::Error(ErrorCode::NotFound, "no vault history for symbol");
 	}
+	const TimeId block_span = kTimeBlockDayLength * kTimeIdDayStep;
 	uint16_t last_block_idx = static_cast<uint16_t>(block_meta_[blk_end - 1] >> 16);
-	TimeId last_block_id = static_cast<TimeId>(last_block_idx) * kTimeBlockDayLength * kTimeIdDayStep;
+	TimeId last_block_id = static_cast<TimeId>(last_block_idx) * block_span;
+	// Fast path: if the last block's full range cannot exceed limit, skip disk read.
+	if (limit > 0 && last_block_id + block_span - 1 <= limit)
+		return Status::Error(ErrorCode::NotFound, "no vault history for symbol");
 	// Decode only the last block.
 	std::vector<uint8_t> bytes;
 	Status status = ReadVaultBlob(path_, runtime_market_id_, frequency_, best.segment_id,
@@ -3212,7 +3235,7 @@ Status VaultStore::latest_time(SymbolId symbol_id, TimeId *out) const
 	TimeId max_time = 0;
 	for (size_t j = 0; j < bars.size(); ++j)
 	{
-		if (bars[j].time_id > max_time)
+		if (bars[j].time_id > limit && bars[j].time_id > max_time)
 			max_time = bars[j].time_id;
 	}
 	if (max_time == 0)

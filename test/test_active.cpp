@@ -287,7 +287,7 @@ void TestAutomaticFlush() {
 	{
 		zstfs::ActiveStore active(zstfs::Frequency::Daily, calendar, threshold_path,
 			1, 60 * 1000);
-		ExpectOk(active.put(9, time_id, block_id, block_offset, bar, false));
+		ExpectOk(active.put(9, time_id, bar, false));
 		ExpectOk(active.flush_if_needed());
 		assert(FileSize(threshold_path + "/active.data") == 36);
 	}
@@ -297,7 +297,7 @@ void TestAutomaticFlush() {
 	{
 		zstfs::ActiveStore active(zstfs::Frequency::Daily, calendar, timer_path,
 			1024 * 1024, 5);
-		ExpectOk(active.put(9, time_id, block_id, block_offset, bar, false));
+		ExpectOk(active.put(9, time_id, bar, false));
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		assert(FileSize(timer_path + "/active.data") == 36);
 	}
@@ -436,21 +436,20 @@ void TestVaultPersistenceMergeAndCorruption() {
 		assert(CloseEnough(bar.close, 10.0));
 
 		// Active data is newer than Vault data for the same logical key.
+		// History returns the newest layer's value without checking lower layers.
 		ExpectOk(history.put(BarFor(corrupt_symbol, zstfs::Frequency::Daily,
 			"20260803", 30.0)));
 		bar = BarFor(corrupt_symbol, zstfs::Frequency::Daily, "20260803", 999.0);
-		assert(history.get(corrupt_symbol, "20260803", &bar).code() ==
-			zstfs::ErrorCode::CorruptData);
-		assert(CloseEnough(bar.close, 999.0));
+		ExpectOk(history.get(corrupt_symbol, "20260803", &bar));
+		assert(CloseEnough(bar.close, 30.0));
 
 		// Once sealed, Staging remains newer than the underlying Vault value.
 		ExpectOk(history.put(BarFor(corrupt_symbol, zstfs::Frequency::Daily,
 			"20260804", 40.0)));
 		ExpectOk(history.seal_before("20260805"));
 		bar = BarFor(corrupt_symbol, zstfs::Frequency::Daily, "20260804", 999.0);
-		assert(history.get(corrupt_symbol, "20260804", &bar).code() ==
-			zstfs::ErrorCode::CorruptData);
-		assert(CloseEnough(bar.close, 999.0));
+		ExpectOk(history.get(corrupt_symbol, "20260804", &bar));
+		assert(CloseEnough(bar.close, 40.0));
 		std::vector<zstfs::Bar> values;
 		std::vector<zstfs::SymbolId> symbols;
 		symbols.push_back(intact_symbol);

@@ -148,7 +148,7 @@ Status History::put(const Bar& bar) {
 			bar.symbol_id, bar.time.c_str()),
 			Status::Error(ErrorCode::AlreadyPresent, "history bar is already present"));
 	}
-	status = active_->put(bar.symbol_id, time_id, block_id, block_offset, block_bar, false);
+	status = active_->put(bar.symbol_id, time_id, block_bar, false);
 	if (!status.ok())
 	{
 		return status;
@@ -227,8 +227,7 @@ Status History::put(const std::vector<Bar>& bars) {
 			block_bar.high = item.bar.high;
 			block_bar.low = item.bar.low;
 		}
-		Status status = active_->put(item.bar.symbol_id, item.time_id, item.block_id,
-							 item.block_offset, block_bar, false);
+		Status status = active_->put(item.bar.symbol_id, item.time_id, block_bar, false);
 		if (!status.ok()) {
 			return status;
 		}
@@ -236,118 +235,75 @@ Status History::put(const std::vector<Bar>& bars) {
 	return active_->flush_if_needed();
 }
 
-Status History::get(SymbolId symbol_id,
-			    const std::string& time,
-			    Bar* out) const {
-	if (!status_.ok()) {
+Status History::get(SymbolId symbol_id, const std::string &time, Bar* out) const
+{
+	if (!status_.ok())
 		return status_;
-	}
-	if (out == NULL || symbol_id == kInvalidSymbolId) {
+	if (out == NULL || symbol_id == kInvalidSymbolId)
 		return Status::Error(ErrorCode::InvalidArgument, "history read output and symbol are required");
-	}
-	// An empty time means "latest bar". We first find the latest TimeId
-	// using each store's in-memory index, then read the single bar at that time.
-	// This avoids scanning the full history range and only pays for one point
-	// lookup across the three layers, the same as a time-specified get.
+
+	TimeId time_id = 0;
+	Status status = Status::Ok();
+	// An empty time means "latest bar". We first find the latest TimeId in each store
 	if (time.empty())
 	{
 		TimeId latest = 0;
-		bool found = false;
-		TimeId active_latest = 0;
-		Status active_status = active_->latest_time(symbol_id, &active_latest);
-		if (active_status.ok())
+		// ActiveStore
+		if ((status = active_->latest_time(symbol_id, &latest)).ok())
+			time_id = latest;	// found
+		else if (status.code() != ErrorCode::NotFound)
+			return status;	// on error
+		// Staging: pass time_id as limit.
+		if ((status = staging_->latest_time(symbol_id, &latest, time_id)).ok())
 		{
-			latest = active_latest;
-			found = true;
+			if (latest > time_id)	// found newer
+				time_id = latest;
 		}
-		else if (active_status.code() != ErrorCode::NotFound)
+		else if (status.code() != ErrorCode::NotFound)
+			return status;	// on error
+		// Vault
+		if ((status = vault_->latest_time(symbol_id, &latest, time_id)).ok())
 		{
-			return active_status;
+			if (latest > time_id)	// found newer
+				time_id = latest;
 		}
-		TimeId staged_latest = 0;
-		Status staged_status = staging_->latest_time(symbol_id, &staged_latest);
-		if (staged_status.ok())
-		{
-			if (!found || staged_latest > latest)
-			{
-				latest = staged_latest;
-			}
-			found = true;
-		}
-		else if (staged_status.code() != ErrorCode::NotFound)
-		{
-			return staged_status;
-		}
-		TimeId vault_latest = 0;
-		Status vault_status = vault_->latest_time(symbol_id, &vault_latest);
-		if (vault_status.ok())
-		{
-			if (!found || vault_latest > latest)
-			{
-				latest = vault_latest;
-			}
-			found = true;
-		}
-		else if (vault_status.code() != ErrorCode::NotFound)
-		{
-			return vault_status;
-		}
-		if (!found)
-		{
+		else if (status.code() != ErrorCode::NotFound)
+			return status;	// on error
+		if (time_id == 0)	// none found
 			return Status::Error(ErrorCode::NotFound, "history bar was not found");
-		}
-		// Convert the resolved TimeId back to a canonical local-time string and
-		// fall through to the normal single-bar read path.
-		std::string resolved_time;
-		Status status = LocalTime(calendar_, frequency_, latest, &resolved_time);
-		if (!status.ok()) return status;
-		return get(symbol_id, resolved_time, out);
 	}
-	TimeId time_id = 0;
-	TimeId block_id = 0;
-	BlockOff block_offset = 0;
-	Status status = ResolveTime(calendar_, frequency_, time,
-						&time_id, &block_id, &block_offset);
-	if (!status.ok()) {
-		return status;
+	else	// non-empty time, convert to TimeId
+	{
+		TimeId block_id = 0;
+		BlockOff block_offset = 0;
+		status = ResolveTime(calendar_, frequency_, time,
+							&time_id, &block_id, &block_offset);
+		if (!status.ok())
+			return status;
 	}
-	BlockBar active_bar = {};
-	BlockBar staged_bar = {};
-	BlockBar vault_bar = {};
-	const Status active_status = active_->get(symbol_id, block_id, block_offset, &active_bar);
-	const Status staged_status = staging_->get(symbol_id, time_id, &staged_bar);
-	const Status vault_status = vault_->get(symbol_id, time_id, &vault_bar);
-	if ((!active_status.ok() && active_status.code() != ErrorCode::NotFound) ||
-		(!staged_status.ok() && staged_status.code() != ErrorCode::NotFound) ||
-		(!vault_status.ok() && vault_status.code() != ErrorCode::NotFound)) {
-		// A corrupt target must never expose a partially reconstructed single bar.
-		if (active_status.code() != ErrorCode::NotFound && !active_status.ok()) {
-			return active_status;
-		}
-		if (staged_status.code() != ErrorCode::NotFound && !staged_status.ok()) {
-			return staged_status;
-		}
-		return vault_status;
-	}
-	const bool has_active = active_status.ok();
-	const bool has_staged = staged_status.ok();
-	const bool has_vault = vault_status.ok();
-	const bool layer_conflict =
-		(has_active && has_staged && !SameBlockBar(active_bar, staged_bar)) ||
-		(has_active && has_vault && !SameBlockBar(active_bar, vault_bar)) ||
-		(has_staged && has_vault && !SameBlockBar(staged_bar, vault_bar));
-	BlockBar block_bar = has_active ? active_bar : (has_staged ? staged_bar : vault_bar);
-	if (!has_active && !has_staged && !has_vault) {
+
+	// Try layers from newest to oldest; return the first hit.
+	// Active overwrites Staging overwrites Vault by design.
+	BlockBar block_bar = {};
+	if ((status = active_->get(symbol_id, time_id, &block_bar)).ok())
+		;	// found in active
+	else if (status.code() != ErrorCode::NotFound)
+		return status;	// on error
+	else if ((status = staging_->get(symbol_id, time_id, &block_bar)).ok())	// not found, try staging
+		;	// found in staging
+	else if (status.code() != ErrorCode::NotFound)
+		return status;	// on error
+	else if ((status = vault_->get(symbol_id, time_id, &block_bar)).ok())	// try vault
+		;	// found in vault
+	else if (status.code() == ErrorCode::NotFound)	// not found in all stores
 		return Status::Error(ErrorCode::NotFound, "history bar was not found");
-	}
-	if (layer_conflict) {
-		return Status::Error(ErrorCode::CorruptData, "history layers contain conflicting bars");
-	}
+	else
+		return status;	// on error
+
 	std::string canonical_time;
 	status = LocalTime(calendar_, frequency_, time_id, &canonical_time);
-	if (!status.ok()) {
+	if (!status.ok())
 		return status;
-	}
 	Bar result = {symbol_id, frequency_, canonical_time, block_bar.state, block_bar.open,
 		block_bar.high, block_bar.low, block_bar.close, block_bar.volume};
 	*out = result;
