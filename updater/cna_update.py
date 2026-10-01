@@ -7,59 +7,101 @@ from datetime import datetime, timedelta
 import time
 from collections import defaultdict
 
+tmstart = None
 
 def main(argv):
+    global tmstart
+    tmstart = time.time()
+    isschedule = len(argv) > 1 and argv[1] == "schedule"
     common.setup()
-    cna_date()
+    cna_date(isschedule)
     
-    symbols = cna_index_list()
-    common.put_symbols(symbols, "cna")
-    # print(records[0])
-    # symbols = [{"code": "sh000001", 'list_date': '19910715'}]
-    cna_updatedata_daily(symbols)
+    stats = [None] * 4
+    while True:
+        idx = 0
+        if stats[idx] is None or stats[idx][2] <= 0.95:
+            symbols = cna_index_list()
+            common.put_symbols(symbols, "cna")
+            # print(records[0])
+            # symbols = [{"code": "sh000001", 'list_date': '19910715'}]
+            stats[idx] = cna_updatedata_daily(symbols)
+            stats[idx].append(stats[idx][0] * 1.0 / stats[idx][1] if stats[idx][0] > 0 else 0)
+        
+        idx += 1
+        if stats[idx] is None or stats[idx][2] <= 0.95:
+            symbols = cna_stock_list()
+            common.put_symbols(symbols, "cna")
+            # # print(symbols[:10])
+            # symbols = [{'code': 'sh600004', 'name': '白云机场', 'list_date': '20030428'}]
+            stats[idx] = cna_updatedata_daily(symbols)
+            stats[idx].append(stats[idx][0] * 1.0 / stats[idx][1] if stats[idx][0] > 0 else 0)
+            
+        idx += 1
+        if stats[idx] is None or stats[idx][2] <= 0.95:
+            symbols = cna_etf_list()
+            common.put_symbols(symbols, "cna")
+            # print(symbols[0])
+            stats[idx] = cna_updatedata_daily(symbols)
+            stats[idx].append(stats[idx][0] * 1.0 / stats[idx][1] if stats[idx][0] > 0 else 0)
+            
+        idx += 1
+        if stats[idx] is None or stats[idx][2] <= 0.95:
+            symbols = cnof_list()
+            common.put_symbols(symbols, "cnof")
+            # print(symbols[:5])
+            # symbols = [{'code': 'of000001', 'name': '华夏成长混合', 'values': {'20260924': 3.868, '20260923': 3.897}}]
+            stats[idx] = cnof_updatedata(symbols)
+            stats[idx].append(stats[idx][0] * 1.0 / stats[idx][1] if stats[idx][0] > 0 else 0)
+        
+        if not isschedule:
+            break
+        logging.info("Progress: %s", stats)
+        if (time.time() < tmstart or time.time() > tmstart + 6 * 3600 or
+                all(s[2] > 0.95 for s in stats)):   # all finished
+            break
+        time.sleep(600)
     
-    symbols = cna_stock_list()
-    common.put_symbols(symbols, "cna")
-    # # print(symbols[:10])
-    # symbols = [{'code': 'sh600004', 'name': '白云机场', 'list_date': '20030428'}]
-    cna_updatedata_daily(symbols)
-    
-    symbols = cna_etf_list()
-    common.put_symbols(symbols, "cna")
-    # print(symbols[0])
-    cna_updatedata_daily(symbols)
-    
-    symbols = cnof_list()
-    common.put_symbols(symbols, "cnof")
-    # print(symbols[:5])
-    # symbols = [{'code': 'of000001', 'name': '华夏成长混合', 'values': {'20260924': 3.868, '20260923': 3.897}}]
-    cnof_updatedata(symbols)
+    common.stage()
 
     return 0
 
 # newest market open date for cna 
+# wait_ready: If True, wait until there is newer data than local store, for at most 2 hours
 _cna_date = None
 _cna_open_dates = set()
-def cna_date():
+def cna_date(wait_ready=False):
     global _cna_date
-    # get sh000001 data and get the newest date
-    cur_date = datetime.now()
-    if cur_date.strftime("%H%M") < "1600":
-        cur_date -= timedelta(days=1)   # Today is not finished
-    start_date = (cur_date - timedelta(days=31)).strftime("%Y%m%d")
-    end_date = cur_date.strftime("%Y%m%d")
-    logging.verbose("cna_date test range: %s %s", start_date, end_date)
-    rawdata = common.safe_call(akshare.stock_zh_a_hist_tx,
-            symbol="sh000001", start_date=start_date, end_date=end_date, adjust="")
-    for __, row in rawdata.iterrows():
-        newdate = row["date"].strftime("%Y%m%d")
-        _cna_open_dates.add(newdate)
-        if _cna_date is None or newdate > _cna_date:
-            _cna_date = newdate
-    if _cna_date is None:
-        _cna_date = end_date
-    logging.info("CNA open date: %s", _cna_date)
-
+    while True:
+        # get sh000001 data and get the newest date
+        cur_date = datetime.now()
+        if cur_date.strftime("%H%M") < "1530":
+            cur_date -= timedelta(days=1)   # Today is not finished
+        start_date = (cur_date - timedelta(days=31)).strftime("%Y%m%d")
+        end_date = cur_date.strftime("%Y%m%d")
+        logging.verbose("cna_date test range: %s %s", start_date, end_date)
+        rawdata = common.safe_call(akshare.stock_zh_a_hist_tx,
+                symbol="sh000001", start_date=start_date, end_date=end_date, adjust="")
+        for __, row in rawdata.iterrows():
+            # print(row)
+            newdate = row["date"].strftime("%Y%m%d")
+            _cna_open_dates.add(newdate)
+            if _cna_date is None or newdate > _cna_date:
+                _cna_date = newdate
+        if _cna_date is None:
+            _cna_date = end_date
+        logging.info("CNA open date: %s", _cna_date)
+        if _cna_date != end_date and wait_ready:
+            # get local store date
+            regdata = common.get_bar("cna", "sh000001", "daily")
+            # print(regdata)
+            if len(regdata) > 0:
+                regdate = regdata["time"]
+                logging.info("CNA store date: %s", regdate)
+                if time.time() > tmstart and time.time() < tmstart + 7200 and regdate >= _cna_date:
+                    logging.info("No new data. Wait 5 min...")
+                    time.sleep(300)
+                    continue
+        break
 
 def cna_index_list():
     logging.info("Fetching CNA Index list...")
@@ -237,7 +279,9 @@ def cna_etf_list():
 
 
 def cna_updatedata_daily(symbols):
+    stat = [0, 0]   # done_num / all_num
     for symbol in symbols:
+        stat[1] += 1
         name = f"{symbol["code"]}:{symbol["name"]}" if "name" in symbol else symbol["code"]
         # determine start date for the symbol
         regdata = common.get_bar("cna", symbol["code"], "daily")
@@ -251,6 +295,7 @@ def cna_updatedata_daily(symbols):
             start_date = "19000101"
         if start_date > _cna_date:
             logging.info("%s already up to date %s", name, _cna_date)
+            stat[0] += 1
             continue
         # Try tx first, except for BJ
         apilist = ["tx", "sina"]
@@ -265,12 +310,14 @@ def cna_updatedata_daily(symbols):
         # put server
         if data is not None and len(data) > 0:
             common.put_bars(data, "cna")
+            if max(d["time"] for d in data) >= _cna_date:
+                stat[0] += 1
         logging.info("%s put %d bars", name, len(data) if data is not None else 0)
-        time.sleep(1)
+        # time.sleep(1)
         if start_date[:4] != _cna_date[:4]:
-            time.sleep(1)
+            time.sleep(2)
         # break
-        
+    return stat
 
 def cna_getdata_daily(code, name, start_date, end_date, api="tx"):
     # fetch data
@@ -361,6 +408,7 @@ def cnof_list():
 
 
 def cnof_updatedata(symbols):
+    stat = [0, 0]   # done_num / all_num
     opendates = sorted(_cna_open_dates) # sorted open dates
     openmap = dict((date, i) for i, date in enumerate(opendates))   # dates -> index in sorted
     allthresh = opendates[0]    # thresh that 3-mon covers
@@ -369,6 +417,7 @@ def cnof_updatedata(symbols):
         if "values" not in symbol or len(symbol["values"]) == 0:
             logging.info("%s Skip no value", name)
             continue
+        stat[1] += 1
         # get server date to determine start date for the symbol
         regdata = common.get_bar("cnof", symbol["code"], "daily")
         newdate = None
@@ -389,10 +438,12 @@ def cnof_updatedata(symbols):
                             "frequency": "daily",
                             "state": "normal",
                             "time": date, "open": value, "high": value, "low": value, "close": value,
-                            "volume": 0,
+                            "volume": 1,    # value 1 takes smallest storage for `volume`
                         })
                 if len(records) == 0:
                     logging.info("%s already up to date %s", name, newdate)
+                    if newdate >= _cna_date:
+                        stat[0] += 1
                     continue
             elif newdate >= allthresh:
                 period = "3月"
@@ -426,16 +477,19 @@ def cnof_updatedata(symbols):
                         "frequency": "daily",
                         "state": "normal",
                         "time": date, "open": value, "high": value, "low": value, "close": value,
-                        "volume": 0,
+                        "volume": 1,    # value 1 takes smallest storage for `volume`
                     })
         records.sort(key=lambda x: x["time"])
         # print(len(records), records[0], records[-1], end="\n")
 
         if records is not None and len(records) > 0:
             common.put_bars(records, "cnof")
+            if max(d["time"] for d in records) >= _cna_date:
+                stat[0] += 1
         logging.info("%s put %d bars", name, len(records) if records is not None else 0)
         if period is not None:
             time.sleep(1)
+    return stat
 
 
 if __name__ == "__main__":

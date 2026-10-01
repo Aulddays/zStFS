@@ -130,7 +130,7 @@ def put_symbols(records, market):
     payload = records
     logging.verbose("Writing %d symbols %s ...", len(payload), url)
     try:
-        with httpx.Client(timeout=60.0) as client:
+        with httpx.Client(timeout=60) as client:
             resp = client.post(url, json=payload)
             resp.raise_for_status()
             data = resp.json()
@@ -148,7 +148,7 @@ def get_bar(market, code, frequency, time=None):
     if isinstance(time, str) and time != "":
         url += f"&time={time}"
     try:
-        with httpx.Client(timeout=10.0) as client:
+        with httpx.Client(timeout=10) as client:
             resp = client.get(url)
             if resp.status_code == 404:
                 return []
@@ -167,7 +167,7 @@ def get_bar(market, code, frequency, time=None):
 def get_bars(market, code, frequency, start_date, end_date):
     url = f"{zstfsurl}/v1/markets/{market}/bars?code={code}&frequency={frequency}&begin={start_date}&end={end_date}"
     try:
-        with httpx.Client(timeout=10.0) as client:
+        with httpx.Client(timeout=10) as client:
             resp = client.get(url)
             if resp.status_code == 404:
                 return []
@@ -192,11 +192,26 @@ def put_bars(records, market):
     payload = records
     logging.verbose("Writing %d bars %s ...", len(payload), url)
     try:
-        with httpx.Client(timeout=60.0) as client:
+        with httpx.Client(timeout=60) as client:
             resp = client.post(url, json=payload)
             resp.raise_for_status()
             data = resp.json()
         logging.verbose("%s", data)
+    except httpx.HTTPStatusError as e:
+        msg = f"HTTP {e.response.status_code} {e.response.reason_phrase}: {e.response.text}"
+        logging.error("%s", msg)
+        raise ConnectionError(msg) from None
+
+
+def stage():
+    url = f"{zstfsurl}/v1/stage"
+    logging.info("Initiating StagingStore seal ...")
+    try:
+        with httpx.Client(timeout=240) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+        logging.info("%s", data)
     except httpx.HTTPStatusError as e:
         msg = f"HTTP {e.response.status_code} {e.response.reason_phrase}: {e.response.text}"
         logging.error("%s", msg)
