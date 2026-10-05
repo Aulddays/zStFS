@@ -2,6 +2,7 @@
 Python client for zStFS HTTP daemon (zstfsd).
 """
 
+import sys
 import logging
 import os
 from dotenv import load_dotenv
@@ -10,14 +11,16 @@ import httpx
 
 zstfsurl = None
 
+# setup env
+load_dotenv()
+zstfsurl = os.getenv("ZSTFS_URL", None)
+if zstfsurl is None:
+    raise ValueError("ZSTFS_URL not defined")
 
-def setup():
-    # setup env
-    load_dotenv()
-    global zstfsurl
-    zstfsurl = os.getenv("ZSTFS_URL", None)
-    if zstfsurl is None:
-        raise ValueError("ZSTFS_URL not found")
+
+def main(argv):
+    print(health())
+    return 0
 
 
 # ----------------------------------------------------------------------
@@ -25,7 +28,7 @@ def setup():
 # ----------------------------------------------------------------------
 
 def health():
-    """GET /v1/health — daemon liveness check."""
+    """GET /v1/health: daemon liveness check."""
     url = f"{zstfsurl}/v1/health"
     try:
         with httpx.Client(timeout=10) as client:
@@ -80,7 +83,7 @@ def get_symbol(market, code):
 
 def put_symbols(market, records):
     """
-    POST /v1/markets/<market>/symbols — upsert one or more symbols.
+    POST /v1/markets/<market>/symbols —-upsert one or more symbols.
 
     `records` may be a single symbol dict, a list of dicts, or
     {"symbols": [...]}.
@@ -127,7 +130,7 @@ def delete_symbol(market, code):
 
 def get_bar(market, code=None, symbol_id=None, frequency="daily", time=None):
     """
-    GET /v1/markets/<market>/bars — single bar lookup.
+    GET /v1/markets/<market>/bars - single bar lookup.
 
     One of `code` or `symbol_id` must be provided.
     If `time` is omitted the latest bar is returned.
@@ -154,7 +157,7 @@ def get_bar(market, code=None, symbol_id=None, frequency="daily", time=None):
 def get_bars(market, code=None, symbol_id=None, frequency="daily",
              begin=None, end=None, adjust=None):
     """
-    GET /v1/markets/<market>/bars — range query.
+    GET /v1/markets/<market>/bars - range query.
 
     One of `code` or `symbol_id` must be provided.
     `adjust`: "raw" (default), "forward", or "backward".
@@ -184,7 +187,7 @@ def get_bars(market, code=None, symbol_id=None, frequency="daily",
 
 def put_bars(market, records):
     """
-    POST /v1/markets/<market>/bars — write one or more bars.
+    POST /v1/markets/<market>/bars - write one or more bars.
 
     `records` may be a single bar dict, a list, or {"bars":[...]}.
     Each bar identifies the symbol via `symbol_id` or `code`,
@@ -226,7 +229,7 @@ def _bar_query_params(code, symbol_id, frequency):
 
 def put_action(market, action):
     """
-    POST /v1/markets/<market>/actions — upsert a corporate action.
+    POST /v1/markets/<market>/actions - upsert a corporate action.
 
     `action` is a dict with: external_event_key, symbol_id or code,
     effective_date, type, factor, cash_value.
@@ -245,7 +248,7 @@ def put_action(market, action):
 
 def get_actions(market, code=None, symbol_id=None, begin=None, end=None):
     """
-    GET /v1/markets/<market>/actions — query corporate actions.
+    GET /v1/markets/<market>/actions - query corporate actions.
 
     One of `code` or `symbol_id` must be provided.
     `begin` / `end` are optional YYYYMMDD strings.
@@ -275,7 +278,7 @@ def get_actions(market, code=None, symbol_id=None, begin=None, end=None):
 
 def delete_action(market, external_event_key, code=None, symbol_id=None):
     """
-    DELETE /v1/markets/<market>/actions — idempotent action removal.
+    DELETE /v1/markets/<market>/actions - idempotent action removal.
 
     One of `code` or `symbol_id` must be provided together with
     `external_event_key`.
@@ -305,7 +308,7 @@ def delete_action(market, external_event_key, code=None, symbol_id=None):
 
 def stage():
     """
-    GET /v1/stage — trigger Active → Staging seal for all markets.
+    GET /v1/stage - trigger Active -> Staging seal for all markets.
 
     Returns {"trading_days_back": N}.
     """
@@ -322,3 +325,8 @@ def stage():
         msg = f"HTTP {e.response.status_code} {e.response.reason_phrase}: {e.response.text}"
         logging.error("%s", msg)
         raise ConnectionError(msg) from None
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+
