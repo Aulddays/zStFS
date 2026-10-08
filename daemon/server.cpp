@@ -894,7 +894,10 @@ public:
 	        RequestWorker* worker)
 		: socket_(std::move(socket)), io_(io), worker_(worker) {}
 
-	void start() {
+	void start()
+	{
+		// Record start time at the moment we begin reading the request.
+		gettimeofday(&start_time_, NULL);
 		const std::shared_ptr<Session> self = shared_from_this();
 		asio::async_read_until(socket_, buffer_, "\r\n\r\n",
 			[self](const asio::error_code& error, std::size_t) {
@@ -969,11 +972,29 @@ private:
 			<< "Connection: close\r\n\r\n" << body;
 		response_ = output.str();
 		const std::shared_ptr<Session> self = shared_from_this();
-		asio::async_write(socket_, asio::buffer(response_), [self](const asio::error_code&, std::size_t) {
-			asio::error_code ignored;
-			self->socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
-			self->socket_.close(ignored);
-		});
+		asio::async_write(socket_, asio::buffer(response_),
+			[self, code](const asio::error_code &, std::size_t) {
+				// End time: response fully written to socket.
+				struct timeval end_time;
+				gettimeofday(&end_time, NULL);
+				double elapsed_ms = (end_time.tv_sec - self->start_time_.tv_sec) * 1000.0
+					+ (end_time.tv_usec - self->start_time_.tv_usec) / 1000.0;
+				if (code >= 200 && code < 300)
+				{
+					PELOG_LOG((PLV_INFO, "RSP %s %s -> %d (%.2f ms)\n",
+						self->request_method_.c_str(), self->request_target_.c_str(),
+						code, elapsed_ms));
+				}
+				else
+				{
+					PELOG_LOG((PLV_WARNING, "RSP %s %s -> %d (%.2f ms)\n",
+						self->request_method_.c_str(), self->request_target_.c_str(),
+						code, elapsed_ms));
+				}
+				asio::error_code ignored;
+				self->socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
+				self->socket_.close(ignored);
+			});
 	}
 
 	asio::ip::tcp::socket socket_;
@@ -984,6 +1005,7 @@ private:
 	std::string request_target_;
 	std::string request_body_;
 	std::string response_;
+	struct timeval start_time_;
 };
 
 }  // namespace
@@ -1050,31 +1072,15 @@ void RequestWorker::run() {
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
 			condition_.wait(lock, [this]() { return stopping_ || !requests_.empty(); });
-			if (requests_.empty() && stopping_) break;
+			if (requests_.empty() && stopping_)
+				break;
 			request = requests_.front();
 			requests_.pop();
 		}
-		// Log request start: method + full target (includes query string)
 		PELOG_LOG((PLV_INFO, "REQ %s %s\n", request.method.c_str(), request.target.c_str()));
-		struct timeval t0;
-		gettimeofday(&t0, NULL);
 		const HttpResponse response = handle(request);
-		struct timeval t1;
-		gettimeofday(&t1, NULL);
-		double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_usec - t0.tv_usec) / 1000.0;
-		if (response.status_code >= 200 && response.status_code < 300)
-		{
-			PELOG_LOG((PLV_INFO, "RSP %s %s -> %d (%.2f ms)\n",
-				request.method.c_str(), request.target.c_str(),
-				response.status_code, elapsed_ms));
-		}
-		else
-		{
-			PELOG_LOG((PLV_WARNING, "RSP %s %s -> %d (%.2f ms)\n",
-				request.method.c_str(), request.target.c_str(),
-				response.status_code, elapsed_ms));
-		}
-		if (request.complete) request.complete(response.body, response.status_code, response.content_type);
+		if (request.complete)
+			request.complete(response.body, response.status_code, response.content_type);
 	}
 	markets_.reset();
 }
