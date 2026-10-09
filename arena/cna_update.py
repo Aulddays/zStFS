@@ -19,31 +19,34 @@ def main(argv):
     stats = [None] * 4
     while True:
         idx = 0
-        if stats[idx] is None or stats[idx][2] <= 0.95:
+        if stats[idx] is None or stats[idx][2] <= 0.995:
             symbols = cna_index_list()
             common.put_symbols(symbols, "cna")
             # print(records[0])
             # symbols = [{"code": "sh000001", 'list_date': '19910715'}]
             stats[idx] = cna_updatedata_daily(symbols)
             stats[idx].append(stats[idx][0] * 1.0 / stats[idx][1] if stats[idx][0] > 0 else 0)
-        
+            logging.info("Progress index: %s", stats[idx])
+
         idx += 1
-        if stats[idx] is None or stats[idx][2] <= 0.95:
+        if stats[idx] is None or stats[idx][2] <= 0.995:
             symbols = cna_stock_list()
             common.put_symbols(symbols, "cna")
             # # print(symbols[:10])
             # symbols = [{'code': 'sh600004', 'name': '白云机场', 'list_date': '20030428'}]
             stats[idx] = cna_updatedata_daily(symbols)
             stats[idx].append(stats[idx][0] * 1.0 / stats[idx][1] if stats[idx][0] > 0 else 0)
-            
+            logging.info("Progress stock: %s", stats[idx])
+
         idx += 1
-        if stats[idx] is None or stats[idx][2] <= 0.95:
+        if stats[idx] is None or stats[idx][2] <= 0.98:
             symbols = cna_etf_list()
             common.put_symbols(symbols, "cna")
             # print(symbols[0])
             stats[idx] = cna_updatedata_daily(symbols)
             stats[idx].append(stats[idx][0] * 1.0 / stats[idx][1] if stats[idx][0] > 0 else 0)
-            
+            logging.info("Progress etf: %s", stats[idx])
+
         idx += 1
         if stats[idx] is None or stats[idx][2] <= 0.95:
             symbols = cnof_list()
@@ -52,11 +55,12 @@ def main(argv):
             # symbols = [{'code': 'of000001', 'name': '华夏成长混合', 'values': {'20260924': 3.868, '20260923': 3.897}}]
             stats[idx] = cnof_updatedata(symbols)
             stats[idx].append(stats[idx][0] * 1.0 / stats[idx][1] if stats[idx][0] > 0 else 0)
-        
+            logging.info("Progress cnof: %s", stats[idx])
+
         if not isschedule:
             break
         logging.info("Progress: %s", stats)
-        if (time.time() < tmstart or time.time() > tmstart + 6 * 3600 or
+        if (time.time() < tmstart or time.time() > tmstart + 8 * 3600 or
                 all(s[2] > 0.95 for s in stats)):   # all finished
             break
         time.sleep(600)
