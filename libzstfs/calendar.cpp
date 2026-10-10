@@ -262,9 +262,10 @@ Status Calendar::date(TimeId value, std::string* out) const {
 
 Status Calendar::nearest_trading_day(const std::string &date_str,
 									std::string *out,
-									int max_days_back) const
+									int max_days,
+									bool forward) const
 {
-	if (out == NULL || max_days_back < 0)
+	if (out == NULL || max_days < 0)
 	{
 		return Status::Error(ErrorCode::InvalidArgument,
 							"nearest_trading_day: invalid arguments");
@@ -273,9 +274,11 @@ Status Calendar::nearest_trading_day(const std::string &date_str,
 	if (!ParseDate(date_str, &date_parts))
 		return Status::Error(ErrorCode::InvalidArgument, "invalid input date");
 	int ordinal = DaysBeforeDate(date_parts);
-	for (int i = 0; i <= max_days_back; ++i, --ordinal)
+	const int step = forward ? 1 : -1;
+	const int max_ordinal = DaysBeforeYear(10000);
+	for (int i = 0; i <= max_days; ++i, ordinal += step)
 	{
-		if (ordinal < 0)
+		if (ordinal < 0 || ordinal >= max_ordinal)
 			break;
 		if (IsWeekendOrdinal(ordinal))
 			continue;

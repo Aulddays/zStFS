@@ -106,6 +106,26 @@ int main() {
 	assert(restored_calendar.slots("19000101", &slots).ok());
 	assert(slots.size() == 4);
 
+	// nearest_trading_day: weekday dates pass through unchanged.
+	std::string nearest;
+	assert(calendar.nearest_trading_day("19000101", &nearest).ok());
+	assert(nearest == "19000101");
+	// nearest_trading_day: Saturday snaps backward to Friday.
+	assert(calendar.nearest_trading_day("19000106", &nearest).ok());
+	assert(nearest == "19000105");
+	// nearest_trading_day: Sunday snaps backward to Friday.
+	assert(calendar.nearest_trading_day("19000107", &nearest).ok());
+	assert(nearest == "19000105");
+	// nearest_trading_day forward: Saturday snaps forward to Monday.
+	assert(calendar.nearest_trading_day("19000106", &nearest, 7, true).ok());
+	assert(nearest == "19000108");
+	// nearest_trading_day forward: Sunday snaps forward to Monday.
+	assert(calendar.nearest_trading_day("19000107", &nearest, 7, true).ok());
+	assert(nearest == "19000108");
+	// nearest_trading_day forward: weekday passes through unchanged.
+	assert(calendar.nearest_trading_day("19000105", &nearest, 7, true).ok());
+	assert(nearest == "19000105");
+
 	assert(zstfs::register_market_type("custom", CustomSlots).ok());
 	zstfs::Calendar custom("custom");
 	assert(custom.slots("19000101", &slots).ok());

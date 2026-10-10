@@ -61,12 +61,15 @@ public:
 	Status time_id(const std::string& date, TimeId* out) const;
 	Status date(TimeId day_time_id, std::string* out) const;
 
-	// Finds the nearest trading day on or before `date`. If `date` itself is
-	// a trading day it is returned unchanged; otherwise the function walks
-	// backward up to `max_days_back` calendar days until it finds one.
+	// Finds the nearest trading day to `date`. If `date` itself is a trading day
+	// it is returned unchanged; otherwise the function walks in the given
+	// direction up to `max_days` calendar days until it finds one.
+	// When `forward` is false, walks backward (same as the historical behavior).
+	// When `forward` is true, walks forward to the next trading day.
 	Status nearest_trading_day(const std::string &date,
 	                           std::string *out,
-	                           int max_days_back = 7) const;
+	                           int max_days = 7,
+	                           bool forward = false) const;
 
 	// The minute component is rounded down to the ten-minute grid before it is
 	// encoded as HHM, so 09:39 becomes slot 93.

@@ -330,16 +330,51 @@ Status History::get(const std::vector<SymbolId>& symbol_ids,
 	if (out == NULL) {
 		return Status::Error(ErrorCode::InvalidArgument, "history range output is required");
 	}
+	// Adjust weekend boundary dates to the nearest valid trading day.
+	// `begin` snaps forward (to Monday) so the range starts on the first
+	// trading day on or after the requested date.
+	// `end` snaps backward (to Friday) so the range ends on the last
+	// trading day on or before the requested date.
+	// Non-weekend dates are returned unchanged by nearest_trading_day.
+	std::string adjusted_begin = begin;
+	std::string adjusted_end = end;
+	if (frequency_ == Frequency::Daily)
+	{
+		Status adj_status = calendar_.nearest_trading_day(begin, &adjusted_begin, 7, true);
+		if (!adj_status.ok())
+			return adj_status;
+		adj_status = calendar_.nearest_trading_day(end, &adjusted_end, 7, false);
+		if (!adj_status.ok())
+			return adj_status;
+	}
+	else
+	{
+		// For hourly frequencies, adjust the date part (first 8 chars) and
+		// preserve the intraday slot portion.
+		const std::string begin_date = begin.substr(0, 8);
+		const std::string end_date = end.substr(0, 8);
+		std::string adj_begin_date;
+		std::string adj_end_date;
+		Status adj_status = calendar_.nearest_trading_day(begin_date, &adj_begin_date, 7, true);
+		if (!adj_status.ok())
+			return adj_status;
+		adj_status = calendar_.nearest_trading_day(end_date, &adj_end_date, 7, false);
+		if (!adj_status.ok())
+			return adj_status;
+		adjusted_begin = adj_begin_date + (begin.size() > 8 ? begin.substr(8) : "");
+		adjusted_end = adj_end_date + (end.size() > 8 ? end.substr(8) : "");
+	}
+
 	TimeId begin_time_id = 0;
 	TimeId ignored_block_id = 0;
 	BlockOff ignored_block_offset = 0;
-	Status status = ResolveTime(calendar_, frequency_, begin,
+	Status status = ResolveTime(calendar_, frequency_, adjusted_begin,
 						&begin_time_id, &ignored_block_id, &ignored_block_offset);
 	if (!status.ok()) {
 		return status;
 	}
 	TimeId end_time_id = 0;
-	status = ResolveTime(calendar_, frequency_, end,
+	status = ResolveTime(calendar_, frequency_, adjusted_end,
 						&end_time_id, &ignored_block_id, &ignored_block_offset);
 	if (!status.ok()) {
 		return status;
