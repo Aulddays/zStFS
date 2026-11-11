@@ -42,3 +42,6 @@ prog.md
 venv
 __pycache__
 .env
+
+/testspace/
+/updater/
