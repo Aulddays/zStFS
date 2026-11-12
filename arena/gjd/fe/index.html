@@ -104,6 +104,7 @@ thead th{position:sticky;top:0;background:#fafafa;text-align:right;font-size:11p
 thead th:nth-child(1),thead th:nth-child(2){text-align:left}
 tbody td{padding:11px 12px;border-bottom:1px solid var(--line2);text-align:right;white-space:nowrap;font-size:13px}
 tbody td:nth-child(1),tbody td:nth-child(2){text-align:left}
+tbody td:nth-child(9){padding-top:4px;padding-bottom:4px}
 tr.grouphead td{background:#f7f7f7;font-size:11px;font-weight:700;letter-spacing:1px;color:var(--ink2);padding:9px 12px;text-align:left;border-bottom:1px solid var(--line)}
 tr.grouphead td .cnt{font-weight:400;color:var(--ink3);letter-spacing:0;margin-left:8px}
 tr.total td{background:#fafafa;font-weight:700;border-top:1px solid var(--line);border-bottom:none}
@@ -121,6 +122,7 @@ tr.total td{background:#fafafa;font-weight:700;border-top:1px solid var(--line);
 th sup{font-size:9px;font-weight:700;color:var(--orange);margin-left:1px;vertical-align:super}
 .thsub{display:block;font-size:9.5px;font-weight:400;color:var(--ink3);margin-top:1px;letter-spacing:0}
 .mini{height:4px;background:var(--line2);border-radius:2px;margin-top:5px;overflow:hidden;width:74px;margin-left:auto}
+svg.spark{display:block;margin:0 auto}
 .mini span{display:block;height:100%;background:var(--orange);border-radius:2px}
 
 .tnote{margin-top:8px;padding:10px 14px;background:var(--card);border:1px solid var(--line);border-radius:16px;
@@ -409,15 +411,57 @@ function signed(n){ return (n>0?'+':'')+fmt(n,2); }
 function cls(n){ return n>0?'up':(n<0?'down':'muted'); }
 
 // ---- sparkline ----
-function spark(hist){
-  if(!hist||!hist.length) return '';
-  var vals=hist.map(function(x){return x.amount_yi;});
-  var mx=Math.max.apply(null,vals)||1, w=96, h=26, bw=w/vals.length;
-  var bars=vals.map(function(v,i){
-    var bh=Math.max(1.2,v/mx*h), last=(i===vals.length-1);
-    return '<rect x="'+(i*bw).toFixed(1)+'" y="'+(h-bh).toFixed(1)+'" width="'+Math.max(1.2,bw-1).toFixed(1)+
-           '" height="'+bh.toFixed(1)+'" fill="'+(last?'#ff4713':'#e0e0e0')+'"/>';
-  }).join('');
+function spark(hist, todayAmt, todayDate, todayFull){
+  // Append today's real-time amount as the last (red) bar, unless hist already includes today.
+  // todayFull: projected full-day amount (real / shape progress). Shown as light red extension above actual.
+  // Keep at most 30 bars total.
+  var arr = hist ? hist.slice() : [];
+  var hasToday = todayAmt > 0 && todayDate && (!arr.length || arr[arr.length-1].date < todayDate);
+  if(hasToday){
+    arr.push({date: todayDate, amount_yi: todayAmt});
+  }
+  arr = arr.slice(-30);
+  if(!arr.length) return '';
+  var vals=arr.map(function(x){return x.amount_yi;});
+  // for max scale, use todayFull if it's higher than actual today amount
+  var mx = Math.max.apply(null, vals);
+  if(hasToday && todayFull && todayFull > vals[vals.length-1]){
+    mx = Math.max(mx, todayFull);
+  }
+  mx = mx || 1;
+  var n = vals.length, gap = 1;
+  // original: 96px for n gray bars with 1px gap → grayW = 96/n - 1
+  var grayW = Math.max(1.2, 96/n - gap);
+  var redW = grayW * 1.5;
+  // total width: (n-1)*grayW + redW + n*gap
+  var w = (n-1)*grayW + redW + n*gap;
+  var h = 55;
+  var bars='';
+  var x = 0;
+  vals.forEach(function(v,i){
+    var last = (i === vals.length-1);
+    var barW = last ? redW : grayW;
+    var barX = x;
+    x += barW + gap;
+    if(last && todayFull && todayFull > v){
+      // split bar: bottom = actual (solid red), top = projected (light red)
+      var actualH = Math.max(1.5, v/mx*h);
+      var fullH = Math.max(actualH, todayFull/mx*h);
+      var projH = fullH - actualH;
+      // actual part
+      bars += '<rect x="'+barX+'" y="'+(h-actualH).toFixed(1)+'" width="'+barW.toFixed(1)+
+              '" height="'+actualH.toFixed(1)+'" fill="#ff4713"/>';
+      // projected part
+      if(projH > 0.5){
+        bars += '<rect x="'+barX+'" y="'+(h-fullH).toFixed(1)+'" width="'+barW.toFixed(1)+
+                '" height="'+projH.toFixed(1)+'" fill="#ffb199"/>';
+      }
+    } else {
+      var bh = Math.max(1.5, v/mx*h);
+      bars += '<rect x="'+barX+'" y="'+(h-bh).toFixed(1)+'" width="'+barW.toFixed(1)+
+              '" height="'+bh.toFixed(1)+'" fill="'+(last?'#ff4713':'#c0c0c0')+'"/>';
+    }
+  });
   return '<svg class="spark" width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'" aria-label="近30日成交额">'+bars+'</svg>';
 }
 
@@ -807,7 +851,7 @@ function renderTable(){
       '<td class="num '+netCls+'" style="font-weight:700">'+signed(c.net)+'</td>'+
       '<td class="num '+pctCls+'" style="font-weight:700">'+signed(it.pct)+'%</td>'+
       '<td><div class="num">'+fmt(it.shares_yi,1)+'</div>'+subscrCell(it)+'</td>'+
-      '<td>'+spark(it.hist)+'</td>'+
+      '<td>'+spark(it.hist, it.amount_yi, it.date && it.date.length===8 ? it.date.slice(0,4)+'-'+it.date.slice(4,6)+'-'+it.date.slice(6,8) : '', (c.done>0 && it.amount_yi>0) ? it.amount_yi/c.done : 0)+'</td>'+
       '<td class="num '+(it.huijin_yi?'':'muted')+'">'+(it.huijin_yi?fmt(it.huijin_yi,1):'—')+'</td>'+
     '</tr>';
   });
