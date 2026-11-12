@@ -40,6 +40,7 @@ def setup_logging():
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FE_DIR = os.path.join(SCRIPT_DIR, "fe")
 SNAPSHOT_FILE = os.path.join(FE_DIR, "snapshot.json")
+SNAPSHOT_TEST_FILE = os.path.join(SCRIPT_DIR, "snapshot_test.json")
 SHARES_FILE = os.path.join(SCRIPT_DIR, "shares_history.json")
 VOL5MIN_FILE = os.path.join(SCRIPT_DIR, "vol5min_history.json")
 
@@ -199,7 +200,6 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
     os.makedirs(FE_DIR, exist_ok=True)
     trade_date = datetime.now().strftime("%Y%m%d")
     tcodes = [e["tcode"] for e in ETF_LIST]
-    core_codes = [e["code"] for e in ETF_LIST if e["group"] == "core"]
 
     # load history if not provided
     if shares_history is None:
@@ -301,11 +301,12 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
                      code, etf["name"], item["amount_yi"], item["avg20_yi"],
                      len(shape_hist_list))
 
-    # keep only core group in shares_history, sorted by date
+    # all ETFs in shares_history, sorted by date
+    all_codes = [e["code"] for e in ETF_LIST]
     shares_clean = {}
     for d in sorted(shares_history.keys()):
         row = shares_history[d]
-        shares_clean[d] = {c: round(row[c], 4) for c in core_codes if c in row}
+        shares_clean[d] = {c: round(row[c], 4) for c in all_codes if c in row}
 
     share_dates = sorted(shares_clean.keys())
     latest_share_date = share_dates[-1] if share_dates else ""
@@ -363,8 +364,9 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
     }
 
     # --- save ---
-    save_json(SNAPSHOT_FILE, snapshot)
-    logging.info("Snapshot saved: %s", SNAPSHOT_FILE)
+    out_file = SNAPSHOT_TEST_FILE if test_mode else SNAPSHOT_FILE
+    save_json(out_file, snapshot)
+    logging.info("Snapshot saved: %s", out_file)
 
     if save_history:
         save_json(SHARES_FILE, shares_history)
@@ -398,8 +400,8 @@ def update_shares_history(shares_history, target_date):
     SZSE: fetched in batch range (more efficient).
     Returns True if any data was added/updated.
     """
-    sse_codes = [e["code"] for e in ETF_LIST if e["tcode"].startswith("sh") and e["group"] == "core"]
-    szse_codes = [e["code"] for e in ETF_LIST if e["tcode"].startswith("sz") and e["group"] == "core"]
+    sse_codes = [e["code"] for e in ETF_LIST if e["tcode"].startswith("sh")]
+    szse_codes = [e["code"] for e in ETF_LIST if e["tcode"].startswith("sz")]
 
     # find the oldest "latest date" per market — determines the range we need to fetch
     def oldest_latest(codes):
@@ -420,28 +422,38 @@ def update_shares_history(shares_history, target_date):
     changed = False
 
     # --- SZSE: batch fetch from oldest lagging date to target ---
+    # SZSE API has a max range (~6 months), so fetch in 150-day batches
     if szse_codes and szse_oldest < target_date:
         szse_start = szse_oldest if szse_oldest else "20200101"
-        # start from the day after the oldest latest date
         start_dt = datetime.strptime(szse_start, "%Y%m%d") + timedelta(days=1)
         end_dt = datetime.strptime(target_date, "%Y%m%d")
         if start_dt <= end_dt:
-            start_str = start_dt.strftime("%Y%m%d")
-            end_str = end_dt.strftime("%Y%m%d")
-            logging.info("Backfilling SZSE shares: %s -> %s", start_str, end_str)
-            szse_data = fetch_szse_shares_range(start_str, end_str)
+            logging.info("Backfilling SZSE shares: %s -> %s",
+                         start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"))
             szse_updated = 0
-            for d, row in szse_data.items():
-                filtered = {c: row[c] for c in szse_codes if c in row}
-                if not filtered:
-                    continue
-                if d not in shares_history:
-                    shares_history[d] = {}
-                for c, v in filtered.items():
-                    if shares_history[d].get(c) != v:
-                        shares_history[d][c] = v
-                        changed = True
-                        szse_updated += 1
+            batch_dt = start_dt
+            batch_num = 0
+            while batch_dt <= end_dt:
+                batch_end = batch_dt + timedelta(days=150)
+                if batch_end > end_dt:
+                    batch_end = end_dt
+                batch_num += 1
+                s = batch_dt.strftime("%Y%m%d")
+                e = batch_end.strftime("%Y%m%d")
+                logging.info("  batch %d: %s ~ %s", batch_num, s, e)
+                batch_data = fetch_szse_shares_range(s, e)
+                for d, row in batch_data.items():
+                    filtered = {c: row[c] for c in szse_codes if c in row}
+                    if not filtered:
+                        continue
+                    if d not in shares_history:
+                        shares_history[d] = {}
+                    for c, v in filtered.items():
+                        if shares_history[d].get(c) != v:
+                            shares_history[d][c] = v
+                            changed = True
+                            szse_updated += 1
+                batch_dt = batch_end + timedelta(days=1)
             logging.info("  SZSE: %d ETF-day entries updated", szse_updated)
 
     # --- SSE: day by day, from oldest lagging date to target ---
