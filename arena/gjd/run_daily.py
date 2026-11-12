@@ -1,21 +1,37 @@
 #!/usr/bin/env python3
 """
 gjd tracking daily task
-Run once after market close each day: fetch latest quotes, daily K-line, 5-min K-line → compute indicators → output fe/snapshot.json
 
-Usage:
-    python build_snapshot.py           # normal build (online)
-    python build_snapshot.py --test    # test mode (simulated data, offline)
+Modes:
+    python run_daily.py             # one-shot build (online)
+    python run_daily.py --test      # one-shot build (mock data, offline)
+    python run_daily.py --schedule  # keep running until all data catches up to latest trade date
+
+In schedule mode, the script loops:
+  1. determine the latest trade date (from sh000001 daily K)
+  2. backfill shares_history and vol5min_history from local latest to target date
+  3. regenerate fe/snapshot.json
+  4. if everything is up to date, exit; otherwise sleep 10 min and retry
+  5. max runtime: 8 hours
 """
 
 import sys
 import os
 import re
 import json
+import time
 import logging
 from datetime import datetime, timedelta
 from urllib.request import urlopen, Request
 
+def setup_logging():
+    logging.basicConfig(format='[%(asctime)s %(levelname)s] %(message)s', datefmt="%Y%m%d-%H%M%S", level=logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.addLevelName(logging.CRITICAL, "CRI")
+    logging.addLevelName(logging.ERROR, "ERR")
+    logging.addLevelName(logging.WARNING, "WRN")
+    logging.addLevelName(logging.INFO, "INF")
+    logging.addLevelName(logging.DEBUG, "DBG")
 
 # ----------------------------------------------------------------------
 # configs
@@ -29,6 +45,15 @@ VOL5MIN_FILE = os.path.join(SCRIPT_DIR, "vol5min_history.json")
 
 # MA window length for `shape`
 SHAPE_WINDOW = 20
+
+# max runtime for schedule mode (seconds)
+MAX_RUNTIME = 8 * 3600
+# sleep between rounds (seconds)
+SLEEP_INTERVAL = 600
+# how many 5min bars to fetch per call (each call returns ~5 trading days of data)
+VOL5MIN_BATCH_BARS = 480  # ~10 trading days, enough to cover gaps
+# keep vol5min history for N days (sliding window uses 20, with headroom)
+VOL5MIN_KEEP_DAYS = 60
 
 # ETFs
 # group: core = 2025年报汇金前十大持有人口径有持仓（最后一次实名披露）
@@ -80,27 +105,95 @@ DEFAULT_SHAPE = [
 ]
 
 
-def setup_logging():
-    logging.basicConfig(
-        format="[%(asctime)s %(levelname)s] %(message)s",
-        datefmt="%Y%m%d-%H%M%S",
-        level=logging.INFO,
-    )
-    logging.addLevelName(logging.WARNING, "WRN")
-    logging.addLevelName(logging.INFO, "INF")
-
+# ----------------------------------------------------------------------
+# main entry
+# ----------------------------------------------------------------------
 
 def main(argv):
     setup_logging()
-    test_mode = len(argv) > 1 and argv[1] in ("--test", "-t")
-    build_snapshot(test_mode=test_mode)
+
+    # test mode: short-circuit, mock data, no history writes
+    if len(argv) > 1 and argv[1] in ("--test", "-t"):
+        build_snapshot(test_mode=True, save_history=False)
+        return 0
+
+    schedule_mode = len(argv) > 1 and argv[1] == "--schedule"
+    if schedule_mode:
+        logging.info("=== Schedule mode start, max runtime=%dh ===", MAX_RUNTIME // 3600)
+
+    shares_history = load_json(SHARES_FILE, {})
+    vol5min_history = load_json(VOL5MIN_FILE, {})
+
+    tm_start = time.time()
+    round_num = 0
+
+    while True:
+        round_num += 1
+        if schedule_mode:
+            logging.info("--- Round %d ---", round_num)
+
+        target_date = get_latest_trade_date()
+        logging.info("Latest trade date: %s", target_date)
+
+        shares_changed = update_shares_history(shares_history, target_date)
+        vol5min_changed = update_vol5min_history(vol5min_history, target_date)
+
+        # only rebuild snapshot when history data changes (running post-market, realtime data is static)
+        if shares_changed or vol5min_changed or round_num == 1:
+            build_snapshot(test_mode=False, shares_history=shares_history,
+                           vol5min_history=vol5min_history, save_history=False)
+
+        if shares_changed:
+            save_json(SHARES_FILE, shares_history)
+            logging.info("Shares history saved: %s (%d days)", SHARES_FILE, len(shares_history))
+        if vol5min_changed:
+            save_json(VOL5MIN_FILE, vol5min_history)
+            logging.info("vol5min history saved: %s (%d days)", VOL5MIN_FILE, len(vol5min_history))
+
+        # one-shot mode: done after first round
+        if not schedule_mode:
+            break
+
+        # schedule mode: check if done
+        shares_done = is_shares_up_to_date(shares_history, target_date)
+        vol5min_done = is_vol5min_up_to_date(vol5min_history, target_date)
+        logging.info("Progress: shares=%s vol5min=%s",
+                     "DONE" if shares_done else "pending",
+                     "DONE" if vol5min_done else "pending")
+        if shares_done and vol5min_done:
+            logging.info("All data up to date. Exiting.")
+            break
+
+        if time.time() - tm_start > MAX_RUNTIME:
+            logging.warning("Reached max runtime (%dh). Exiting.", MAX_RUNTIME // 3600)
+            break
+
+        logging.info("Sleep %ds...", SLEEP_INTERVAL)
+        time.sleep(SLEEP_INTERVAL)
+
     return 0
 
 
 # ----------------------------------------------------------------------
-# main logic
+# build snapshot
 # ----------------------------------------------------------------------
-def build_snapshot(test_mode=False):
+
+# cache for market data used by build_snapshot, stored once confirmed complete
+_snap_data_cache = {
+    "realtime": None,   # {code: {...}} — all ETFs from tencent
+    "daily": {},        # tcode -> [daily bars...] — sina daily K
+    "5min": {},         # tcode -> [5min bars...] — sina 5min K
+}
+
+
+def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, save_history=True):
+    """
+    Build snapshot and save to fe/snapshot.json.
+
+    If shares_history / vol5min_history are provided, use them instead of loading from disk.
+    If save_history is False, skip writing shares/vol5min files (caller handles saving).
+    Market data (realtime, daily K, 5min K) is cached globally once confirmed complete.
+    """
     logging.info("Building snapshot (test_mode=%s) ...", test_mode)
 
     os.makedirs(FE_DIR, exist_ok=True)
@@ -108,23 +201,32 @@ def build_snapshot(test_mode=False):
     tcodes = [e["tcode"] for e in ETF_LIST]
     core_codes = [e["code"] for e in ETF_LIST if e["group"] == "core"]
 
-    # --- load history ---
-    shares_history = load_json(SHARES_FILE, {})
-    vol5min_history = load_json(VOL5MIN_FILE, {})  # {date: {code: [[time, amount_yi], ...]}}
+    # load history if not provided
+    if shares_history is None:
+        shares_history = load_json(SHARES_FILE, {})
+    if vol5min_history is None:
+        vol5min_history = load_json(VOL5MIN_FILE, {})
     prev_date = prev_trading_date(trade_date)
 
     # --- realtime quotes ---
     if test_mode:
         logging.info("Test mode: using mock data")
         realtime = _mock_realtime()
+    elif _snap_data_cache["realtime"] is not None:
+        realtime = _snap_data_cache["realtime"]
+        logging.info("Using cached realtime quotes (%d ETFs)", len(realtime))
     else:
         logging.info("Fetching realtime quotes (%d ETFs) ...", len(tcodes))
         realtime = fetch_tencent_realtime(tcodes)
         logging.info("Got %d realtime entries", len(realtime))
+        # cache if post-market (data won't change anymore)
+        if datetime.now().strftime("%H%M") >= "1500":
+            _snap_data_cache["realtime"] = realtime
+            logging.info("Cached realtime quotes (post-market)")
 
     # --- build per-ETF items ---
     items = []
-    today_vol5min = {}  # {code: [[time, amount_yi], ...]}  today's raw 5min bars, appended to history after close
+    today_vol5min = {}  # {code: [[time, amount_yi], ...]}  today's raw 5min bars (for tail_ratio)
 
     for etf in ETF_LIST:
         code = etf["code"]
@@ -134,9 +236,25 @@ def build_snapshot(test_mode=False):
             daily = _mock_daily(code)
             bars_5min = []
         else:
-            daily = fetch_sina_daily(tcode, days=40)
-            # fetch today's 5-min bars (for intraday history)
-            bars_5min = fetch_sina_5min(tcode)
+            # daily K-line: use cache if complete, otherwise fetch and check completeness
+            if tcode in _snap_data_cache["daily"]:
+                daily = _snap_data_cache["daily"][tcode]
+            else:
+                daily = fetch_sina_daily(tcode, days=40)
+                # cache if latest bar is today or later (data is complete for our purposes)
+                if daily:
+                    last_date = daily[-1]["date"].replace("-", "")
+                    if last_date >= trade_date or datetime.now().strftime("%H%M") >= "1500":
+                        _snap_data_cache["daily"][tcode] = daily
+
+            # 5min K-line: use cache if complete
+            if tcode in _snap_data_cache["5min"]:
+                bars_5min = _snap_data_cache["5min"][tcode]
+            else:
+                bars_5min = fetch_sina_5min(tcode)
+                # cache if today's data is complete (near full 48 bars)
+                if len(bars_5min) >= 45:
+                    _snap_data_cache["5min"][tcode] = bars_5min
 
         # today's raw intraday data [[time, amount_yi], ...]
         today_amounts = [[b["time"], b["amount_yi"]] for b in bars_5min] if bars_5min else []
@@ -183,44 +301,6 @@ def build_snapshot(test_mode=False):
                      code, etf["name"], item["amount_yi"], item["avg20_yi"],
                      len(shape_hist_list))
 
-    # --- update intraday history (only append after market close when data is complete) ---
-    if not test_mode and today_vol5min:
-        if trade_date not in vol5min_history:
-            vol5min_history[trade_date] = today_vol5min
-            logging.info("Updated vol5min_history for %s (%d ETFs)", trade_date, len(today_vol5min))
-        # keep only last 60 days (sliding window uses 20, with headroom)
-        if len(vol5min_history) > 60:
-            old_dates = sorted(vol5min_history.keys())[:-60]
-            for d in old_dates:
-                del vol5min_history[d]
-
-    # --- update shares history (from exchange official APIs, not Tencent estimates) ---
-    # SSE and SZSE each have their own daily share disclosure, fetched separately.
-    # Tencent realtime shares field is never written to history.
-    if not test_mode:
-        sse_shares = fetch_sse_shares(trade_date)
-        szse_shares = fetch_szse_shares(trade_date)
-        today_row = {}
-
-        sse_codes = [e["code"] for e in ETF_LIST if e["tcode"].startswith("sh") and e["group"] == "core"]
-        szse_codes = [e["code"] for e in ETF_LIST if e["tcode"].startswith("sz") and e["group"] == "core"]
-
-        for code in sse_codes:
-            if code in sse_shares:
-                today_row[code] = sse_shares[code]
-        for code in szse_codes:
-            if code in szse_shares:
-                today_row[code] = szse_shares[code]
-
-        if today_row:
-            shares_history[trade_date] = today_row
-            sse_cnt = sum(1 for c in today_row if c.startswith("5"))
-            szse_cnt = sum(1 for c in today_row if c.startswith("1") or c.startswith("3"))
-            logging.info("Updated shares_history for %s (SSE: %d, SZSE: %d, total: %d)",
-                         trade_date, sse_cnt, szse_cnt, len(today_row))
-        else:
-            logging.info("No share data available yet (not updated or holiday), skip update")
-
     # keep only core group in shares_history, sorted by date
     shares_clean = {}
     for d in sorted(shares_history.keys()):
@@ -229,9 +309,8 @@ def build_snapshot(test_mode=False):
 
     share_dates = sorted(shares_clean.keys())
     latest_share_date = share_dates[-1] if share_dates else ""
-    # prev_share_date = the trading day before the latest date with complete data
-    # Note: not the day before trade_date, but the second-to-last in shares_history
-    #   because SSE data may not be updated yet, and Tencent realtime shares is still T-1 value
+    # prev_share_date = the second-to-last in shares_history (not prev calendar day)
+    # because SSE data may not be updated yet on the day after close
     prev_share_date = share_dates[-2] if len(share_dates) >= 2 else ""
 
     # compute share-related fields per ETF
@@ -287,33 +366,346 @@ def build_snapshot(test_mode=False):
     save_json(SNAPSHOT_FILE, snapshot)
     logging.info("Snapshot saved: %s", SNAPSHOT_FILE)
 
-    save_json(SHARES_FILE, shares_history)
-    logging.info("Shares history saved: %s (%d days)", SHARES_FILE, len(shares_history))
+    if save_history:
+        save_json(SHARES_FILE, shares_history)
+        logging.info("Shares history saved: %s (%d days)", SHARES_FILE, len(shares_history))
 
-    if not test_mode:
-        save_json(VOL5MIN_FILE, vol5min_history)
-        logging.info("vol5min history saved: %s (%d days)", VOL5MIN_FILE, len(vol5min_history))
+        if not test_mode:
+            save_json(VOL5MIN_FILE, vol5min_history)
+            logging.info("vol5min history saved: %s (%d days)", VOL5MIN_FILE, len(vol5min_history))
 
     logging.info("Done.")
     return snapshot
 
 
+# ----------------------------------------------------------------------
+# history backfill
+# ----------------------------------------------------------------------
 
-def load_json(path, default):
-    if not os.path.exists(path):
-        return default
+def _etf_latest_date(shares_history, code):
+    """Find the latest date that has data for a given ETF code."""
+    for d in sorted(shares_history.keys(), reverse=True):
+        if code in shares_history[d]:
+            return d
+    return ""
+
+
+def update_shares_history(shares_history, target_date):
+    """
+    Backfill shares_history up to target_date, per-ETF.
+    Each ETF tracks its own latest date; if any ETF lags behind target_date, we try to fill.
+    SSE: fetched day by day (API only supports single date).
+    SZSE: fetched in batch range (more efficient).
+    Returns True if any data was added/updated.
+    """
+    sse_codes = [e["code"] for e in ETF_LIST if e["tcode"].startswith("sh") and e["group"] == "core"]
+    szse_codes = [e["code"] for e in ETF_LIST if e["tcode"].startswith("sz") and e["group"] == "core"]
+
+    # find the oldest "latest date" per market — determines the range we need to fetch
+    def oldest_latest(codes):
+        oldest = target_date
+        for code in codes:
+            ld = _etf_latest_date(shares_history, code)
+            if ld < oldest:
+                oldest = ld
+        return oldest
+
+    sse_oldest = oldest_latest(sse_codes) if sse_codes else target_date
+    szse_oldest = oldest_latest(szse_codes) if szse_codes else target_date
+
+    # if all ETFs in both markets are already at or past target_date, nothing to do
+    if sse_oldest >= target_date and szse_oldest >= target_date:
+        return False
+
+    changed = False
+
+    # --- SZSE: batch fetch from oldest lagging date to target ---
+    if szse_codes and szse_oldest < target_date:
+        szse_start = szse_oldest if szse_oldest else "20200101"
+        # start from the day after the oldest latest date
+        start_dt = datetime.strptime(szse_start, "%Y%m%d") + timedelta(days=1)
+        end_dt = datetime.strptime(target_date, "%Y%m%d")
+        if start_dt <= end_dt:
+            start_str = start_dt.strftime("%Y%m%d")
+            end_str = end_dt.strftime("%Y%m%d")
+            logging.info("Backfilling SZSE shares: %s -> %s", start_str, end_str)
+            szse_data = fetch_szse_shares_range(start_str, end_str)
+            szse_updated = 0
+            for d, row in szse_data.items():
+                filtered = {c: row[c] for c in szse_codes if c in row}
+                if not filtered:
+                    continue
+                if d not in shares_history:
+                    shares_history[d] = {}
+                for c, v in filtered.items():
+                    if shares_history[d].get(c) != v:
+                        shares_history[d][c] = v
+                        changed = True
+                        szse_updated += 1
+            logging.info("  SZSE: %d ETF-day entries updated", szse_updated)
+
+    # --- SSE: day by day, from oldest lagging date to target ---
+    if sse_codes and sse_oldest < target_date:
+        sse_start = sse_oldest if sse_oldest else "20200101"
+        start_dt = datetime.strptime(sse_start, "%Y%m%d") + timedelta(days=1)
+        end_dt = datetime.strptime(target_date, "%Y%m%d")
+        fill_dates = []
+        d = start_dt
+        while d <= end_dt:
+            if d.weekday() < 5:
+                fill_dates.append(d.strftime("%Y%m%d"))
+            d += timedelta(days=1)
+
+        if fill_dates:
+            logging.info("Backfilling SSE shares: %s -> %s (%d weekdays)",
+                         fill_dates[0], fill_dates[-1], len(fill_dates))
+            sse_updated = 0
+            for d in fill_dates:
+                sse_data = fetch_sse_shares(d)
+                if not sse_data:
+                    continue
+                filtered = {c: sse_data[c] for c in sse_codes if c in sse_data}
+                if not filtered:
+                    continue
+                if d not in shares_history:
+                    shares_history[d] = {}
+                for c, v in filtered.items():
+                    if shares_history[d].get(c) != v:
+                        shares_history[d][c] = v
+                        changed = True
+                        sse_updated += 1
+            logging.info("  SSE: %d ETF-day entries updated", sse_updated)
+
+    return changed
+
+
+def update_vol5min_history(vol5min_history, target_date):
+    """
+    Backfill vol5min_history up to target_date.
+    Sina 5min API returns recent ~10 trading days with one call (datalen=480),
+    so we fetch each ETF once and fill in any missing days.
+    Only complete days (>=45 bars) are stored.
+    Returns True if any data was added.
+    """
+    changed = False
+    new_days = set()
+
+    for etf in ETF_LIST:
+        code = etf["code"]
+        tcode = etf["tcode"]
+        bars = fetch_sina_5min_range(tcode, datalen=VOL5MIN_BATCH_BARS)
+        if not bars:
+            continue
+
+        # group bars by date
+        by_date = {}  # {date_str: [[time, amount_yi], ...]}
+        for bar in bars:
+            d = bar["date"]  # YYYYMMDD
+            if d > target_date:
+                continue
+            if d not in by_date:
+                by_date[d] = []
+            by_date[d].append([bar["time"], bar["amount_yi"]])
+
+        for d, amounts in by_date.items():
+            # only keep complete days (near full 48 bars)
+            if len(amounts) < 45:
+                continue
+            if d not in vol5min_history:
+                vol5min_history[d] = {}
+            if code not in vol5min_history[d]:
+                vol5min_history[d][code] = amounts
+                changed = True
+                new_days.add(d)
+
+    # trim old days
+    all_dates = sorted(vol5min_history.keys())
+    if len(all_dates) > VOL5MIN_KEEP_DAYS:
+        for d in all_dates[:-VOL5MIN_KEEP_DAYS]:
+            del vol5min_history[d]
+
+    if new_days:
+        logging.info("  vol5min: added data for %d days (%s ... %s)",
+                     len(new_days), min(new_days), max(new_days))
+
+    return changed
+
+
+def get_latest_trade_date():
+    """
+    Determine the latest trading date by checking sh000001 daily K-line.
+    If current time is before 15:30, consider yesterday the latest (today not yet finished).
+    Returns date string YYYYMMDD.
+    """
+    now = datetime.now()
+    end_dt = now
+    if now.strftime("%H%M") < "1530":
+        end_dt = now - timedelta(days=1)  # today not finished yet
+    start_dt = end_dt - timedelta(days=10)
+    start_date = start_dt.strftime("%Y%m%d")
+    end_date = end_dt.strftime("%Y%m%d")
+
     try:
-        with open(path, "r") as f:
-            return json.load(f)
+        import akshare as ak
+        df = ak.stock_zh_a_daily(symbol="sh000001", start_date=start_date,
+                                 end_date=end_date, adjust="")
+        if df is None or df.empty:
+            logging.warning("get_latest_trade_date: no data, fallback to end_date")
+            return end_date
+        last_date = str(df.iloc[-1]["date"])[:10].replace("-", "")
+        return last_date
     except Exception as e:
-        logging.warning("load %s failed: %s", path, e)
-        return default
+        logging.warning("get_latest_trade_date failed: %s, fallback to end_date", e)
+        return end_date
 
 
-def save_json(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, ensure_ascii=False)
+def is_shares_up_to_date(shares_history, target_date):
+    """Check if shares_history has data up to target_date (at least one ETF)."""
+    if not shares_history:
+        return False
+    latest = sorted(shares_history.keys())[-1]
+    return latest >= target_date
+
+
+def is_vol5min_up_to_date(vol5min_history, target_date):
+    """Check if vol5min_history has data for target_date."""
+    return target_date in vol5min_history and len(vol5min_history[target_date]) > 0
+
+
+# ----------------------------------------------------------------------
+# per-ETF item builder
+# ----------------------------------------------------------------------
+
+def build_item(etf, realtime_data, daily_kline, shape_avg):
+    rt = realtime_data or {}
+    price = rt.get("price", 0)
+    prev_close = rt.get("prev_close", 0)
+    pct = rt.get("pct", 0)
+    amount_wan = rt.get("amount_wan", 0)
+    amount_yi = rt.get("amount_yi", 0)
+    outer_lots = rt.get("outer_lots", 0)
+    inner_lots = rt.get("inner_lots", 0)
+    turnover = rt.get("turnover", 0)
+    mktcap_yi = rt.get("mktcap_yi", 0)
+    shares = rt.get("shares", 0)
+    shares_yi = rt.get("shares_yi", 0)
+    ts = rt.get("ts", "")
+    date = rt.get("date", "")
+
+    # hist: compact daily K-line of last 30 days
+    hist = []
+    if daily_kline:
+        for bar in daily_kline:
+            hist.append({
+                "date": bar["date"],
+                "amount_yi": bar["amount_yi"],
+                "volume_lots": bar["volume_lots"],
+            })
+    hist = hist[-30:]
+
+    avg20 = calc_avg20(hist) if hist else 0
+
+    return {
+        "code": etf["code"],
+        "tcode": etf["tcode"],
+        "name": etf["name"],
+        "index": etf["index"],
+        "group": etf["group"],
+        "huijin_yi": etf["huijin_yi"],
+        "price": price,
+        "prev_close": prev_close,
+        "pct": pct,
+        "amount_yi": amount_yi,
+        "amount_wan": amount_wan,
+        "mktcap_yi": mktcap_yi,
+        "shares": shares,
+        "shares_yi": shares_yi,
+        "outer_lots": outer_lots,
+        "inner_lots": inner_lots,
+        "turnover": turnover,
+        "ts": ts,
+        "date": date,
+        "avg20_yi": avg20,
+        "shape": shape_avg,
+        "hist": hist,
+        "tail_ratio": None,
+        "tail_ratio_base": 0.2906,  # empirical value, to be replaced with historical data
+        "subscr_net_yi": None,
+        "prev_shares": None,
+    }
+
+
+# ----------------------------------------------------------------------
+# calculations
+# ----------------------------------------------------------------------
+
+def calc_avg20(hist):
+    """ MA-20 of daily trading value (亿) """
+    if not hist:
+        return 0.0
+    recent = hist[-20:]
+    amounts = [d["amount_yi"] for d in recent if d.get("amount_yi", 0) > 0]
+    if not amounts:
+        return 0.0
+    return round(sum(amounts) / len(amounts), 2)
+
+
+def build_shape_from_amounts(amounts):
+    """
+    Build cumulative turnover ratio curve from raw 5min amount data.
+    amounts: [[time, amount_yi], ...]
+    Returns [[hhmm, ratio], ...]
+    """
+    if not amounts:
+        return []
+    total = sum(a[1] for a in amounts)
+    if total <= 0:
+        return []
+
+    cumulative = 0.0
+    shape = []
+    for time_str, amt in amounts:
+        cumulative += amt
+        ratio = min(1.0, cumulative / total)
+        shape.append([time_str, round(ratio, 5)])
+    return shape
+
+
+def avg_shapes(shape_list):
+    """Average shape curves across multiple days"""
+    if not shape_list:
+        return []
+    times = [p[0] for p in shape_list[0]]
+    avg = []
+    for i, t in enumerate(times):
+        vals = [s[i][1] for s in shape_list if i < len(s)]
+        if vals:
+            avg.append([t, round(sum(vals) / len(vals), 5)])
+    return avg
+
+
+def calc_tail_ratio(shape, daily_amount=None):
+    """
+    Compute the tail-half-hour (14:30-15:00) share of full-day turnover from shape curve.
+    shape is a cumulative ratio curve; tail ratio = 1 - shape(point before 14:30)
+    """
+    if not shape:
+        return None
+    # find the nearest point before 14:30
+    for i, (t, r) in enumerate(shape):
+        if t >= "14:30":
+            before = shape[i - 1][1] if i > 0 else 0
+            return round(1.0 - before, 4)
+    return None
+
+
+def prev_trading_date(date_str):
+    """Roughly roll back to the previous weekday (holidays not considered)"""
+    d = datetime.strptime(date_str, "%Y%m%d")
+    while True:
+        d -= timedelta(days=1)
+        if d.weekday() < 5:
+            return d.strftime("%Y%m%d")
 
 
 # ----------------------------------------------------------------------
@@ -412,25 +804,37 @@ def fetch_szse_shares(date_str):
     fetch one-day SZSE-official ETF share data  (using akshare)
     returns {code: shares_yi}  (亿份), {} on failure
     """
+    result_by_date = fetch_szse_shares_range(date_str, date_str)
+    return result_by_date.get(date_str, {})
+
+
+def fetch_szse_shares_range(start_date, end_date):
+    """
+    fetch SZSE-official ETF share data for a date range (using akshare).
+    returns {date_str: {code: shares_yi}}, {} on failure
+    """
     try:
         import akshare as ak
         df = ak.fund_scale_daily_szse(
-            start_date=date_str, end_date=date_str, symbol="ETF"
+            start_date=start_date, end_date=end_date, symbol="ETF"
         )
         result = {}
         for _, row in df.iterrows():
+            d = str(row["日期"]).replace("-", "")
             code = str(row["基金代码"]).strip()
             shares = float(row["基金份额"])  # 单位: 份
-            result[code] = round(shares / 1e8, 4)
+            if d not in result:
+                result[d] = {}
+            result[d][code] = round(shares / 1e8, 4)
         return result
     except Exception as e:
-        logging.warning("SZSE shares %s failed: %s", date_str, e)
+        logging.warning("SZSE shares %s~%s failed: %s", start_date, end_date, e)
         return {}
 
 
 def fetch_sina_daily(tcode, days=40):
     """
-    sina daily K线（qfq, with volume data)。
+    sina daily K-line (qfq, with volume data).
     return: [{date, open, close, high, low, volume_lots, amount_yi}, ...]
     In ascending order by date.
     """
@@ -467,49 +871,64 @@ def fetch_sina_daily(tcode, days=40):
 
 def fetch_sina_5min(tcode):
     """
-    sina 5min K-line via CN_MarketDataService.getKLineData (covers recent trading days)
+    sina 5min K-line for today via CN_MarketDataService.getKLineData
     return: [{time, open, close, high, low, volume_lots, amount_yi}, ...]
-    Only today's bars are used; data is already in 5-min intervals.
+    Only today's bars are returned; data is already in 5-min intervals.
     """
-    url = (
-        f"https://quotes.sina.cn/cn/api/jsonp_v2.php/=/"
-        f"CN_MarketDataService.getKLineData?symbol={tcode}&scale=5&ma=no&datalen=48"
-    )
-    text = _http_get(url, referer="https://finance.sina.com.cn/")
+    all_bars = fetch_sina_5min_range(tcode, datalen=48)
+    today_str = datetime.now().strftime("%Y%m%d")
+    return [b for b in all_bars if b["date"] == today_str]
+
+
+def _parse_sina_5min_jsonp(text):
+    """Parse JSONP response from sina getKLineData into raw list."""
     if not text:
         return []
-
-    # JSONP format: =([...]);  — strip the wrapper
-    # find the first [ and last ]
     start = text.find("[")
     end = text.rfind("]")
     if start < 0 or end < 0 or end <= start:
         return []
     text = text[start:end + 1]
-
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
         return []
-
     if not isinstance(data, list):
         return []
+    return data
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
+
+def fetch_sina_5min_range(tcode, datalen=480):
+    """
+    sina 5min K-line for multiple recent days.
+    datalen: number of 5min bars to fetch (48 per trading day)
+    returns [{date(YYYYMMDD), time(HH:MM), open, close, high, low, volume_lots, amount_yi}, ...]
+    sorted ascending by date+time.
+    """
+    url = (
+        f"https://quotes.sina.cn/cn/api/jsonp_v2.php/=/"
+        f"CN_MarketDataService.getKLineData?symbol={tcode}&scale=5&ma=no&datalen={datalen}"
+    )
+    text = _http_get(url, referer="https://finance.sina.com.cn/")
+    data = _parse_sina_5min_jsonp(text)
+    if not data:
+        return []
+
     result = []
     for row in data:
         try:
             day_str = str(row.get("day", ""))
-            # only keep today's bars
-            if not day_str.startswith(today_str):
-                continue
             if " " in day_str:
-                hhmm = day_str.split(" ")[1][:5]
+                date_part, time_part = day_str.split(" ", 1)
+                hhmm = time_part[:5]
             else:
-                hhmm = day_str
+                date_part = day_str
+                hhmm = ""
+            date_yyyymmdd = date_part.replace("-", "")
             volume = float(row.get("volume", 0))
             amount = float(row.get("amount", 0))
             result.append({
+                "date": date_yyyymmdd,
                 "time": hhmm,
                 "open": float(row.get("open", 0)),
                 "close": float(row.get("close", 0)),
@@ -525,139 +944,24 @@ def fetch_sina_5min(tcode):
 
 
 # ----------------------------------------------------------------------
-# Calculations
+# utils
 # ----------------------------------------------------------------------
 
-def calc_avg20(hist):
-    """ MA-20 of daily trading value (亿) """
-    if not hist:
-        return 0.0
-    recent = hist[-20:]
-    amounts = [d["amount_yi"] for d in recent if d.get("amount_yi", 0) > 0]
-    if not amounts:
-        return 0.0
-    return round(sum(amounts) / len(amounts), 2)
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.warning("load %s failed: %s", path, e)
+        return default
 
 
-def build_shape_from_amounts(amounts):
-    """
-    Build cumulative turnover ratio curve from raw 5min amount data.
-    amounts: [[time, amount_yi], ...]
-    Returns [[hhmm, ratio], ...]
-    """
-    if not amounts:
-        return []
-    total = sum(a[1] for a in amounts)
-    if total <= 0:
-        return []
-
-    cumulative = 0.0
-    shape = []
-    for time_str, amt in amounts:
-        cumulative += amt
-        ratio = min(1.0, cumulative / total)
-        shape.append([time_str, round(ratio, 5)])
-    return shape
-
-
-def avg_shapes(shape_list):
-    """Average shape curves across multiple days"""
-    if not shape_list:
-        return []
-    times = [p[0] for p in shape_list[0]]
-    avg = []
-    for i, t in enumerate(times):
-        vals = [s[i][1] for s in shape_list if i < len(s)]
-        if vals:
-            avg.append([t, round(sum(vals) / len(vals), 5)])
-    return avg
-
-
-def calc_tail_ratio(shape, daily_amount=None):
-    """
-    Compute the tail-half-hour (14:30-15:00) share of full-day turnover from shape curve.
-    shape is a cumulative ratio curve; tail ratio = 1 - shape(point before 14:30)
-    """
-    if not shape:
-        return None
-    # find the nearest point before 14:30
-    for i, (t, r) in enumerate(shape):
-        if t >= "14:30":
-            before = shape[i - 1][1] if i > 0 else 0
-            return round(1.0 - before, 4)
-    return None
-
-
-def prev_trading_date(date_str):
-    """Roughly roll back to the previous weekday (holidays not considered)"""
-    d = datetime.strptime(date_str, "%Y%m%d")
-    while True:
-        d -= timedelta(days=1)
-        if d.weekday() < 5:
-            return d.strftime("%Y%m%d")
-
-
-# ----------------------------------------------------------------------
-# build per-ETF item
-# ----------------------------------------------------------------------
-
-def build_item(etf, realtime_data, daily_kline, shape_avg):
-    rt = realtime_data or {}
-    price = rt.get("price", 0)
-    prev_close = rt.get("prev_close", 0)
-    pct = rt.get("pct", 0)
-    amount_wan = rt.get("amount_wan", 0)
-    amount_yi = rt.get("amount_yi", 0)
-    outer_lots = rt.get("outer_lots", 0)
-    inner_lots = rt.get("inner_lots", 0)
-    turnover = rt.get("turnover", 0)
-    mktcap_yi = rt.get("mktcap_yi", 0)
-    shares = rt.get("shares", 0)
-    shares_yi = rt.get("shares_yi", 0)
-    ts = rt.get("ts", "")
-    date = rt.get("date", "")
-
-    # hist: compact daily K-line of last 30 days
-    hist = []
-    if daily_kline:
-        for bar in daily_kline:
-            hist.append({
-                "date": bar["date"],
-                "amount_yi": bar["amount_yi"],
-                "volume_lots": bar["volume_lots"],
-            })
-    hist = hist[-30:]
-
-    avg20 = calc_avg20(hist) if hist else 0
-
-    return {
-        "code": etf["code"],
-        "tcode": etf["tcode"],
-        "name": etf["name"],
-        "index": etf["index"],
-        "group": etf["group"],
-        "huijin_yi": etf["huijin_yi"],
-        "price": price,
-        "prev_close": prev_close,
-        "pct": pct,
-        "amount_yi": amount_yi,
-        "amount_wan": amount_wan,
-        "mktcap_yi": mktcap_yi,
-        "shares": shares,
-        "shares_yi": shares_yi,
-        "outer_lots": outer_lots,
-        "inner_lots": inner_lots,
-        "turnover": turnover,
-        "ts": ts,
-        "date": date,
-        "avg20_yi": avg20,
-        "shape": shape_avg,
-        "hist": hist,
-        "tail_ratio": None,
-        "tail_ratio_base": 0.2906,  # empirical value, to be replaced with historical data
-        "subscr_net_yi": None,
-        "prev_shares": None,
-    }
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, ensure_ascii=False)
 
 
 # ----------------------------------------------------------------------
