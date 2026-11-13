@@ -99,11 +99,15 @@ button.primary:hover{background:#333}
 
 /* table */
 .tablewrap{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:auto}
-table{width:100%;border-collapse:collapse;min-width:1060px}
-thead th{position:sticky;top:0;background:#fafafa;text-align:right;font-size:11px;font-weight:700;color:var(--ink3);letter-spacing:.4px;padding:12px 12px;border-bottom:1px solid var(--line);white-space:nowrap;z-index:2}
-thead th:nth-child(1),thead th:nth-child(2){text-align:left}
-tbody td{padding:11px 12px;border-bottom:1px solid var(--line2);text-align:right;white-space:nowrap;font-size:13px}
-tbody td:nth-child(1),tbody td:nth-child(2){text-align:left}
+table{width:100%;border-collapse:collapse}
+thead th{position:sticky;top:0;background:#fafafa;text-align:right;font-size:11px;font-weight:700;color:var(--ink3);letter-spacing:.4px;padding:8px 2px;border-bottom:1px solid var(--line);white-space:nowrap;z-index:2}
+thead th:nth-child(1){text-align:left;padding-left:12px}
+thead th:nth-child(2){text-align:left;padding-left:2px}
+thead th:last-child{padding-right:12px}
+tbody td{padding:11px 2px;border-bottom:1px solid var(--line2);text-align:right;white-space:nowrap;font-size:13px}
+tbody td:nth-child(1){text-align:left;padding-left:12px}
+tbody td:nth-child(2){text-align:left;padding-left:2px}
+tbody td:last-child{padding-right:12px}
 tbody td:nth-child(9){padding-top:4px;padding-bottom:4px}
 tr.grouphead td{background:#f7f7f7;font-size:11px;font-weight:700;letter-spacing:1px;color:var(--ink2);padding:9px 12px;text-align:left;border-bottom:1px solid var(--line)}
 tr.grouphead td .cnt{font-weight:400;color:var(--ink3);letter-spacing:0;margin-left:8px}
@@ -122,7 +126,7 @@ tr.total td{background:#fafafa;font-weight:700;border-top:1px solid var(--line);
 th sup{font-size:9px;font-weight:700;color:var(--orange);margin-left:1px;vertical-align:super}
 .thsub{display:block;font-size:9.5px;font-weight:400;color:var(--ink3);margin-top:1px;letter-spacing:0}
 .mini{height:4px;background:var(--line2);border-radius:2px;margin-top:5px;overflow:hidden;width:74px;margin-left:auto}
-svg.spark{display:block;margin:0 auto}
+svg.spark{display:block;margin:0 0 0 auto}
 .mini span{display:block;height:100%;background:var(--orange);border-radius:2px}
 
 .tnote{margin-top:8px;padding:10px 14px;background:var(--card);border:1px solid var(--line);border-radius:16px;
@@ -263,14 +267,14 @@ footer code{background:#f5f5f5;padding:2px 6px;border-radius:3px;font-size:11px;
         <tr>
           <th>ETF</th>
           <th>跟踪指数</th>
-          <th>规模(亿)</th>
+          <th title="场内份额日频披露，下方为较前一交易日变化">份额(亿份)<sup>②</sup><span class="thsub" id="thShareDate"></span></th>
+          <th>规模(亿)<span class="thsub" id="thMktcapDate"></span></th>
           <th>成交额(亿)</th>
           <th id="thRatio">较20日均</th>
           <th title="外盘−内盘 逐笔主动买卖推算，非资金流向、非申赎、不含大宗">主动净买入<sup>①</sup></th>
           <th>涨跌</th>
-          <th title="场内份额日频披露，下方为最近已公布日较前一交易日的变化估算">份额(亿份)<sup>②</sup><span class="thsub" id="thShareDate"></span></th>
           <th>近30日成交额</th>
-          <th>汇金持仓(25年报·亿份)</th>
+          <th>汇金持仓(亿份)<span class="thsub">截至25年报</span></th>
         </tr>
       </thead>
       <tbody id="tbody">
@@ -840,24 +844,46 @@ function renderTable(){
     var hb=Math.min(100,c.ratio/3*100);
     var amtSub = st.trading ? '<div class="sub muted">截至 '+st.effHHMM+'</div>' : '';
     var ratioSub = st.trading ? '<div class="sub muted">已达成日均 '+fmt(c.raw,2)+'×</div>' : '';
+    // share diff and market cap diff
+    var shareDelta = null, mktcapDelta = null;
+    if(it.subscr_net_yi !== null && it.subscr_net_yi !== undefined && it.price){
+      shareDelta = it.shares_yi - it.prev_shares/1e8;
+      mktcapDelta = it.subscr_net_yi;
+    }
+    var shareCls = shareDelta!==null ? cls(shareDelta) : 'muted';
+    var mktcapSubCls = mktcapDelta!==null ? cls(mktcapDelta) : 'muted';
+    // if this ETF's share date differs from the global latest, mark it
+    var dateMark = '';
+    if(it.share_date && S.latest_share_date && it.share_date !== S.latest_share_date){
+      dateMark = '<span class="muted" style="font-size:10px;margin-left:2px">('+fmtMMDD(it.share_date)+')</span>';
+    }
+    function signed1(n){ return (n>0?'+':'')+fmt(n,1); }
+    var shareSub = shareDelta===null
+      ? '<div class="muted" style="font-size:13px">—</div>'
+      : '<div class="num '+shareCls+'" style="font-size:13px">'+signed1(shareDelta)+'</div>';
+    var mktcapSub = mktcapDelta===null
+      ? '<div class="muted" style="font-size:13px">—</div>'
+      : '<div class="num '+mktcapSubCls+'" style="font-size:13px">'+signed1(mktcapDelta)+'</div>';
+
     html += '<tr>'+
       '<td><div class="name">'+it.name+'<span class="chip '+it.group+'">'+(it.group==='core'?'汪汪队':'观察')+'</span></div>'+
            '<div class="code num">'+it.code+'</div></td>'+
       '<td class="muted">'+it.index+'</td>'+
-      '<td class="num">'+fmt(it.mktcap_yi,1)+'</td>'+
+      '<td><div class="num">'+fmt(it.shares_yi,1)+dateMark+'</div>'+shareSub+'</td>'+
+      '<td><div class="num">'+fmt(it.mktcap_yi,1)+dateMark+'</div>'+mktcapSub+'</td>'+
       '<td class="num" style="font-weight:700">'+fmt(it.amount_yi,2)+amtSub+'</td>'+
       '<td><div class="ratio num '+rCls+'">'+fmt(c.ratio,2)+'<b>×</b></div>'+ratioSub+
            '<div class="mini"><span style="width:'+hb.toFixed(1)+'%"></span></div></td>'+
       '<td class="num '+netCls+'" style="font-weight:700">'+signed(c.net)+'</td>'+
       '<td class="num '+pctCls+'" style="font-weight:700">'+signed(it.pct)+'%</td>'+
-      '<td><div class="num">'+fmt(it.shares_yi,1)+'</div>'+subscrCell(it)+'</td>'+
       '<td>'+spark(it.hist, it.amount_yi, it.date && it.date.length===8 ? it.date.slice(0,4)+'-'+it.date.slice(4,6)+'-'+it.date.slice(6,8) : '', (c.done>0 && it.amount_yi>0) ? it.amount_yi/c.done : 0)+'</td>'+
       '<td class="num '+(it.huijin_yi?'':'muted')+'">'+(it.huijin_yi?fmt(it.huijin_yi,1):'—')+'</td>'+
     '</tr>';
   });
   var core = S.items.filter(function(i){return i.group==='core';});
   var sa=0,sb=0,sn=0; core.forEach(function(it){var c=calcAdj(it,st);sa+=it.amount_yi||0;sb+=(it.avg20_yi||0)*c.done;sn+=c.net;});
-  html += '<tr class="total"><td>汪汪队合计</td><td class="muted">'+core.length+' 只</td><td class="muted">—</td>'+
+  html += '<tr class="total"><td>汪汪队合计</td><td class="muted">'+core.length+' 只</td>'+
+    '<td class="muted">—</td><td class="muted">—</td>'+
     '<td class="num">'+fmt(sa,2)+(st.trading?'<div class="sub muted">截至 '+st.effHHMM+'</div>':'')+'</td>'+
     '<td class="num hl">'+fmt(sb>0?sa/sb:0,2)+'×</td>'+
     '<td class="num '+cls(sn)+'">'+signed(sn)+'</td><td colspan="4" class="muted" style="text-align:right">合计口径与上方判断一致</td></tr>';
@@ -938,7 +964,9 @@ function renderStatus(){
   }
   document.getElementById('stamp').textContent = '快照 '+fmtDate(S.trade_date)+' · 生成 '+S.generated_at;
   var sd = S.latest_share_date;
-  document.getElementById('thShareDate').textContent = sd && sd.length===8 ? '截至 '+sd.slice(4,6)+'-'+sd.slice(6,8) : '';
+  var sdStr = sd && sd.length===8 ? '截至 '+sd.slice(4,6)+'-'+sd.slice(6,8) : '';
+  document.getElementById('thShareDate').textContent = sdStr;
+  document.getElementById('thMktcapDate').textContent = sdStr;
   var newest = S.items[0] && S.items[0].date ? S.items[0].date : S.trade_date;
   var stale = newest && newest!==st.date && (st.trading||st.after);
   document.getElementById('meta').innerHTML =

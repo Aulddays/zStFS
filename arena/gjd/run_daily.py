@@ -48,7 +48,7 @@ VOL5MIN_FILE = os.path.join(SCRIPT_DIR, "vol5min_history.json")
 SHAPE_WINDOW = 20
 
 # max runtime for schedule mode (seconds)
-MAX_RUNTIME = 8 * 3600
+MAX_RUNTIME = 14 * 3600
 # sleep between rounds (seconds)
 SLEEP_INTERVAL = 600
 # how many 5min bars to fetch per call (each call returns ~5 trading days of data)
@@ -136,8 +136,8 @@ def main(argv):
         target_date = get_latest_trade_date()
         logging.info("Latest trade date: %s", target_date)
 
-        shares_changed = update_shares_history(shares_history, target_date)
-        vol5min_changed = update_vol5min_history(vol5min_history, target_date)
+        shares_changed, shares_done = update_shares_history(shares_history, target_date)
+        vol5min_changed, vol5min_done = update_vol5min_history(vol5min_history, target_date)
 
         # only rebuild snapshot when history data changes (running post-market, realtime data is static)
         if shares_changed or vol5min_changed or round_num == 1:
@@ -156,8 +156,6 @@ def main(argv):
             break
 
         # schedule mode: check if done
-        shares_done = is_shares_up_to_date(shares_history, target_date)
-        vol5min_done = is_vol5min_up_to_date(vol5min_history, target_date)
         logging.info("Progress: shares=%s vol5min=%s",
                      "DONE" if shares_done else "pending",
                      "DONE" if vol5min_done else "pending")
@@ -398,7 +396,7 @@ def update_shares_history(shares_history, target_date):
     Each ETF tracks its own latest date; if any ETF lags behind target_date, we try to fill.
     SSE: fetched day by day (API only supports single date).
     SZSE: fetched in batch range (more efficient).
-    Returns True if any data was added/updated.
+    Returns (changed, done): whether data was updated, and whether all ETFs reached target_date.
     """
     sse_codes = [e["code"] for e in ETF_LIST if e["tcode"].startswith("sh")]
     szse_codes = [e["code"] for e in ETF_LIST if e["tcode"].startswith("sz")]
@@ -417,7 +415,7 @@ def update_shares_history(shares_history, target_date):
 
     # if all ETFs in both markets are already at or past target_date, nothing to do
     if sse_oldest >= target_date and szse_oldest >= target_date:
-        return False
+        return False, True
 
     changed = False
 
@@ -488,7 +486,10 @@ def update_shares_history(shares_history, target_date):
                         sse_updated += 1
             logging.info("  SSE: %d ETF-day entries updated", sse_updated)
 
-    return changed
+    # re-check after fetch: did all ETFs catch up?
+    sse_done = (not sse_codes) or oldest_latest(sse_codes) >= target_date
+    szse_done = (not szse_codes) or oldest_latest(szse_codes) >= target_date
+    return changed, sse_done and szse_done
 
 
 def update_vol5min_history(vol5min_history, target_date):
@@ -497,7 +498,7 @@ def update_vol5min_history(vol5min_history, target_date):
     Sina 5min API returns recent ~10 trading days with one call (datalen=480),
     so we fetch each ETF once and fill in any missing days.
     Only complete days (>=45 bars) are stored.
-    Returns True if any data was added.
+    Returns (changed, done): whether data was added, and whether all ETFs have target_date.
     """
     changed = False
     new_days = set()
@@ -540,7 +541,10 @@ def update_vol5min_history(vol5min_history, target_date):
         logging.info("  vol5min: added data for %d days (%s ... %s)",
                      len(new_days), min(new_days), max(new_days))
 
-    return changed
+    # done: every ETF has complete target_date data
+    day_data = vol5min_history.get(target_date, {})
+    done = all(etf["code"] in day_data for etf in ETF_LIST)
+    return changed, done
 
 
 def get_latest_trade_date():
@@ -569,19 +573,6 @@ def get_latest_trade_date():
     except Exception as e:
         logging.warning("get_latest_trade_date failed: %s, fallback to end_date", e)
         return end_date
-
-
-def is_shares_up_to_date(shares_history, target_date):
-    """Check if shares_history has data up to target_date (at least one ETF)."""
-    if not shares_history:
-        return False
-    latest = sorted(shares_history.keys())[-1]
-    return latest >= target_date
-
-
-def is_vol5min_up_to_date(vol5min_history, target_date):
-    """Check if vol5min_history has data for target_date."""
-    return target_date in vol5min_history and len(vol5min_history[target_date]) > 0
 
 
 # ----------------------------------------------------------------------
