@@ -74,7 +74,7 @@ header{display:flex;align-items:flex-start;justify-content:space-between;gap:20p
 .rng button:hover{color:var(--ink)}
 .rng button.on{background:#fff;color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.09)}
 .chartbox{position:relative;margin-top:10px}
-.chartbox svg{display:block;width:100%;height:auto}
+.chartbox svg{display:block;width:100%;height:auto;max-height:240px}
 .chart-tip{position:absolute;pointer-events:none;background:#fff;border:1px solid var(--line);border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.10);padding:7px 10px;font-size:11px;line-height:1.6;display:none;z-index:6;white-space:nowrap}
 .chart-tip b{font-size:12px}
 .chart-tip .tu{color:var(--up);font-weight:700}
@@ -98,17 +98,18 @@ button.primary:hover{background:#333}
 .meta{margin-left:auto;font-size:11px;color:var(--ink3);text-align:right}
 
 /* table */
-.tablewrap{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:auto}
-table{width:100%;border-collapse:collapse}
-thead th{position:sticky;top:0;background:#fafafa;text-align:right;font-size:11px;font-weight:700;color:var(--ink3);letter-spacing:.4px;padding:8px 2px;border-bottom:1px solid var(--line);white-space:nowrap;z-index:2}
+.tablewrap{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);position:relative}
+.tablewrap thead th:first-child{border-top-left-radius:15px}
+.tablewrap thead th:last-child{border-top-right-radius:15px}
+table{width:100%;border-collapse:separate;border-spacing:0}
+thead th{position:sticky;top:0;background:#fafafa;text-align:right;font-size:11px;font-weight:700;color:var(--ink3);letter-spacing:.4px;padding:8px 2px;border-bottom:1px solid var(--line);white-space:nowrap;z-index:3}
 thead th:nth-child(1){text-align:left;padding-left:12px}
-thead th:nth-child(2){text-align:left;padding-left:2px}
 thead th:last-child{padding-right:12px}
 tbody td{padding:11px 2px;border-bottom:1px solid var(--line2);text-align:right;white-space:nowrap;font-size:13px}
 tbody td:nth-child(1){text-align:left;padding-left:12px}
-tbody td:nth-child(2){text-align:left;padding-left:2px}
 tbody td:last-child{padding-right:12px}
 tbody td:nth-child(9){padding-top:4px;padding-bottom:4px}
+tbody td:nth-child(4){padding-top:4px;padding-bottom:4px}
 tr.grouphead td{background:#f7f7f7;font-size:11px;font-weight:700;letter-spacing:1px;color:var(--ink2);padding:9px 12px;text-align:left;border-bottom:1px solid var(--line)}
 tr.grouphead td .cnt{font-weight:400;color:var(--ink3);letter-spacing:0;margin-left:8px}
 tr.total td{background:#fafafa;font-weight:700;border-top:1px solid var(--line);border-bottom:none}
@@ -125,9 +126,9 @@ tr.total td{background:#fafafa;font-weight:700;border-top:1px solid var(--line);
 .ratio b{font-size:11px;font-weight:600;color:var(--ink3);margin-left:2px}
 th sup{font-size:9px;font-weight:700;color:var(--orange);margin-left:1px;vertical-align:super}
 .thsub{display:block;font-size:9.5px;font-weight:400;color:var(--ink3);margin-top:1px;letter-spacing:0}
-.mini{height:4px;background:var(--line2);border-radius:2px;margin-top:5px;overflow:hidden;width:74px;margin-left:auto}
+.mini{margin-top:5px;width:74px;margin-left:auto}
+.mini svg{display:block}
 svg.spark{display:block;margin:0 0 0 auto}
-.mini span{display:block;height:100%;background:var(--orange);border-radius:2px}
 
 .tnote{margin-top:8px;padding:10px 14px;background:var(--card);border:1px solid var(--line);border-radius:16px;
   font-size:11px;line-height:1.65;color:var(--ink2)}
@@ -149,7 +150,8 @@ footer code{background:#f5f5f5;padding:2px 6px;border-radius:3px;font-size:11px;
 
 @media (max-width:768px){
   .wrap{padding:18px 14px 40px}
-  .brand h1{font-size:21px}
+  header{flex-direction:column;align-items:flex-start;gap:10px}
+  .status{align-items:flex-start}
   .verdict{padding:18px 16px 16px}
   .vtitle{font-size:24px}
   .mgrid{grid-template-columns:repeat(2,1fr)}
@@ -266,9 +268,9 @@ footer code{background:#f5f5f5;padding:2px 6px;border-radius:3px;font-size:11px;
       <thead>
         <tr>
           <th>ETF</th>
-          <th>跟踪指数</th>
           <th title="场内份额日频披露，下方为较前一交易日变化">份额(亿份)<sup>②</sup><span class="thsub" id="thShareDate"></span></th>
           <th>规模(亿)<span class="thsub" id="thMktcapDate"></span></th>
+          <th>30日份额价格</th>
           <th>成交额(亿)</th>
           <th id="thRatio">较20日均</th>
           <th title="外盘−内盘 逐笔主动买卖推算，非资金流向、非申赎、不含大宗">主动净买入<sup>①</sup></th>
@@ -467,6 +469,84 @@ function spark(hist, todayAmt, todayDate, todayFull){
     }
   });
   return '<svg class="spark" width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'" aria-label="近30日成交额">'+bars+'</svg>';
+}
+
+// 30日份额价格图：份额diff柱状(上下) + 价格折线
+// data: [[date_yyyymmdd, close_price, shares_yi], ...] oldest first
+function sparkSharesPrice(data){
+  if(!data || data.length < 2) return '';
+  var n = data.length;
+  var w = 96, h = 55;
+  var gap = 1;
+  var barW = Math.max(1.2, (w - (n-1)*gap) / n);
+
+  // compute shares diffs (first day diff = 0)
+  var diffs = [0];
+  for(var i = 1; i < n; i++){
+    diffs.push(data[i][2] - data[i-1][2]);
+  }
+
+  // share diff scale: symmetric around 0
+  var maxAbsDiff = 0;
+  for(var i = 0; i < diffs.length; i++){
+    if(Math.abs(diffs[i]) > maxAbsDiff) maxAbsDiff = Math.abs(diffs[i]);
+  }
+  if(maxAbsDiff === 0) maxAbsDiff = 1;
+
+  // price range
+  var prices = data.map(function(d){ return d[1]; });
+  var pMin = Math.min.apply(null, prices);
+  var pMax = Math.max.apply(null, prices);
+  var pRange = pMax - pMin || 1;
+
+  var midY = h / 2;  // zero line for shares diff
+  var upPad = 6, downPad = 6;
+  var shareScale = (midY - upPad) / maxAbsDiff;  // px per 亿份
+  // price: draw in the same space, top area (align first day to 0 line of shares)
+  var priceTopPad = 4;
+  var priceBotPad = 4;
+  var priceH = h - priceTopPad - priceBotPad;
+  // first day price aligns with midY (shares 0 line)
+  var firstPrice = prices[0];
+
+  var svg = '';
+  // zero line (gray dashed)
+  svg += '<line x1="0" y1="'+midY.toFixed(1)+'" x2="'+w+'" y2="'+midY.toFixed(1)+'" stroke="#d0d0d0" stroke-dasharray="2,2"/>';
+
+  // share diff bars
+  var x = 0;
+  for(var i = 0; i < n; i++){
+    var d = diffs[i];
+    var barH = Math.abs(d) * shareScale;
+    barH = Math.min(barH, midY - 2);
+    var barY, color;
+    if(d >= 0){
+      barY = midY - barH;
+      color = '#ff4713';
+    } else {
+      barY = midY;
+      color = '#00875a';
+    }
+    if(barH < 0.5) barH = 0.5;
+    svg += '<rect x="'+x.toFixed(1)+'" y="'+barY.toFixed(1)+'" width="'+barW.toFixed(1)+
+           '" height="'+barH.toFixed(1)+'" fill="'+color+'" opacity="0.7"/>';
+    x += barW + gap;
+  }
+
+  // price line
+  var path = '';
+  x = barW / 2;  // center of first bar
+  for(var i = 0; i < n; i++){
+    // map price: first price at midY, up if higher, down if lower
+    var py = midY - (prices[i] - firstPrice) / pRange * (priceH / 2);
+    // clamp
+    py = Math.max(priceTopPad, Math.min(h - priceBotPad, py));
+    path += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + py.toFixed(1) + ' ';
+    x += barW + gap;
+  }
+  svg += '<path d="'+path+'" fill="none" stroke="#005eb8" stroke-width="1"/>';
+
+  return '<svg class="spark" width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'" aria-label="30日份额价格">'+svg+'</svg>';
 }
 
 // ---- 份额图表 ----
@@ -754,7 +834,23 @@ function renderVerdict(v){
   var thr=document.getElementById('thRatio');
   if(thr) thr.textContent = v.st.trading?'同时点倍数':'较20日均';
 
-  var bars = Math.min(100, v.ratio/2.5*100);
+  // top verdict bar: dynamic max, markers at 1x and 1.8x
+  var topBarMax = Math.max(2, v.ratio);
+  var topBarW = '100%', topBarH = 5, topMarkH = 14;
+  var topBarFillPct = Math.min(100, v.ratio / topBarMax * 100);
+  var topBarColor = v.ratio >= 1.8 ? '#28a745' : (v.ratio >= 1 ? '#4a90d9' : '#ff4713');
+  var topSvgH = topMarkH;
+  var topBarY = (topMarkH - topBarH) / 2;
+  var oneXx = (1 / topBarMax) * 100;  // % position
+  var one8x = (1.8 / topBarMax) * 100;
+  var topBarSvg = '<div class="bar" style="height:'+topSvgH+'px;background:none;overflow:visible">' +
+    '<svg width="100%" height="'+topSvgH+'" viewBox="0 0 100 '+topSvgH+'" preserveAspectRatio="none">'+
+      '<rect x="0" y="'+topBarY+'" width="100" height="'+topBarH+'" fill="#f0f0f0" rx="2.5" ry="2.5"/>'+
+      '<rect x="0" y="'+topBarY+'" width="'+topBarFillPct.toFixed(1)+'" height="'+topBarH+'" fill="'+topBarColor+'" rx="2.5" ry="2.5"/>'+
+      '<line x1="'+oneXx.toFixed(1)+'" y1="0" x2="'+oneXx.toFixed(1)+'" y2="'+topSvgH+'" stroke="#aaa" stroke-width="0.5"/>'+
+      '<line x1="'+one8x.toFixed(1)+'" y1="0" x2="'+one8x.toFixed(1)+'" y2="'+topSvgH+'" stroke="#28a745" stroke-width="0.8"/>'+
+    '</svg></div>';
+
   document.getElementById('mgrid').innerHTML =
     card('汪汪队合计成交额', fmt(v.sumAmt,1)+' 亿',
          v.st.trading
@@ -764,7 +860,7 @@ function renderVerdict(v){
          v.st.trading
            ? '基准 '+fmt(v.sumBaseAdj,1)+' 亿 = 20日均额 × 同时点进度 '+fmt(v.done*100,1)+'%'
            : '阈值 1.8× 为强信号',
-           '<div class="bar"><span style="width:'+bars.toFixed(1)+'%"></span></div>') +
+           topBarSvg) +
     card('合计主动净买入', signed(v.sumNet)+' 亿', '主动买卖口径推算', '') +
     card('池内加权涨跌', fmt(v.wpct,2)+'%', '规模加权 · '+fmtDate(S.trade_date), '');
   var g=document.getElementById('mgrid');
@@ -831,6 +927,14 @@ function renderTable(){
   }[sort];
   list.sort(function(a,b){ if(a.group!==b.group) return a.group==='core'?-1:1; return cmp(a,b); });
 
+  // dynamic bar max: max(max_ratio * 1.2, 1.5)
+  var maxRatio = 0;
+  list.forEach(function(it){
+    var r = calcAdj(it, effSt).ratio;
+    if(r > maxRatio) maxRatio = r;
+  });
+  var barMax = Math.max(maxRatio * 1.2, 1.5);
+
   var html='', lastGroup='';
   list.forEach(function(it){
     if(it.group!==lastGroup){
@@ -843,7 +947,19 @@ function renderTable(){
     var rCls = c.ratio>=1.8?'hl':(c.ratio>=1.3?'':'muted');
     var hb=Math.min(100,c.ratio/3*100);
     var amtSub = st.trading ? '<div class="sub muted">截至 '+st.effHHMM+'</div>' : '';
-    var ratioSub = st.trading ? '<div class="sub muted">已达成日均 '+fmt(c.raw,2)+'×</div>' : '';
+    // ratio bar: SVG with 1x marker line; <1 red, >=1 green
+    var barW = 74, barH = 4, markH = 12;
+    var barPct = Math.min(100, c.ratio / barMax * 100);
+    var barFillPct = Math.max(0, barPct);
+    var barColor = c.ratio >= 1 ? '#28a745' : '#ff4713';
+    var oneXx = (1 / barMax) * barW;  // x position of 1x marker
+    var svgH = markH;
+    var barY = (markH - barH) / 2;
+    var ratioBar = '<div class="mini"><svg width="'+barW+'" height="'+svgH+'" viewBox="0 0 '+barW+' '+svgH+'">'+
+      '<rect x="0" y="'+barY+'" width="'+barW+'" height="'+barH+'" fill="#f0f0f0" rx="2" ry="2"/>'+
+      '<rect x="0" y="'+barY+'" width="'+(barFillPct/100*barW).toFixed(1)+'" height="'+barH+'" fill="'+barColor+'" rx="2" ry="2"/>'+
+      '<line x1="'+oneXx.toFixed(1)+'" y1="0" x2="'+oneXx.toFixed(1)+'" y2="'+svgH+'" stroke="#aaa" stroke-width="1"/>'+
+      '</svg></div>';
     // share diff and market cap diff
     var shareDelta = null, mktcapDelta = null;
     if(it.subscr_net_yi !== null && it.subscr_net_yi !== undefined && it.price){
@@ -866,14 +982,13 @@ function renderTable(){
       : '<div class="num '+mktcapSubCls+'" style="font-size:13px">'+signed1(mktcapDelta)+'</div>';
 
     html += '<tr>'+
-      '<td><div class="name">'+it.name+'<span class="chip '+it.group+'">'+(it.group==='core'?'汪汪队':'观察')+'</span></div>'+
+      '<td><div class="name">'+it.name+'<span class="chip '+it.group+'">'+(it.group==='core'?'汪':'观')+'</span></div>'+
            '<div class="code num">'+it.code+'</div></td>'+
-      '<td class="muted">'+it.index+'</td>'+
       '<td><div class="num">'+fmt(it.shares_yi,1)+dateMark+'</div>'+shareSub+'</td>'+
       '<td><div class="num">'+fmt(it.mktcap_yi,1)+dateMark+'</div>'+mktcapSub+'</td>'+
+      '<td>'+sparkSharesPrice(it.shares_30d)+'</td>'+
       '<td class="num" style="font-weight:700">'+fmt(it.amount_yi,2)+amtSub+'</td>'+
-      '<td><div class="ratio num '+rCls+'">'+fmt(c.ratio,2)+'<b>×</b></div>'+ratioSub+
-           '<div class="mini"><span style="width:'+hb.toFixed(1)+'%"></span></div></td>'+
+      '<td><div class="ratio num '+rCls+'">'+fmt(c.ratio,2)+'<b>×</b></div>'+ratioBar+'</td>'+
       '<td class="num '+netCls+'" style="font-weight:700">'+signed(c.net)+'</td>'+
       '<td class="num '+pctCls+'" style="font-weight:700">'+signed(it.pct)+'%</td>'+
       '<td>'+spark(it.hist, it.amount_yi, it.date && it.date.length===8 ? it.date.slice(0,4)+'-'+it.date.slice(4,6)+'-'+it.date.slice(6,8) : '', (c.done>0 && it.amount_yi>0) ? it.amount_yi/c.done : 0)+'</td>'+
@@ -882,8 +997,8 @@ function renderTable(){
   });
   var core = S.items.filter(function(i){return i.group==='core';});
   var sa=0,sb=0,sn=0; core.forEach(function(it){var c=calcAdj(it,st);sa+=it.amount_yi||0;sb+=(it.avg20_yi||0)*c.done;sn+=c.net;});
-  html += '<tr class="total"><td>汪汪队合计</td><td class="muted">'+core.length+' 只</td>'+
-    '<td class="muted">—</td><td class="muted">—</td>'+
+  html += '<tr class="total"><td>汪汪队合计</td>'+
+    '<td class="muted">—</td><td class="muted">—</td><td class="muted">—</td>'+
     '<td class="num">'+fmt(sa,2)+(st.trading?'<div class="sub muted">截至 '+st.effHHMM+'</div>':'')+'</td>'+
     '<td class="num hl">'+fmt(sb>0?sa/sb:0,2)+'×</td>'+
     '<td class="num '+cls(sn)+'">'+signed(sn)+'</td><td colspan="4" class="muted" style="text-align:right">合计口径与上方判断一致</td></tr>';

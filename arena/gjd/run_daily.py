@@ -300,11 +300,13 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
                      len(shape_hist_list))
 
     # all ETFs in shares_history, sorted by date
+    # shares_history format: {date: {code: [close_price, shares_yi]}}
+    # snapshot's shares_history keeps just shares_yi numbers (frontend chart only needs shares)
     all_codes = [e["code"] for e in ETF_LIST]
     shares_clean = {}
     for d in sorted(shares_history.keys()):
         row = shares_history[d]
-        shares_clean[d] = {c: round(row[c], 4) for c in all_codes if c in row}
+        shares_clean[d] = {c: round(row[c][1], 4) for c in all_codes if c in row}
 
     share_dates = sorted(shares_clean.keys())
     latest_share_date = share_dates[-1] if share_dates else ""
@@ -320,26 +322,27 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
         last_d = None
         prev_d = None
         for d in reversed(share_dates):
-            if code in shares_clean.get(d, {}):
+            if code in shares_history.get(d, {}):
                 if last_d is None:
                     last_d = d
                 else:
                     prev_d = d
                     break
         if last_d and prev_d:
-            last_sh_yi = shares_clean[last_d][code]
-            prev_sh_yi = shares_clean[prev_d][code]
+            last_entry = shares_history[last_d][code]  # [close_price, shares_yi]
+            prev_entry = shares_history[prev_d][code]
+            last_sh_yi = last_entry[1]
+            prev_sh_yi = prev_entry[1]
             # use official precise value from shares_history (not Tencent realtime estimate)
             item["shares"] = last_sh_yi * 1e8
             item["shares_yi"] = last_sh_yi
             item["prev_shares"] = prev_sh_yi * 1e8
             item["share_date"] = last_d
             item["prev_share_date"] = prev_d
-            if item["price"]:
-                diff = (last_sh_yi - prev_sh_yi) * item["price"]
-                item["subscr_net_yi"] = round(diff, 2)
-            else:
-                item["subscr_net_yi"] = None
+            # market cap diff = shares_delta × close_price (from shares_history)
+            close_price = last_entry[0] if last_entry[0] is not None else (item["price"] or 0)
+            diff = (last_sh_yi - prev_sh_yi) * close_price
+            item["subscr_net_yi"] = round(diff, 2)
         elif last_d:
             item["prev_shares"] = None
             item["share_date"] = last_d
@@ -350,6 +353,15 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
             item["share_date"] = ""
             item["prev_share_date"] = ""
             item["subscr_net_yi"] = None
+
+        # 30-day shares + price series for the per-row sparkline-like chart
+        # format: [[date_yyyymmdd, close_price, shares_yi], ...] oldest first
+        series_30 = []
+        for d in share_dates:
+            if code in shares_history.get(d, {}):
+                entry = shares_history[d][code]  # [price, shares_yi]
+                series_30.append([d, entry[0], entry[1]])
+        item["shares_30d"] = series_30[-30:]
 
     # --- assemble snapshot ---
     snapshot = {
@@ -393,9 +405,9 @@ def _etf_latest_date(shares_history, code):
 def update_shares_history(shares_history, target_date):
     """
     Backfill shares_history up to target_date, per-ETF.
-    Each ETF tracks its own latest date; if any ETF lags behind target_date, we try to fill.
-    SSE: fetched day by day (API only supports single date).
-    SZSE: fetched in batch range (more efficient).
+    Each entry stores [close_price, shares_yi].
+    Logic: first fetch shares from exchange, then fetch daily close from Sina.
+    Only save when BOTH price and shares are available; if incomplete, treat as not fetched.
     Returns (changed, done): whether data was updated, and whether all ETFs reached target_date.
     """
     sse_codes = [e["code"] for e in ETF_LIST if e["tcode"].startswith("sh")]
@@ -417,18 +429,18 @@ def update_shares_history(shares_history, target_date):
     if sse_oldest >= target_date and szse_oldest >= target_date:
         return False, True
 
-    changed = False
+    # --- Step 1: fetch shares data into temp structure ---
+    # new_shares_raw: {date_str: {code: shares_yi}}
+    new_shares_raw = {}
 
     # --- SZSE: batch fetch from oldest lagging date to target ---
-    # SZSE API has a max range (~6 months), so fetch in 150-day batches
     if szse_codes and szse_oldest < target_date:
         szse_start = szse_oldest if szse_oldest else "20200101"
         start_dt = datetime.strptime(szse_start, "%Y%m%d") + timedelta(days=1)
         end_dt = datetime.strptime(target_date, "%Y%m%d")
         if start_dt <= end_dt:
-            logging.info("Backfilling SZSE shares: %s -> %s",
+            logging.info("Fetching SZSE shares: %s -> %s",
                          start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"))
-            szse_updated = 0
             batch_dt = start_dt
             batch_num = 0
             while batch_dt <= end_dt:
@@ -442,17 +454,11 @@ def update_shares_history(shares_history, target_date):
                 batch_data = fetch_szse_shares_range(s, e)
                 for d, row in batch_data.items():
                     filtered = {c: row[c] for c in szse_codes if c in row}
-                    if not filtered:
-                        continue
-                    if d not in shares_history:
-                        shares_history[d] = {}
-                    for c, v in filtered.items():
-                        if shares_history[d].get(c) != v:
-                            shares_history[d][c] = v
-                            changed = True
-                            szse_updated += 1
+                    if filtered:
+                        if d not in new_shares_raw:
+                            new_shares_raw[d] = {}
+                        new_shares_raw[d].update(filtered)
                 batch_dt = batch_end + timedelta(days=1)
-            logging.info("  SZSE: %d ETF-day entries updated", szse_updated)
 
     # --- SSE: day by day, from oldest lagging date to target ---
     if sse_codes and sse_oldest < target_date:
@@ -467,24 +473,68 @@ def update_shares_history(shares_history, target_date):
             d += timedelta(days=1)
 
         if fill_dates:
-            logging.info("Backfilling SSE shares: %s -> %s (%d weekdays)",
+            logging.info("Fetching SSE shares: %s -> %s (%d weekdays)",
                          fill_dates[0], fill_dates[-1], len(fill_dates))
-            sse_updated = 0
             for d in fill_dates:
                 sse_data = fetch_sse_shares(d)
                 if not sse_data:
                     continue
                 filtered = {c: sse_data[c] for c in sse_codes if c in sse_data}
-                if not filtered:
-                    continue
-                if d not in shares_history:
-                    shares_history[d] = {}
-                for c, v in filtered.items():
-                    if shares_history[d].get(c) != v:
-                        shares_history[d][c] = v
-                        changed = True
-                        sse_updated += 1
-            logging.info("  SSE: %d ETF-day entries updated", sse_updated)
+                if filtered:
+                    if d not in new_shares_raw:
+                        new_shares_raw[d] = {}
+                    new_shares_raw[d].update(filtered)
+
+    # if no shares data at all, nothing to do
+    if not new_shares_raw:
+        logging.info("  No new shares data fetched")
+        sse_done = (not sse_codes) or oldest_latest(sse_codes) >= target_date
+        szse_done = (not szse_codes) or oldest_latest(szse_codes) >= target_date
+        return False, sse_done and szse_done
+
+    # --- Step 2: fetch daily close prices from Sina for ETFs that have new shares ---
+    # collect all ETF codes that appear in new_shares_raw
+    codes_with_new_shares = set()
+    for d, row in new_shares_raw.items():
+        codes_with_new_shares.update(row.keys())
+
+    # price_by_code: {code: {date_str_yyyymmdd: close_price}}
+    price_by_code = {}
+    for etf in ETF_LIST:
+        code = etf["code"]
+        if code not in codes_with_new_shares:
+            continue
+        tcode = etf["tcode"]
+        logging.info("  Fetching daily K for %s (%s)", code, tcode)
+        daily = fetch_sina_daily(tcode, days=80)  # enough headroom for backfill
+        if not daily:
+            logging.warning("  No daily data for %s", code)
+            continue
+        prices = {}
+        for bar in daily:
+            d = bar["date"].replace("-", "")
+            prices[d] = bar["close"]
+        price_by_code[code] = prices
+
+    # --- Step 3: merge — only save entries with both shares and price ---
+    changed = False
+    merged_count = 0
+    for d, row in new_shares_raw.items():
+        for code, shares_yi in row.items():
+            # skip if already in history
+            if d in shares_history and code in shares_history[d]:
+                continue
+            # need both shares and price
+            price = price_by_code.get(code, {}).get(d)
+            if price is None:
+                continue  # incomplete, skip
+            if d not in shares_history:
+                shares_history[d] = {}
+            shares_history[d][code] = [round(price, 4), round(shares_yi, 4)]
+            changed = True
+            merged_count += 1
+
+    logging.info("  Merged %d new entries (price + shares)", merged_count)
 
     # re-check after fetch: did all ETFs catch up?
     sse_done = (not sse_codes) or oldest_latest(sse_codes) >= target_date
