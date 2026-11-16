@@ -14,13 +14,17 @@ import time
 from datetime import datetime, date
 
 
-def isopen(val):
+def isopen(val=None):
     """
     Check whether A-share market is open on the given date.
 
-    val: date string (YYYYMMDD / YYYY-MM-DD) or unix timestamp (int/float)
+    val: date string (YYYYMMDD / YYYY-MM-DD), unix timestamp (int/float)
+         if None, use current time
     Returns: True if open, False if closed
     """
+    if val is None:
+        val = time.time()
+
     # normalize input to date
     if isinstance(val, date):
         d = val
