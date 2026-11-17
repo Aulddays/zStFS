@@ -15,6 +15,7 @@ import time
 import logging
 import threading
 import queue
+from dotenv import load_dotenv
 from urllib.request import urlopen, Request
 
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -22,6 +23,7 @@ sys.path.insert(0, os.path.dirname(_this_dir))   # arena/
 sys.path.insert(0, _this_dir)                      # arena/gjd/
 import cna_calendar
 from run_daily import ETF_LIST, setup_logging
+from zstorec import zstore
 
 # ----------------------------------------------------------------------
 # configs
@@ -39,6 +41,13 @@ CELL_SECONDS = 30         # 0.5 min per cell
 CELLS_PER_SESSION = 240   # 120 min / 0.5 min
 TOTAL_CELLS = CELLS_PER_SESSION * 2  # 480 cells per day
 
+STORE_INTERVAL = 60       # seconds between zstore writes
+ZSTORE_TABLE = "zStFS"
+ZSTORE_PARTKEY = "gjd-0.5m"
+load_dotenv()
+ZSTORE_URL = os.environ.get("ZSTORE_URL", None)
+ZSTORE_AUTHKEY = os.environ.get("ZSTORE_AUTHKEY", None)
+
 
 def main(argv):
     setup_logging()
@@ -50,15 +59,13 @@ def main(argv):
     logging.info("=== run_open start ===")
 
     today = _today_str()
-    detail_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               f"{today}.detail.json")
 
-    # load existing data if any
-    gjd_realtime_data = _load_detail(detail_path)  # {code: [[price, outer, inner], ...]}
+    # load existing data from zstore
+    gjd_realtime_data = _load_from_zstore(today)
     if gjd_realtime_data:
         n = len(gjd_realtime_data)
         cells = sum(len(v) for v in gjd_realtime_data.values()) // n
-        logging.info("Loaded %d ETFs from %s (%d cells each)", n, detail_path, cells)
+        logging.info("Loaded %d ETFs from zstore (%d cells each)", n, cells)
 
     data_queue = queue.Queue(maxsize=100)
     stop_event = threading.Event()
@@ -70,11 +77,15 @@ def main(argv):
     aggregator = threading.Thread(
         target=aggregator_thread, args=(data_queue, gjd_realtime_data, data_lock, stop_event),
         name="aggregator", daemon=True)
+    storer = threading.Thread(
+        target=store_thread, args=(gjd_realtime_data, data_lock, stop_event, today),
+        name="store", daemon=True)
     fetcher.start()
     aggregator.start()
+    storer.start()
 
     try:
-        while fetcher.is_alive() and aggregator.is_alive():
+        while fetcher.is_alive() and aggregator.is_alive() and storer.is_alive():
             time.sleep(30)
             with data_lock:
                 n = len(gjd_realtime_data)
@@ -89,11 +100,9 @@ def main(argv):
         logging.info("Interrupted")
     finally:
         stop_event.set()
-        fetcher.join(timeout=5)
-        aggregator.join(timeout=5)
-        with data_lock:
-            _save_detail(detail_path, gjd_realtime_data)
-        logging.info("Saved detail to %s", detail_path)
+        fetcher.join(timeout=30)
+        aggregator.join(timeout=30)
+        storer.join(timeout=30)
 
     logging.info("Done.")
     return 0
@@ -179,11 +188,11 @@ def aggregator_thread(data_queue, gjd_realtime_data, data_lock, stop_event):
     # per-ETF state
     state = {}
     for etf in ETF_LIST:
-        code = etf["code"]
-        bars = gjd_realtime_data.get(code, [])
-        if code not in gjd_realtime_data:
-            gjd_realtime_data[code] = []
-        state[code] = _build_state_from_bars(bars)
+        tcode = etf["tcode"]
+        bars = gjd_realtime_data.get(tcode, [])
+        if tcode not in gjd_realtime_data:
+            gjd_realtime_data[tcode] = []
+        state[tcode] = _build_state_from_bars(bars)
 
     logging.info("Aggregator thread started (%d ETFs)", len(state))
 
@@ -201,6 +210,39 @@ def aggregator_thread(data_queue, gjd_realtime_data, data_lock, stop_event):
         with data_lock:
             for code, item in data.items():
                 update_one(gjd_realtime_data, state, code, item)
+
+
+# ----------------------------------------------------------------------
+# store
+
+def store_thread(gjd_realtime_data, data_lock, stop_event, today):
+    """
+    Thread 3: periodically upsert gjd_realtime_data to zstore during market hours.
+    Wakes every STORE_INTERVAL seconds; also writes once on exit.
+    """
+    if not ZSTORE_URL or not ZSTORE_AUTHKEY:
+        logging.warning("ZSTORE_URL/ZSTORE_AUTHKEY not set, store thread disabled")
+        return
+
+    try:
+        z = zstore(ZSTORE_URL, backend="cosmos", authkey=ZSTORE_AUTHKEY)
+    except Exception as e:
+        logging.warning("zstore init failed: %s", e)
+        return
+
+    logging.info("Store thread started (interval=%ds)", STORE_INTERVAL)
+
+    while not stop_event.is_set():
+        _store_to_zstore(z, gjd_realtime_data, data_lock, today)
+        # sleep in small chunks so stop_event responds quickly
+        for _ in range(STORE_INTERVAL):
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+
+    # final store on exit
+    _store_to_zstore(z, gjd_realtime_data, data_lock, today)
+    logging.info("Store thread exiting")
 
 
 # update gjd_realtime_data of code with newly fetched realtime data
@@ -324,36 +366,63 @@ def update_one(gjd_realtime_data, state, code, data):
 
 def _today_str():
     """ return YYYYMMDD of current date in GMT+8 """
-    now = int(time.time())
-    sec = (now % 86400 + 8 * 3600) % 86400
-    day = now // 86400 + (1 if sec < 8 * 3600 else 0)
-    # epoch is 1970-01-01, but let's use time module for safety
-    import time as _t
-    t = _t.gmtime(now + 8 * 3600)
+    t = time.gmtime(int(time.time()) + 8 * 3600)
     return f"{t.tm_year}{t.tm_mon:02d}{t.tm_mday:02d}"
 
 
-def _load_detail(path):
-    """ load bars from json file, returns {} on failure """
-    if not os.path.exists(path):
+def _load_from_zstore(today):
+    """ load today's bars from zstore, returns {tcode: [[price, outer, inner], ...]} """
+    if not ZSTORE_URL or not ZSTORE_AUTHKEY:
+        logging.warning("zstore init no config")
         return {}
     try:
-        with open(path, "r") as f:
-            return json.load(f)
+        z = zstore(ZSTORE_URL, backend="cosmos", authkey=ZSTORE_AUTHKEY)
     except Exception as e:
-        logging.warning("load detail failed: %s", e)
+        logging.warning("zstore init failed: %s", e)
         return {}
-
-
-def _save_detail(path, data):
-    """ save bars to json file """
     try:
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, path)
+        rows = z.select(ZSTORE_TABLE, fields=["id", "code", "bars"],
+                where={"and": [["partkey_", "=", ZSTORE_PARTKEY], ["date", "=", int(today)]]})
     except Exception as e:
-        logging.warning("save detail failed: %s", e)
+        logging.warning("load from zstore failed: %s", e)
+        return {}
+    result = {}
+    for row in rows:
+        code = row.get("code", "")
+        bars_str = row.get("bars", "[]")
+        try:
+            bars = json.loads(bars_str) if isinstance(bars_str, str) else bars_str
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(bars, list):
+            result[code] = bars
+    return result
+
+
+def _store_to_zstore(z, gjd_realtime_data, data_lock, today):
+    """ upsert all non-empty bars to zstore """
+    with data_lock:
+        rows = []
+        for code, bars in gjd_realtime_data.items():
+            if not bars:
+                continue
+            rows.append({
+                "partkey_": ZSTORE_PARTKEY,
+                "id": f"{today}.{code}",
+                "date": int(today),
+                "code": code,
+                "bars": json.dumps(bars),
+            })
+    if not rows:
+        return
+    try:
+        res = z.upsert(ZSTORE_TABLE, rows)
+        if isinstance(res, dict) and "succeeded" in res:
+            logging.info("Stored %d/%d rows", res["succeeded"], res["total"])
+        else:
+            logging.info("Stored %d rows", len(rows))
+    except Exception as e:
+        logging.warning("zstore upsert failed: %s", e)
 
 
 def _build_state_from_bars(bars):
@@ -462,15 +531,15 @@ def _parse_tencent(text):
         return {}
     result = {}
     for m in re.finditer(r'v_(\w+)="([^"]*)"', text):
+        tcode = m.group(1)
         a = m.group(2).split("~")
         if len(a) < 40:
             continue
-        code = a[2] if len(a) > 2 else ""
         ts = a[30] if len(a) > 30 else ""
-        if len(ts) < 14 or not code:
+        if len(ts) < 14 or not tcode:
             continue
         try:
-            result[code] = {
+            result[tcode] = {
                 "ts": ts,
                 "price": float(a[3]),
                 "outer_lots": float(a[7]),

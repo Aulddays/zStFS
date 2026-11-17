@@ -42,6 +42,7 @@ prog.md
 venv
 __pycache__
 .env
+zstorec
 
 /testspace/
 /updater/
