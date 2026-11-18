@@ -12,11 +12,13 @@ import os
 import re
 import json
 import time
+import signal
 import logging
 import threading
 import queue
 from dotenv import load_dotenv
 from urllib.request import urlopen, Request
+from pymemcache.client import base as _pymemcache_base
 
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_this_dir))   # arena/
@@ -44,9 +46,12 @@ TOTAL_CELLS = CELLS_PER_SESSION * 2  # 480 cells per day
 STORE_INTERVAL = 60       # seconds between zstore writes
 ZSTORE_TABLE = "zStFS"
 ZSTORE_PARTKEY = "gjd-0.5m"
+MEMCACHE_KEY = "zStFS.gjd.realtime"
+
 load_dotenv()
 ZSTORE_URL = os.environ.get("ZSTORE_URL", None)
 ZSTORE_AUTHKEY = os.environ.get("ZSTORE_AUTHKEY", None)
+MEMCACHE_ADDR = os.environ.get("MEMCACHE_ADDR", None)
 
 
 def main(argv):
@@ -71,11 +76,17 @@ def main(argv):
     stop_event = threading.Event()
     data_lock = threading.Lock()
 
+    def _handle_sigterm(signum, frame):
+        logging.info("Received signal %d, shutting down", signum)
+        stop_event.set()
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT, _handle_sigterm)
+
     fetcher = threading.Thread(
-        target=fetcher_thread, args=(data_queue, stop_event),
+        target=fetcher_thread, args=(data_queue, stop_event, today),
         name="fetcher", daemon=True)
     aggregator = threading.Thread(
-        target=aggregator_thread, args=(data_queue, gjd_realtime_data, data_lock, stop_event),
+        target=aggregator_thread, args=(data_queue, gjd_realtime_data, data_lock, stop_event, today),
         name="aggregator", daemon=True)
     storer = threading.Thread(
         target=store_thread, args=(gjd_realtime_data, data_lock, stop_event, today),
@@ -96,8 +107,6 @@ def main(argv):
                     b = gjd_realtime_data[first]
                     logging.info("  %s: %d cells, last price=%.4f",
                                  first, len(b), b[-1][0] if b else 0)
-    except KeyboardInterrupt:
-        logging.info("Interrupted")
     finally:
         stop_event.set()
         fetcher.join(timeout=30)
@@ -111,7 +120,7 @@ def main(argv):
 # ----------------------------------------------------------------------
 # fetcher
 
-def fetcher_thread(data_queue, stop_event):
+def fetcher_thread(data_queue, stop_event, today):
     """
     Thread 1: fetch raw Tencent realtime data every FETCH_INTERVAL seconds,
     aligned to FETCH_ALIGN_SEC second boundaries.
@@ -124,6 +133,11 @@ def fetcher_thread(data_queue, stop_event):
     while not stop_event.is_set():
         now = time.time()
         now_cst_sec = (now % 86400 + 8 * 3600) % 86400
+
+        # date changed — market day is over, exit
+        if _today_str() != today:
+            logging.info("Date changed, fetcher exiting")
+            break
 
         # -- schedule control --
         if now_cst_sec < MORNING_START_SEC - 60:
@@ -180,7 +194,7 @@ def fetcher_thread(data_queue, stop_event):
 # ----------------------------------------------------------------------
 # aggregator
 
-def aggregator_thread(data_queue, gjd_realtime_data, data_lock, stop_event):
+def aggregator_thread(data_queue, gjd_realtime_data, data_lock, stop_event, today):
     """
     Thread 2: parse raw Tencent data and build 0.5-min bars for each ETF.
     gjd_realtime_data[code] = [[price, outer, inner], ...] (protected by data_lock).
@@ -203,13 +217,24 @@ def aggregator_thread(data_queue, gjd_realtime_data, data_lock, stop_event):
             continue
 
         # parse raw response: {code: {ts, price, outer_lots, inner_lots, amount_wan}}
-        data = _parse_tencent(raw_text)
+        raw_data = _parse_tencent(raw_text)
+        if not raw_data:
+            continue
+
+        # filter to today's valid range only; drop stale/wrong-date data
+        data = {}
+        for code, item in raw_data.items():
+            if _is_ts_valid_today(item["ts"], today):
+                data[code] = item
         if not data:
             continue
 
         with data_lock:
             for code, item in data.items():
                 update_one(gjd_realtime_data, state, code, item)
+
+            # write to memcache after each batch
+            _write_memcache(today, gjd_realtime_data)
 
 
 # ----------------------------------------------------------------------
@@ -364,12 +389,6 @@ def update_one(gjd_realtime_data, state, code, data):
 # helpers
 # ----------------------------------------------------------------------
 
-def _today_str():
-    """ return YYYYMMDD of current date in GMT+8 """
-    t = time.gmtime(int(time.time()) + 8 * 3600)
-    return f"{t.tm_year}{t.tm_mon:02d}{t.tm_mday:02d}"
-
-
 def _load_from_zstore(today):
     """ load today's bars from zstore, returns {tcode: [[price, outer, inner], ...]} """
     if not ZSTORE_URL or not ZSTORE_AUTHKEY:
@@ -425,6 +444,29 @@ def _store_to_zstore(z, gjd_realtime_data, data_lock, today):
         logging.warning("zstore upsert failed: %s", e)
 
 
+# shared memcache client (lazily created)
+_memcache_client = None
+
+def _write_memcache(today, gjd_realtime_data):
+    """ write latest bars to memcached, call must hold data_lock """
+    global _memcache_client
+    if not MEMCACHE_ADDR:
+        logging.warning("memcache not configured", e)
+        return
+    if _memcache_client is None:
+        try:
+            host, port = MEMCACHE_ADDR.rsplit(":", 1)
+            _memcache_client = _pymemcache_base.Client((host, int(port)))
+        except Exception as e:
+            logging.warning("memcache init failed: %s", e)
+            return
+    try:
+        value = json.dumps({today: gjd_realtime_data}).encode("utf-8")
+        _memcache_client.set(MEMCACHE_KEY, value)
+    except Exception as e:
+        logging.warning("memcache write failed: %s", e)
+
+
 def _build_state_from_bars(bars):
     """
     Reconstruct aggregator state from existing (assumed all-finalized) bars.
@@ -477,9 +519,27 @@ def _build_state_from_bars(bars):
     }
 
 
+def _today_str():
+    """ return YYYYMMDD of current date in GMT+8 """
+    t = time.gmtime(int(time.time()) + 8 * 3600)
+    return f"{t.tm_year}{t.tm_mon:02d}{t.tm_mday:02d}"
+
+
 def _ts_sec(ts_str):
     """ YYYYMMDDHHMMSS -> seconds since 00:00 """
     return int(ts_str[8:10]) * 3600 + int(ts_str[10:12]) * 60 + int(ts_str[12:14])
+
+
+def _is_ts_valid_today(ts_str, today):
+    """
+    Check if timestamp belongs to today's allowed range
+    (morning start - 60s ~ afternoon end + 300s).
+    Returns False for wrong date or out-of-range time.
+    """
+    if len(ts_str) < 14 or ts_str[:8] != today:
+        return False
+    sec = _ts_sec(ts_str)
+    return MORNING_START_SEC - 60 <= sec <= AFTERNOON_END_SEC + 300
 
 
 def _cell_end_sec(cell_idx):
