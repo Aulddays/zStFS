@@ -108,8 +108,9 @@ thead th:last-child{padding-right:12px}
 tbody td{padding:11px 2px;border-bottom:1px solid var(--line2);text-align:right;white-space:nowrap;font-size:13px}
 tbody td:nth-child(1){text-align:left;padding-left:12px}
 tbody td:last-child{padding-right:12px}
-tbody td:nth-child(9){padding-top:4px;padding-bottom:4px}
+tbody td:nth-child(10){padding-top:4px;padding-bottom:4px}
 tbody td:nth-child(4){padding-top:4px;padding-bottom:4px}
+tbody td:nth-child(5){padding-top:4px;padding-bottom:4px}
 tr.grouphead td{background:#f7f7f7;font-size:11px;font-weight:700;letter-spacing:1px;color:var(--ink2);padding:9px 12px;text-align:left;border-bottom:1px solid var(--line)}
 tr.grouphead td .cnt{font-weight:400;color:var(--ink3);letter-spacing:0;margin-left:8px}
 tr.total td{background:#fafafa;font-weight:700;border-top:1px solid var(--line);border-bottom:none}
@@ -271,6 +272,7 @@ footer code{background:#f5f5f5;padding:2px 6px;border-radius:3px;font-size:11px;
           <th title="场内份额日频披露，下方为较前一交易日变化">份额(亿份)<sup>②</sup><span class="thsub" id="thShareDate"></span></th>
           <th>规模(亿)<span class="thsub" id="thMktcapDate"></span></th>
           <th>30日份额价格</th>
+          <th>当日<span class="thsub">价格 / 量</span></th>
           <th>成交额(亿)</th>
           <th id="thRatio">较20日均</th>
           <th title="外盘−内盘 逐笔主动买卖推算，非资金流向、非申赎、不含大宗">主动净买入<sup>①</sup></th>
@@ -280,7 +282,7 @@ footer code{background:#f5f5f5;padding:2px 6px;border-radius:3px;font-size:11px;
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td colspan="10" style="text-align:center;padding:40px;color:var(--ink3)">加载中…</td></tr>
+        <tr><td colspan="11" style="text-align:center;padding:40px;color:var(--ink3)">加载中…</td></tr>
       </tbody>
     </table>
   </div>
@@ -331,6 +333,7 @@ var S = null;
 var byCode = {};
 var tcodes = [];
 var liveOK = false, lastLiveAt = 0, refreshing = false;
+var RT = null;  // intraday curve data: {date, bars, max_bars, data: {tcode: {price, outer, inner}}}
 
 function loadSnapshot(cb){
   fetch('snapshot.json?r=' + Date.now(), {cache: 'no-cache'})
@@ -547,6 +550,135 @@ function sparkSharesPrice(data){
   svg += '<path d="'+path+'" fill="none" stroke="#005eb8" stroke-width="1"/>';
 
   return '<svg class="spark" width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'" aria-label="30日份额价格">'+svg+'</svg>';
+}
+
+// ---- intraday realtime sparkline (5min bars, up to 48) ----
+// data: {price: [...], outer: [...], inner: [...]}
+// price line + volume bars overlaid in the same space, similar to sparkSharesPrice
+function sparkRealtime(data, totalBars, prevClose){
+  if(!data || !data.price || !data.price.length) return '';
+  var n = data.price.length;
+  var total = totalBars || n;
+  var w = 96, h = 55;
+  var gap = 0;
+  var barW = w / total;
+
+  // compute price range from non-null values
+  var prices = [];
+  for(var i = 0; i < n; i++){
+    if(data.price[i] !== null && data.price[i] !== 0) prices.push(data.price[i]);
+  }
+  if(prices.length < 2) return '';
+
+  var pMin = Math.min.apply(null, prices);
+  var pMax = Math.max.apply(null, prices);
+  var pRange = pMax - pMin || 1;
+
+  // ensure prevClose y-position falls in [0.05, 0.95] of price area
+  // 0 = top, 1 = bottom. expand range if needed.
+  if(prevClose && prevClose > 0){
+    var ratio = (pMax - prevClose) / pRange;  // 0 = at top (pMax), 1 = at bottom (pMin)
+    if(ratio < 0.05){
+      // prevClose too close to top — expand upward so prevClose sits at 0.05
+      var newRange = (prevClose - pMin) / (1 - 0.05);
+      pMax = prevClose + 0.05 * newRange;
+      pRange = pMax - pMin;
+    } else if(ratio > 0.95){
+      // prevClose too close to bottom — expand downward so prevClose sits at 0.95
+      var newRange2 = (pMax - prevClose) / 0.95;
+      pMin = pMax - newRange2;
+      pRange = newRange2;
+    }
+  }
+
+  // max total volume (outer + inner), and max net sell (negative net)
+  // axis range: from -maxNeg to +maxVol, 90% of chart height
+  var maxVol = 0;
+  var maxNeg = 0;
+  for(var i = 0; i < n; i++){
+    var v = (data.outer[i]||0) + (data.inner[i]||0);
+    if(v > maxVol) maxVol = v;
+    var neg = (data.inner[i]||0) - (data.outer[i]||0);
+    if(neg > maxNeg) maxNeg = neg;
+  }
+  if(maxVol === 0) maxVol = 1;
+  if(maxNeg === 0) maxNeg = 1;
+
+  // volume axis: green(min) to gray(max) = 90% of chart height.
+  // range = [-maxNeg, +maxVol], zero line inside. single scale for all.
+  var topPad = 3, botPad = 3;
+  var priceH = h - topPad - botPad;
+  var volH = Math.floor(h * 0.9);
+  var volTop = h - botPad - volH;          // top = gray bar max
+  var volBot = h - botPad;                 // bottom = green bar min
+  var fullRange = maxVol + maxNeg;
+  var zeroY = volBot - (maxNeg / fullRange) * volH;
+  var vScale = volH / fullRange;
+
+  var svg = '';
+
+  // shared zero line
+  svg += '<line x1="0" y1="'+zeroY.toFixed(1)+'" x2="'+w+'" y2="'+zeroY.toFixed(1)+'" stroke="#d0d0d0" stroke-width="0.5"/>';
+
+  // total volume bars (dark gray, up from zero line)
+  var x = 0;
+  for(var i = 0; i < n; i++){
+    var vol = (data.outer[i]||0) + (data.inner[i]||0);
+    var bh = vol * vScale;
+    if(bh < 0.3) bh = 0;
+    if(bh > 0){
+      svg += '<rect x="'+x.toFixed(1)+'" y="'+(zeroY - bh).toFixed(1)+
+             '" width="'+barW.toFixed(1)+'" height="'+bh.toFixed(1)+
+             '" fill="#555" opacity="0.3"/>';
+    }
+    x += barW + gap;
+  }
+
+  // net volume bars: red=positive (up from zero), green=negative (down from zero)
+  x = 0;
+  for(var i = 0; i < n; i++){
+    var netv = (data.outer[i]||0) - (data.inner[i]||0);
+    var nh = Math.abs(netv) * vScale;
+    if(nh < 0.3){ x += barW + gap; continue; }
+    var color = netv >= 0 ? '#ff4713' : '#00875a';
+    var ny = netv >= 0 ? (zeroY - nh) : zeroY;
+    svg += '<rect x="'+x.toFixed(1)+'" y="'+ny.toFixed(1)+
+           '" width="'+barW.toFixed(1)+'" height="'+nh.toFixed(1)+
+           '" fill="'+color+'" opacity="0.55"/>';
+    x += barW + gap;
+  }
+
+  // price line (full height range, drawn on top)
+  var path = '';
+  x = barW / 2;
+  var started = false;
+  for(var i = 0; i < n; i++){
+    var p = data.price[i];
+    if(p === null || p === 0){
+      x += barW + gap;
+      continue;
+    }
+    var py = topPad + priceH - (p - pMin) / pRange * priceH;
+    py = Math.max(topPad, Math.min(h - botPad, py));
+    if(!started){
+      path += 'M' + x.toFixed(1) + ',' + py.toFixed(1) + ' ';
+      started = true;
+    } else {
+      path += 'L' + x.toFixed(1) + ',' + py.toFixed(1) + ' ';
+    }
+    x += barW + gap;
+  }
+  if(path) svg += '<path d="'+path+'" fill="none" stroke="#005eb8" stroke-width="1"/>';
+
+  // prev close reference line (gray dashed)
+  if(prevClose && prevClose > 0 && pRange > 0){
+    var py = topPad + (pMax - prevClose) / pRange * priceH;
+    py = Math.max(topPad, Math.min(h - botPad, py));
+    svg += '<line x1="0" y1="'+py.toFixed(1)+'" x2="'+w+'" y2="'+py.toFixed(1)+
+           '" stroke="#bbb" stroke-width="0.8" stroke-dasharray="3,2"/>';
+  }
+
+  return '<svg class="spark" width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'" aria-label="intraday realtime">'+svg+'</svg>';
 }
 
 // ---- 份额图表 ----
@@ -941,7 +1073,7 @@ function renderTable(){
       lastGroup=it.group;
       var label = it.group==='core'?'汪汪队重点关注 · 2025年报最后一次实名披露（此后停止披露）':'扩展观察 · 2025年报未见汇金持仓（名单已停止更新）';
       var cnt = list.filter(function(x){return x.group===it.group;}).length;
-      html += '<tr class="grouphead"><td colspan="10">'+label+'<span class="cnt">'+cnt+' 只</span></td></tr>';
+      html += '<tr class="grouphead"><td colspan="11">'+label+'<span class="cnt">'+cnt+' 只</span></td></tr>';
     }
     var c=calcAdj(it, effSt), pctCls=cls(it.pct), netCls=cls(c.net);
     var rCls = c.ratio>=1.8?'hl':(c.ratio>=1.3?'':'muted');
@@ -987,6 +1119,7 @@ function renderTable(){
       '<td><div class="num">'+fmt(it.shares_yi,1)+dateMark+'</div>'+shareSub+'</td>'+
       '<td><div class="num">'+fmt(it.mktcap_yi,1)+dateMark+'</div>'+mktcapSub+'</td>'+
       '<td>'+sparkSharesPrice(it.shares_30d)+'</td>'+
+      '<td>'+sparkRealtime(RT && RT.data ? RT.data[it.tcode] : null, RT ? RT.max_bars : 0, it.prev_close)+'</td>'+
       '<td class="num" style="font-weight:700">'+fmt(it.amount_yi,2)+amtSub+'</td>'+
       '<td><div class="ratio num '+rCls+'">'+fmt(c.ratio,2)+'<b>×</b></div>'+ratioBar+'</td>'+
       '<td class="num '+netCls+'" style="font-weight:700">'+signed(c.net)+'</td>'+
@@ -998,10 +1131,10 @@ function renderTable(){
   var core = S.items.filter(function(i){return i.group==='core';});
   var sa=0,sb=0,sn=0; core.forEach(function(it){var c=calcAdj(it,st);sa+=it.amount_yi||0;sb+=(it.avg20_yi||0)*c.done;sn+=c.net;});
   html += '<tr class="total"><td>汪汪队合计</td>'+
-    '<td class="muted">—</td><td class="muted">—</td><td class="muted">—</td>'+
+    '<td class="muted">—</td><td class="muted">—</td><td class="muted">—</td><td class="muted">—</td>'+
     '<td class="num">'+fmt(sa,2)+(st.trading?'<div class="sub muted">截至 '+st.effHHMM+'</div>':'')+'</td>'+
     '<td class="num hl">'+fmt(sb>0?sa/sb:0,2)+'×</td>'+
-    '<td class="num '+cls(sn)+'">'+signed(sn)+'</td><td colspan="4" class="muted" style="text-align:right">合计口径与上方判断一致</td></tr>';
+    '<td class="num '+cls(sn)+'">'+signed(sn)+'</td><td colspan="3" class="muted" style="text-align:right">合计口径与上方判断一致</td></tr>';
 
   document.getElementById('tbody').innerHTML=html;
 }
@@ -1037,6 +1170,18 @@ function applyLive(){
   });
   return got;
 }
+function fetchRealtime(){
+  fetch('realtime?r=' + Date.now(), {cache: 'no-cache'})
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      if(data && data.data && Object.keys(data.data).length > 0){
+        RT = data;
+        renderTable();
+      }
+    })
+    .catch(function(e){ /* silent fail, does not affect main UI */ });
+}
+
 function refresh(){
   if(refreshing) return;
   refreshing=true;
@@ -1094,7 +1239,20 @@ function renderStatus(){
 
 function renderAll(){ renderVerdict(verdict()); renderCharts(); renderTable(); renderStatus(); }
 
-// ---- 入口 ----
+// scroll restoration: save scrollTop on unload, restore after first full render.
+// So the scroll pos keeps after refresh and async load of table data
+if(history.scrollRestoration) history.scrollRestoration = 'manual';
+window.addEventListener('beforeunload', function(){
+  try{ sessionStorage.setItem('__scroll_y', window.scrollY || window.pageYOffset); }catch(e){}
+});
+function _restoreScroll(){
+  try{
+    var y = parseInt(sessionStorage.getItem('__scroll_y'), 10);
+    if(y > 0) window.scrollTo(0, y);
+  }catch(e){}
+}
+
+// ---- Entry point ----
 function boot(){
   bindRange();
   ['sort','scope','q'].forEach(function(id){
@@ -1105,8 +1263,11 @@ function boot(){
     if(this.checked) schedule(); else clearTimeout(window.__t);
   });
   renderAll();
+  _restoreScroll();
   refresh();
+  fetchRealtime();
   schedule();
+  scheduleRealtime();
 }
 function schedule(){
   clearTimeout(window.__t);
@@ -1115,6 +1276,15 @@ function schedule(){
   window.__t=setTimeout(function(){
     if(document.getElementById('auto').checked && marketState().trading) refresh();
     schedule();
+  },ms);
+}
+function scheduleRealtime(){
+  clearTimeout(window.__rt);
+  var st=marketState();
+  var ms = st.trading?60000:300000;  // 1min during trading hours, 5min otherwise
+  window.__rt=setTimeout(function(){
+    if(document.getElementById('auto').checked && marketState().trading) fetchRealtime();
+    scheduleRealtime();
   },ms);
 }
 
