@@ -24,7 +24,7 @@ _this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_this_dir))   # arena/
 sys.path.insert(0, _this_dir)                      # arena/gjd/
 import cna_calendar
-from run_daily import ETF_LIST, setup_logging
+from gjd_run_daily import ETF_LIST, setup_logging
 from zstorec import zstore
 
 # ----------------------------------------------------------------------

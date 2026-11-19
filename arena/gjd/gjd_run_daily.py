@@ -3,9 +3,9 @@
 gjd tracking daily task
 
 Modes:
-    python run_daily.py             # one-shot build (online)
-    python run_daily.py --test      # one-shot build (mock data, offline)
-    python run_daily.py --schedule  # keep running until all data catches up to latest trade date
+    python gjd_run_daily.py             # one-shot build (online)
+    python gjd_run_daily.py --test      # one-shot build (mock data, offline)
+    python gjd_run_daily.py --schedule  # keep running until all data catches up to latest trade date
 
 In schedule mode, the script loops:
   1. determine the latest trade date (from sh000001 daily K)
