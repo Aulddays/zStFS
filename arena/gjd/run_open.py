@@ -221,17 +221,21 @@ def aggregator_thread(data_queue, gjd_realtime_data, data_lock, stop_event, toda
         if not raw_data:
             continue
 
-        # filter to today's valid range only; drop stale/wrong-date data
+        # validate + convert to trade seconds; drop stale/wrong-date data
         data = {}
         for code, item in raw_data.items():
-            if _is_ts_valid_today(item["ts"], today):
-                data[code] = item
+            if not _is_ts_valid_today(item["ts"], today):
+                continue
+            ts_trade = _trade_sec(_ts_sec(item["ts"]))
+            if ts_trade is None:
+                continue
+            data[code] = (ts_trade, item["price"], item["outer_lots"], item["inner_lots"])
         if not data:
             continue
 
         with data_lock:
-            for code, item in data.items():
-                update_one(gjd_realtime_data, state, code, item)
+            for code, (ts_trade, price, outer, inner) in data.items():
+                update_one(gjd_realtime_data, state, code, ts_trade, price, outer, inner)
 
             # write to memcache after each batch
             _write_memcache(today, gjd_realtime_data)
@@ -271,118 +275,75 @@ def store_thread(gjd_realtime_data, data_lock, stop_event, today):
 
 
 # update gjd_realtime_data of code with newly fetched realtime data
-def update_one(gjd_realtime_data, state, code, data):
+#
+# Walk forward from last_trade to curr_trade: at each cell boundary crossed,
+# interpolate cumulative volume and += the increment to that cell.
+# Remaining increment after the last boundary goes to the current (live) cell.
+# Caller is responsible for validation and ts_trade conversion.
+def update_one(gjd_realtime_data, state, code, ts_trade, price, outer, inner):
     if code not in state:
         return
     st = state[code]
     bars = gjd_realtime_data[code]
-    ts_str = data["ts"]
 
-    if ts_str <= st["last_ts"]:
-        return  # timestamp not advanced, skip
+    if ts_trade < st["last_trade"]:
+        return  # older timestamp, skip (equal timestamps update price)
 
-    ts_sec = _ts_sec(ts_str)    # YYYYMMDDHHMMSS -> seconds since 00:00
+    curr_cell = ts_trade // CELL_SECONDS
+    if curr_cell >= TOTAL_CELLS:
+        curr_cell = TOTAL_CELLS - 1
 
-    # -- determine session --
-    if MORNING_START_SEC <= ts_sec <= MORNING_END_SEC + 300:
-        session = 0
-    elif AFTERNOON_START_SEC <= ts_sec <= AFTERNOON_END_SEC + 300:
-        session = 1
-    else:
-        return
+    prev_trade = st["last_trade"]
+    prev_outer = st["last_outer"]
+    prev_inner = st["last_inner"]
 
-    # -- session transition (morning -> afternoon): reset per-session state
-    # outer/inner are daily cumulative; baseline afternoon at morning's last value
-    # so that afternoon cells contain only incremental afternoon volume.
-    if st["session"] != session and session == 1:
-        st["prev_outer"] = st["last_outer"]
-        st["prev_inner"] = st["last_inner"]
-        st["last_finalized"] = None
-        st["started"] = False
-        st["session"] = 1
-        st["last_ts"] = ""
+    # walk through cell boundaries between prev and current (in trade seconds)
+    cell_idx = prev_trade // CELL_SECONDS
+    if cell_idx >= TOTAL_CELLS:
+        cell_idx = TOTAL_CELLS - 1
 
-    curr_cell = _cell_for_sec(ts_sec)
-
-    # -- first data of a session --
-    if not st["started"]:
-        st["started"] = True
-        st["session"] = session
-        st["last_outer"] = data["outer_lots"]
-        st["last_inner"] = data["inner_lots"]
-        st["last_ts"] = ts_str
-
-        if curr_cell is None:
-            # already past close — finalize last cell directly
-            last_idx = CELLS_PER_SESSION - 1 if session == 0 else TOTAL_CELLS - 1
-            _finalize_last(st, bars, last_idx, data)
-        else:
-            while len(bars) <= curr_cell:
-                bars.append([0.0, 0.0, 0.0])
-            bars[curr_cell] = [
-                round(data["price"], 4),
-                round(max(0, data["outer_lots"] - st["prev_outer"]), 2),
-                round(max(0, data["inner_lots"] - st["prev_inner"]), 2),
-            ]
-        return
-
-    prev_sec = _ts_sec(st["last_ts"])
-    prev_cell = _cell_for_sec(prev_sec)
-
-    # -- data after close: finalize last cell --
-    if curr_cell is None:
-        last_idx = CELLS_PER_SESSION - 1 if session == 0 else TOTAL_CELLS - 1
-        _finalize_last(st, bars, last_idx, data)
-        st["last_outer"] = data["outer_lots"]
-        st["last_inner"] = data["inner_lots"]
-        st["last_ts"] = ts_str
-        return
-
-    assert prev_cell is not None, "prev_cell is None but started and in-session"
-
-    # -- finalize all cells whose boundary has been crossed --
-    start_idx = (st["last_finalized"] + 1) if st["last_finalized"] is not None else \
-                (0 if session == 0 else CELLS_PER_SESSION)
-
-    cell_idx = start_idx
     while cell_idx <= curr_cell and cell_idx < TOTAL_CELLS:
-        boundary = _cell_end_sec(cell_idx)
-        if boundary <= prev_sec:
+        boundary_trade = (cell_idx + 1) * CELL_SECONDS
+        if boundary_trade <= prev_trade:
             cell_idx += 1
             continue
-        if boundary > ts_sec:
-            break
+        if boundary_trade > ts_trade:
+            break  # current data point is still inside this cell
 
-        # interpolate cumulative volume at boundary
-        outer_at_b = _interp(st["last_outer"], data["outer_lots"],
-                                prev_sec, ts_sec, boundary)
-        inner_at_b = _interp(st["last_inner"], data["inner_lots"],
-                                prev_sec, ts_sec, boundary)
+        # interpolate cumulative volume at boundary (in trade-seconds space)
+        outer_at_b = _interp(prev_outer, outer, prev_trade, ts_trade, boundary_trade)
+        inner_at_b = _interp(prev_inner, inner, prev_trade, ts_trade, boundary_trade)
 
-        cell_outer = outer_at_b - st["prev_outer"]
-        cell_inner = inner_at_b - st["prev_inner"]
+        inc_outer = outer_at_b - prev_outer
+        inc_inner = inner_at_b - prev_inner
+        if inc_outer < 0 or inc_inner < 0:
+            break  # cumulative volume should not decrease; stop and don't update state
 
         while len(bars) <= cell_idx:
             bars.append([0.0, 0.0, 0.0])
-        bars[cell_idx] = [round(data["price"], 4),
-                            round(cell_outer, 2),
-                            round(cell_inner, 2)]
+        bars[cell_idx][0] = round(price, 4)
+        bars[cell_idx][1] += round(inc_outer, 2)
+        bars[cell_idx][2] += round(inc_inner, 2)
 
-        st["prev_outer"] = outer_at_b
-        st["prev_inner"] = inner_at_b
-        st["last_finalized"] = cell_idx
+        prev_outer = outer_at_b
+        prev_inner = inner_at_b
+        prev_trade = boundary_trade
         cell_idx += 1
 
-    # -- update state and live cell (in-progress) --
-    st["last_outer"] = data["outer_lots"]
-    st["last_inner"] = data["inner_lots"]
-    st["last_ts"] = ts_str
+    # remaining increment goes to the current (live) cell
+    inc_outer = outer - prev_outer
+    inc_inner = inner - prev_inner
 
     while len(bars) <= curr_cell:
         bars.append([0.0, 0.0, 0.0])
-    bars[curr_cell][0] = data["price"]
-    bars[curr_cell][1] = round(max(0, data["outer_lots"] - st["prev_outer"]), 2)
-    bars[curr_cell][2] = round(max(0, data["inner_lots"] - st["prev_inner"]), 2)
+    bars[curr_cell][0] = round(price, 4)
+
+    if inc_outer >= 0 and inc_inner >= 0:
+        bars[curr_cell][1] += round(inc_outer, 2)
+        bars[curr_cell][2] += round(inc_inner, 2)
+        st["last_outer"] = outer
+        st["last_inner"] = inner
+        st["last_trade"] = ts_trade
 
 
 # ----------------------------------------------------------------------
@@ -469,53 +430,20 @@ def _write_memcache(today, gjd_realtime_data):
 
 def _build_state_from_bars(bars):
     """
-    Reconstruct aggregator state from existing (assumed all-finalized) bars.
-    All bars are treated as finalized; last_ts = end time of last bar.
+    Reconstruct aggregator state from existing bars.
+    Assumes all existing bars are full (finalized).
+    last_trade = last second of the last bar (inclusive).
+    last_outer/inner = sum of all bars = cumulative volume at last_trade.
     """
     n = len(bars)
-    if n == 0:
-        return {
-            "last_ts": "",
-            "last_outer": 0.0,
-            "last_inner": 0.0,
-            "prev_outer": 0.0,
-            "prev_inner": 0.0,
-            "last_finalized": None,
-            "session": 0,
-            "started": False,
-        }
-
-    last_idx = n - 1
-    in_afternoon = last_idx >= CELLS_PER_SESSION
-
-    # sum outer/inner up to last_idx to get cumulative at last boundary
-    sum_outer = sum(b[1] for b in bars[:n])
-    sum_inner = sum(b[2] for b in bars[:n])
-
-    # afternoon baseline: morning cumulative before afternoon starts
-    # we don't know it exactly from bars alone, but all cells are finalized
-    # so prev_outer = total sum up to last boundary (including this cell)
-    prev_outer = sum_outer
-    prev_inner = sum_inner
-
-    # last_ts = end time of last cell, formatted as YYYYMMDDHHMMSS
-    end_sec = _cell_end_sec(last_idx)
-    hh = end_sec // 3600
-    mm = (end_sec % 3600) // 60
-    ss = end_sec % 60
-    # date placeholder — update_one only compares lexicographically;
-    # we use a dummy date so that real data (with real date) compares greater
-    last_ts = f"00000000{hh:02d}{mm:02d}{ss:02d}"
+    sum_outer = sum(b[1] for b in bars) if n > 0 else 0.0
+    sum_inner = sum(b[2] for b in bars) if n > 0 else 0.0
+    last_trade = n * CELL_SECONDS - 1 if n > 0 else 0
 
     return {
-        "last_ts": last_ts,
-        "last_outer": prev_outer,
-        "last_inner": prev_inner,
-        "prev_outer": prev_outer,
-        "prev_inner": prev_inner,
-        "last_finalized": last_idx,
-        "session": 1 if in_afternoon else 0,
-        "started": True,
+        "last_trade": last_trade,
+        "last_outer": sum_outer,
+        "last_inner": sum_inner,
     }
 
 
@@ -542,20 +470,23 @@ def _is_ts_valid_today(ts_str, today):
     return MORNING_START_SEC - 60 <= sec <= AFTERNOON_END_SEC + 300
 
 
-def _cell_end_sec(cell_idx):
-    """ cell index -> end time (seconds since 00:00) """
-    if cell_idx < CELLS_PER_SESSION:
-        return MORNING_START_SEC + (cell_idx + 1) * CELL_SECONDS
-    else:
-        return AFTERNOON_START_SEC + (cell_idx - CELLS_PER_SESSION + 1) * CELL_SECONDS
-
-
-def _cell_for_sec(t_sec):
-    """ seconds since midnight -> cell index, or None if outside trading hours """
+def _trade_sec(t_sec):
+    """
+    Wall-clock seconds -> continuous trading seconds.
+    Morning [9:30, 11:30)   -> 0..7199
+    Afternoon [13:00, 15:00) -> 7200..14399
+    After-close (up to +5min) clamps to the last second of each session
+    (so post-close volume all goes into the last bar).
+    Returns None if outside trading hours + grace period.
+    """
     if MORNING_START_SEC <= t_sec < MORNING_END_SEC:
-        return min((t_sec - MORNING_START_SEC) // CELL_SECONDS, CELLS_PER_SESSION - 1)
-    elif AFTERNOON_START_SEC <= t_sec < AFTERNOON_END_SEC:
-        return CELLS_PER_SESSION + min((t_sec - AFTERNOON_START_SEC) // CELL_SECONDS, CELLS_PER_SESSION - 1)
+        return t_sec - MORNING_START_SEC
+    if MORNING_END_SEC <= t_sec <= MORNING_END_SEC + 300:
+        return CELLS_PER_SESSION * CELL_SECONDS - 1  # last second of morning
+    if AFTERNOON_START_SEC <= t_sec < AFTERNOON_END_SEC:
+        return CELLS_PER_SESSION * CELL_SECONDS + (t_sec - AFTERNOON_START_SEC)
+    if AFTERNOON_END_SEC <= t_sec <= AFTERNOON_END_SEC + 300:
+        return TOTAL_CELLS * CELL_SECONDS - 1  # last second of day
     return None
 
 
@@ -566,23 +497,6 @@ def _interp(prev_val, curr_val, prev_sec, curr_sec, boundary_sec):
         return curr_val
     ratio = (boundary_sec - prev_sec) / dt
     return prev_val + (curr_val - prev_val) * ratio
-
-
-def _finalize_last(st, bars, last_idx, item):
-    """
-    Finalize last cell of a session.
-    All remaining volume belongs to it (no interpolation — boundary rule).
-    """
-    cell_outer = item["outer_lots"] - st["prev_outer"]
-    cell_inner = item["inner_lots"] - st["prev_inner"]
-    while len(bars) <= last_idx:
-        bars.append([0.0, 0.0, 0.0])
-    bars[last_idx] = [round(item["price"], 4),
-                      round(cell_outer, 2),
-                      round(cell_inner, 2)]
-    st["last_finalized"] = last_idx
-    st["prev_outer"] = item["outer_lots"]
-    st["prev_inner"] = item["inner_lots"]
 
 
 def _parse_tencent(text):
