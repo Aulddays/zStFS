@@ -138,9 +138,10 @@ def main(argv):
 
         shares_changed, shares_done = update_shares_history(shares_history, target_date)
         vol5min_changed, vol5min_done = update_vol5min_history(vol5min_history, target_date)
+        daily_changed, daily_done = update_daily_cache(target_date)
 
         # only rebuild snapshot when history data changes (running post-market, realtime data is static)
-        if shares_changed or vol5min_changed or round_num == 1:
+        if shares_changed or vol5min_changed or daily_changed or round_num == 1:
             build_snapshot(test_mode=False, shares_history=shares_history,
                            vol5min_history=vol5min_history, save_history=False)
 
@@ -156,10 +157,11 @@ def main(argv):
             break
 
         # schedule mode: check if done
-        logging.info("Progress: shares=%s vol5min=%s",
+        logging.info("Progress: shares=%s vol5min=%s daily=%s",
                      "DONE" if shares_done else "pending",
-                     "DONE" if vol5min_done else "pending")
-        if shares_done and vol5min_done:
+                     "DONE" if vol5min_done else "pending",
+                     "DONE" if daily_done else "pending")
+        if shares_done and vol5min_done and daily_done:
             logging.info("All data up to date. Exiting.")
             break
 
@@ -234,16 +236,12 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
             daily = _mock_daily(code)
             bars_5min = []
         else:
-            # daily K-line: use cache if complete, otherwise fetch and check completeness
+            # daily K-line: from cache (filled by update_daily_cache in schedule mode).
+            # if not cached (e.g. one-shot mode), fetch on the fly without caching.
             if tcode in _snap_data_cache["daily"]:
                 daily = _snap_data_cache["daily"][tcode]
             else:
                 daily = fetch_sina_daily(tcode, days=40)
-                # cache if latest bar is today or later (data is complete for our purposes)
-                if daily:
-                    last_date = daily[-1]["date"].replace("-", "")
-                    if last_date >= trade_date or datetime.now().strftime("%H%M") >= "1500":
-                        _snap_data_cache["daily"][tcode] = daily
 
             # 5min K-line: use cache if complete
             if tcode in _snap_data_cache["5min"]:
@@ -597,19 +595,88 @@ def update_vol5min_history(vol5min_history, target_date):
     return changed, done
 
 
+def update_daily_cache(target_date):
+    """
+    Refresh daily K-line cache for ETFs that haven't caught up to target_date.
+    Caches the "current best (maybe not up to date)" data
+    Returns (changed, done): whether any ETF's data was refreshed, and whether all
+    ETFs have data up to target_date.
+    """
+    changed = False
+    need_refresh = []
+
+    for etf in ETF_LIST:
+        tcode = etf["tcode"]
+        cached = _snap_data_cache["daily"].get(tcode)
+        if not cached:
+            need_refresh.append(etf)
+            continue
+        last_date = cached[-1]["date"].replace("-", "")
+        if last_date < target_date:
+            need_refresh.append(etf)
+
+    if not need_refresh:
+        return False, True
+
+    for etf in need_refresh:
+        tcode = etf["tcode"]
+        code = etf["code"]
+        old = _snap_data_cache["daily"].get(tcode)
+        old_last = old[-1]["date"].replace("-", "") if old else ""
+        daily = fetch_sina_daily(tcode, days=40)
+        if not daily:
+            logging.warning("  daily: %s fetch failed", code)
+            continue
+        new_last = daily[-1]["date"].replace("-", "")
+        if new_last >= old_last:
+            _snap_data_cache["daily"][tcode] = daily
+            if new_last > old_last:
+                changed = True
+        else:
+            logging.warning("  daily: %s new_last=%s < old_last=%s, keep old cache",
+                            code, new_last, old_last)
+            continue
+        logging.info("  daily: %s last=%s (was %s)", code, new_last, old_last or "none")
+
+    # done: every ETF has reached target_date
+    done = True
+    for etf in ETF_LIST:
+        cached = _snap_data_cache["daily"].get(etf["tcode"])
+        if not cached:
+            done = False
+            break
+        last_date = cached[-1]["date"].replace("-", "")
+        if last_date < target_date:
+            done = False
+            break
+    complete = sum(1 for e in ETF_LIST
+                   if _snap_data_cache["daily"].get(e["tcode"])
+                   and _snap_data_cache["daily"][e["tcode"]][-1]["date"].replace("-", "") >= target_date)
+    logging.info("  daily: %d/%d ETFs up to %s", complete, len(ETF_LIST), target_date)
+    return changed, done
+
+
 def get_latest_trade_date():
     """
-    Determine the latest trading date by checking sh000001 daily K-line.
-    If current time is before 15:30, consider yesterday the latest (today not yet finished).
+    Determine the latest trading date, by checking sh000001 data date
     Returns date string YYYYMMDD.
     """
+    import cna_calendar
+
     now = datetime.now()
     end_dt = now
     if now.strftime("%H%M") < "1530":
         end_dt = now - timedelta(days=1)  # today not finished yet
+    end_date = end_dt.strftime("%Y%m%d")
+
+    # trust cna_calendar before 20:00, in case of data delay in stock_zh_a_daily
+    end_20 = end_dt.replace(hour=20, minute=0, second=0, microsecond=0)
+    if now < end_20 and cna_calendar.isopen(end_date):
+        return end_date
+
+    # otherwise verify with actual daily K data
     start_dt = end_dt - timedelta(days=10)
     start_date = start_dt.strftime("%Y%m%d")
-    end_date = end_dt.strftime("%Y%m%d")
 
     try:
         import akshare as ak
