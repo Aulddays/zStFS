@@ -362,6 +362,7 @@ function marketState(){
   var h = parseInt(b.hour,10), m = parseInt(b.minute,10), t = h*60+m;
   var lunch   = !weekend && t>=690 && t<780;
   var trading = !weekend && t>=570 && t<900;
+  var tradingext = !weekend && t>=565 && t<905;  // 5min preopen + trading + 5min after close
   var preopen = !weekend && t>=540 && t<570;
   var after   = !weekend && t>=900;
   var before  = !weekend && t<540;
@@ -372,7 +373,7 @@ function marketState(){
   else if(t<780) prog=120/240;
   else if(t<900) prog=(120+(t-780))/240;
   else prog=1;
-  return {weekend:weekend,trading:trading,lunch:lunch,preopen:preopen,after:after,before:before,offhours:offhours,
+  return {weekend:weekend,trading:trading,tradingext:tradingext,lunch:lunch,preopen:preopen,after:after,before:before,offhours:offhours,
           progress:Math.max(0.12,Math.min(1,prog)),
           date:b.year+b.month+b.day, hhmm:b.hour+':' + b.minute,
           effHHMM: lunch?'11:30':(b.hour+':'+b.minute), weekday:wd};
@@ -1065,7 +1066,7 @@ function renderTable(){
     var r = calcAdj(it, effSt).ratio;
     if(r > maxRatio) maxRatio = r;
   });
-  var barMax = Math.max(maxRatio * 1.2, 1.5);
+  var barMax = Math.min(3.5, Math.max(maxRatio * 1.2, 1.5));
 
   var html='', lastGroup='';
   list.forEach(function(it){
@@ -1268,24 +1269,40 @@ function boot(){
   fetchRealtime();
   schedule();
   scheduleRealtime();
+  scheduleSnapshot();
 }
 function schedule(){
   clearTimeout(window.__t);
   var st=marketState();
-  var ms = st.trading?20000:60000;
+  var ms = st.tradingext?20000:60000;
   window.__t=setTimeout(function(){
-    if(document.getElementById('auto').checked && marketState().trading) refresh();
+    if(document.getElementById('auto').checked && marketState().tradingext) refresh();
     schedule();
   },ms);
 }
 function scheduleRealtime(){
   clearTimeout(window.__rt);
   var st=marketState();
-  var ms = st.trading?60000:300000;  // 1min during trading hours, 5min otherwise
+  var ms = st.tradingext?60000:300000;  // 1min during tradingext, 5min otherwise
   window.__rt=setTimeout(function(){
-    if(document.getElementById('auto').checked && marketState().trading) fetchRealtime();
+    if(document.getElementById('auto').checked && marketState().tradingext) fetchRealtime();
     scheduleRealtime();
   },ms);
+}
+function reloadSnapshot(){
+  loadSnapshot(function(){
+    liveOK = false;
+    renderAll();
+    refresh();
+    fetchRealtime();
+  });
+}
+function scheduleSnapshot(){
+  clearTimeout(window.__snap);
+  window.__snap=setTimeout(function(){
+    reloadSnapshot();
+    scheduleSnapshot();
+  }, 3600000);  // 1 hour
 }
 
 loadSnapshot(boot);
