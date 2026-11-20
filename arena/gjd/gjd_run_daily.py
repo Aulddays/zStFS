@@ -23,6 +23,11 @@ import time
 import logging
 from datetime import datetime, timedelta
 from urllib.request import urlopen, Request
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_this_dir))   # arena/
+sys.path.insert(0, _this_dir)                      # arena/gjd/
+import cna_calendar
+import common
 
 def setup_logging():
     logging.basicConfig(format='[%(asctime)s %(levelname)s] %(message)s', datefmt="%Y%m%d-%H%M%S", level=logging.INFO)
@@ -241,7 +246,7 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
             if tcode in _snap_data_cache["daily"]:
                 daily = _snap_data_cache["daily"][tcode]
             else:
-                daily = fetch_sina_daily(tcode, days=40)
+                daily = fetch_daily(tcode, days=40)
 
             # 5min K-line: use cache if complete
             if tcode in _snap_data_cache["5min"]:
@@ -503,10 +508,10 @@ def update_shares_history(shares_history, target_date):
         if code not in codes_with_new_shares:
             continue
         tcode = etf["tcode"]
-        logging.info("  Fetching daily K for %s (%s)", code, tcode)
-        daily = fetch_sina_daily(tcode, days=80)  # enough headroom for backfill
+        logging.info("  Fetching daily K for %s", tcode)
+        daily = fetch_daily(tcode, days=80)  # enough headroom for backfill
         if not daily:
-            logging.warning("  No daily data for %s", code)
+            logging.warning("  No daily data for %s", tcode)
             continue
         prices = {}
         for bar in daily:
@@ -620,12 +625,11 @@ def update_daily_cache(target_date):
 
     for etf in need_refresh:
         tcode = etf["tcode"]
-        code = etf["code"]
         old = _snap_data_cache["daily"].get(tcode)
         old_last = old[-1]["date"].replace("-", "") if old else ""
-        daily = fetch_sina_daily(tcode, days=40)
+        daily = fetch_daily(tcode, days=40)
         if not daily:
-            logging.warning("  daily: %s fetch failed", code)
+            logging.warning("  daily: %s fetch failed", tcode)
             continue
         new_last = daily[-1]["date"].replace("-", "")
         if new_last >= old_last:
@@ -634,9 +638,9 @@ def update_daily_cache(target_date):
                 changed = True
         else:
             logging.warning("  daily: %s new_last=%s < old_last=%s, keep old cache",
-                            code, new_last, old_last)
+                            tcode, new_last, old_last)
             continue
-        logging.info("  daily: %s last=%s (was %s)", code, new_last, old_last or "none")
+        logging.info("  daily: %s last=%s (was %s)", tcode, new_last, old_last or "none")
 
     # done: every ETF has reached target_date
     done = True
@@ -661,7 +665,6 @@ def get_latest_trade_date():
     Determine the latest trading date, by checking sh000001 data date
     Returns date string YYYYMMDD.
     """
-    import cna_calendar
 
     now = datetime.now()
     end_dt = now
@@ -952,41 +955,70 @@ def fetch_szse_shares_range(start_date, end_date):
         return {}
 
 
-def fetch_sina_daily(tcode, days=40):
+def fetch_daily(tcode, days=40):
     """
-    sina daily K-line (qfq, with volume data).
+    Daily K-line for ETF.  Fetch from both Tencent and Sina, merge by date
+    (Tencent takes priority on conflict).  Returns the union, newest `days` bars.
     return: [{date, open, close, high, low, volume_lots, amount_yi}, ...]
     In ascending order by date.
     """
-    try:
-        import akshare as ak
-        df = ak.fund_etf_hist_sina(symbol=tcode)
-    except Exception as e:
-        logging.warning("sina daily %s failed: %s", tcode, e)
+    import akshare as ak
+
+    merged = {}  # date_str -> bar dict
+
+    # --- Tencent ---
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=days * 2 + 20)
+    df = common.safe_call(ak.stock_zh_a_hist_tx, symbol=tcode,
+                          start_date=start_dt.strftime("%Y%m%d"),
+                          end_date=end_dt.strftime("%Y%m%d"),
+                          adjust="")
+    if df is not None and not df.empty:
+        for _, row in df.iterrows():
+            try:
+                date_str = str(row["date"])[:10]
+                volume = float(row["volume"]) / 100  # 股 -> 手
+                amount = float(row["amount"]) / 1e8  # 元 -> 亿元
+                merged[date_str] = {
+                    "date": date_str,
+                    "open": float(row["open"]),
+                    "close": float(row["close"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "volume_lots": volume,
+                    "amount_yi": round(amount, 4),
+                }
+            except (ValueError, KeyError):
+                continue
+
+    # --- Sina (fills gaps, Tencent data takes priority) ---
+    df = common.safe_call(ak.fund_etf_hist_sina, symbol=tcode)
+    if df is not None and not df.empty:
+        for _, row in df.iterrows():
+            try:
+                date_str = str(row["date"])[:10]
+                if date_str in merged:
+                    continue  # Tencent takes priority
+                volume = float(row["volume"])  # in 手
+                amount = float(row["amount"]) / 1e8  # 元 -> 亿元
+                merged[date_str] = {
+                    "date": date_str,
+                    "open": float(row["open"]),
+                    "close": float(row["close"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "volume_lots": volume,
+                    "amount_yi": round(amount, 4),
+                }
+            except (ValueError, KeyError):
+                continue
+
+    if not merged:
+        logging.warning("daily %s: both tencent and sina returned no data", tcode)
         return []
 
-    if df is None or df.empty:
-        return []
-
-    result = []
-    for _, row in df.tail(days).iterrows():
-        try:
-            date_str = str(row["date"])[:10]  # YYYY-MM-DD
-            volume = float(row["volume"])  # in 手
-            amount = float(row["amount"]) / 1e8  # 元 -> 亿元
-            result.append({
-                "date": date_str,
-                "open": float(row["open"]),
-                "close": float(row["close"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
-                "volume_lots": volume,
-                "amount_yi": round(amount, 4),
-            })
-        except (ValueError, KeyError):
-            continue
-
-    return result
+    result = sorted(merged.values(), key=lambda x: x["date"])
+    return result[-days:]
 
 
 def fetch_sina_5min(tcode):
