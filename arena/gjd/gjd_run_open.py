@@ -126,9 +126,9 @@ def fetcher_thread(data_queue, stop_event, today):
     aligned to FETCH_ALIGN_SEC second boundaries.
     Puts (fetch_time, raw_text) into queue; parsing is done in aggregator thread.
     """
-    tcodes = [e["tcode"] for e in ETF_LIST]
+    codes = [e["code"] for e in ETF_LIST]
     logging.info("Fetcher thread started (%d ETFs, interval=%ds, align=%ds)",
-                 len(tcodes), FETCH_INTERVAL, FETCH_ALIGN_SEC)
+                 len(codes), FETCH_INTERVAL, FETCH_ALIGN_SEC)
 
     while not stop_event.is_set():
         now = time.time()
@@ -165,7 +165,7 @@ def fetcher_thread(data_queue, stop_event, today):
             break
 
         # -- fetch raw data --
-        url = f"https://qt.gtimg.cn/q={','.join(tcodes)}&r={int(time.time() * 1000)}"
+        url = f"https://qt.gtimg.cn/q={','.join(codes)}&r={int(time.time() * 1000)}"
         raw = None
         try:
             req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
@@ -202,11 +202,11 @@ def aggregator_thread(data_queue, gjd_realtime_data, data_lock, stop_event, toda
     # per-ETF state
     state = {}
     for etf in ETF_LIST:
-        tcode = etf["tcode"]
-        bars = gjd_realtime_data.get(tcode, [])
-        if tcode not in gjd_realtime_data:
-            gjd_realtime_data[tcode] = []
-        state[tcode] = _build_state_from_bars(bars)
+        code = etf["code"]
+        bars = gjd_realtime_data.get(code, [])
+        if code not in gjd_realtime_data:
+            gjd_realtime_data[code] = []
+        state[code] = _build_state_from_bars(bars)
 
     logging.info("Aggregator thread started (%d ETFs)", len(state))
 
@@ -351,7 +351,7 @@ def update_one(gjd_realtime_data, state, code, ts_trade, price, outer, inner):
 # ----------------------------------------------------------------------
 
 def _load_from_zstore(today):
-    """ load today's bars from zstore, returns {tcode: [[price, outer, inner], ...]} """
+    """ load today's bars from zstore, returns {code: [[price, outer, inner], ...]} """
     if not ZSTORE_URL or not ZSTORE_AUTHKEY:
         logging.warning("zstore init no config")
         return {}
@@ -505,15 +505,15 @@ def _parse_tencent(text):
         return {}
     result = {}
     for m in re.finditer(r'v_(\w+)="([^"]*)"', text):
-        tcode = m.group(1)
+        code = m.group(1)
         a = m.group(2).split("~")
         if len(a) < 40:
             continue
         ts = a[30] if len(a) > 30 else ""
-        if len(ts) < 14 or not tcode:
+        if len(ts) < 14 or not code:
             continue
         try:
-            result[tcode] = {
+            result[code] = {
                 "ts": ts,
                 "price": float(a[3]),
                 "outer_lots": float(a[7]),

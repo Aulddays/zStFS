@@ -330,9 +330,9 @@ footer code{background:#f5f5f5;padding:2px 6px;border-radius:3px;font-size:11px;
 // ---- 加载快照数据 ----
 var S = null;
 var byCode = {};
-var tcodes = [];
+var codes = [];
 var liveOK = false, lastLiveAt = 0, refreshing = false;
-var RT = null;  // intraday curve data: {date, bars, max_bars, data: {tcode: {price, outer, inner}}}
+var RT = null;  // intraday curve data: {date, bars, max_bars, data: {code: {price, outer, inner}}}
 
 function loadSnapshot(cb){
   fetch('snapshot.json?r=' + Date.now(), {cache: 'no-cache'})
@@ -341,7 +341,7 @@ function loadSnapshot(cb){
       S = data;
       byCode = {};
       S.items.forEach(function(it){ byCode[it.code] = it; });
-      tcodes = S.items.map(function(it){ return it.tcode; });
+      codes = S.items.map(function(it){ return it.code; });
       cb();
     })
     .catch(function(e){
@@ -996,7 +996,7 @@ function sharesSuspect(){
   if(__suspect) return __suspect;
   var by={};
   S.items.forEach(function(it){
-    var m=(it.tcode||'').slice(0,2); (by[m]=by[m]||[]).push(it);
+    var m=(it.code||'').slice(0,2); (by[m]=by[m]||[]).push(it);
   });
   var out={};
   Object.keys(by).forEach(function(m){
@@ -1107,7 +1107,7 @@ function renderTable(){
       '<td><div class="num">'+fmt(it.shares_yi,1)+dateMark+'</div>'+shareSub+'</td>'+
       '<td><div class="num">'+fmt(it.mktcap_yi,1)+dateMark+'</div>'+mktcapSub+'</td>'+
       '<td>'+sparkSharesPrice(it.shares_30d)+'</td>'+
-      '<td>'+sparkRealtime(RT && RT.data ? RT.data[it.tcode] : null, RT ? RT.max_bars : 0, it.prev_close)+'</td>'+
+      '<td>'+sparkRealtime(RT && RT.data ? RT.data[it.code] : null, RT ? RT.max_bars : 0, it.prev_close)+'</td>'+
       '<td class="num" style="font-weight:700">'+fmt(it.amount_yi,2)+amtSub+'</td>'+
       '<td><div class="ratio num '+rCls+'">'+fmt(c.ratio,2)+'<b>×</b></div>'+ratioBar+'</td>'+
       '<td class="num '+netCls+'" style="font-weight:700">'+signed(c.net)+'</td>'+
@@ -1142,12 +1142,12 @@ function parseLive(line){
 }
 function applyLive(){
   var got=0;
-  tcodes.forEach(function(tc){
-    var raw=window['v_'+tc];
+  codes.forEach(function(code){
+    var raw=window['v_'+code];
     if(!raw) return;
-    var q=parseLive('v_'+tc+'="'+raw+'"');
+    var q=parseLive('v_'+code+'="'+raw+'"');
     if(!q) return;
-    var it=byCode[q.code]; if(!it) return;
+    var it=byCode[code]; if(!it) return;
     it.price=q.price; it.prev_close=q.prev_close; it.pct=q.pct;
     it.amount_wan=q.amount_wan; it.amount_yi=q.amount_wan/1e4;
     it.outer_lots=q.outer_lots; it.inner_lots=q.inner_lots;
@@ -1174,7 +1174,7 @@ function refresh(){
   if(refreshing) return;
   refreshing=true;
   var btn=document.getElementById('refresh'); btn.textContent='更新中…';
-  var url='https://qt.gtimg.cn/q='+tcodes.join(',')+'&r='+Date.now();
+  var url='https://qt.gtimg.cn/q='+codes.join(',')+'&r='+Date.now();
   var s=document.createElement('script');
   s.src=url; s.async=true;
   var done=false;

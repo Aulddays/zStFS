@@ -77,30 +77,30 @@ ZSTORE_AUTHKEY = os.environ.get("ZSTORE_AUTHKEY", None)
 # group: watch = 扩展观察，2025年报未见汇金持仓
 # huijin_yi: 2025年报中央汇金持仓份额（亿份）
 ETF_LIST = [
-    {"code": "510300", "tcode": "sh510300", "name": "沪深300ETF华泰柏瑞", "index": "沪深300",   "group": "core",  "huijin_yi": 735.13},
-    {"code": "510310", "tcode": "sh510310", "name": "沪深300ETF易方达",   "index": "沪深300",   "group": "core",  "huijin_yi": 558.94},
-    {"code": "510050", "tcode": "sh510050", "name": "上证50ETF华夏",      "index": "上证50",    "group": "core",  "huijin_yi": 487.59},
-    {"code": "510330", "tcode": "sh510330", "name": "沪深300ETF华夏",     "index": "沪深300",   "group": "core",  "huijin_yi": 420.28},
-    {"code": "159919", "tcode": "sz159919", "name": "沪深300ETF嘉实",     "index": "沪深300",   "group": "core",  "huijin_yi": 354.98},
-    {"code": "512100", "tcode": "sh512100", "name": "中证1000ETF南方",    "index": "中证1000",  "group": "core",  "huijin_yi": 221.69},
-    {"code": "588080", "tcode": "sh588080", "name": "科创50ETF易方达",    "index": "科创50",    "group": "core",  "huijin_yi": 216.07},
-    {"code": "159915", "tcode": "sz159915", "name": "创业板ETF易方达",    "index": "创业板",     "group": "core",  "huijin_yi": 170.20},
-    {"code": "510500", "tcode": "sh510500", "name": "中证500ETF南方",     "index": "中证500",   "group": "core",  "huijin_yi": 142.17},
-    {"code": "159845", "tcode": "sz159845", "name": "中证1000ETF华夏",    "index": "中证1000",  "group": "core",  "huijin_yi": 137.26},
-    {"code": "560010", "tcode": "sh560010", "name": "中证1000ETF广发",    "index": "中证1000",  "group": "core",  "huijin_yi": 105.50},
-    {"code": "510180", "tcode": "sh510180", "name": "上证180ETF华安",     "index": "上证180",   "group": "core",  "huijin_yi":  52.32},
-    {"code": "159629", "tcode": "sz159629", "name": "中证1000ETF富国",    "index": "中证1000",  "group": "core",  "huijin_yi":  36.34},
-    {"code": "510230", "tcode": "sh510230", "name": "金融ETF国泰",        "index": "中证金融",   "group": "core",  "huijin_yi":  25.64},
-    {"code": "159922", "tcode": "sz159922", "name": "中证500ETF嘉实",     "index": "中证500",   "group": "core",  "huijin_yi":  23.11},
-    {"code": "512500", "tcode": "sh512500", "name": "中证500ETF华夏",     "index": "中证500",   "group": "core",  "huijin_yi":  20.51},
-    {"code": "515800", "tcode": "sh515800", "name": "中证800ETF汇添富",   "index": "中证800",   "group": "core",  "huijin_yi":  13.08},
-    {"code": "159952", "tcode": "sz159952", "name": "创业板ETF广发",      "index": "创业板",     "group": "core",  "huijin_yi":  10.91},
-    {"code": "588050", "tcode": "sh588050", "name": "科创50ETF工银",      "index": "科创50",    "group": "core",  "huijin_yi":   9.70},
-    {"code": "159901", "tcode": "sz159901", "name": "深证100ETF易方达",   "index": "深证100",   "group": "core",  "huijin_yi":   7.19},
-    {"code": "588000", "tcode": "sh588000", "name": "科创50ETF华夏",      "index": "科创50",    "group": "watch", "huijin_yi":   0.0},
-    {"code": "512050", "tcode": "sh512050", "name": "A500ETF华夏",        "index": "中证A500",  "group": "watch", "huijin_yi":   0.0},
-    {"code": "159338", "tcode": "sz159338", "name": "中证A500ETF国泰",    "index": "中证A500",  "group": "watch", "huijin_yi":   0.0},
-    {"code": "159339", "tcode": "sz159339", "name": "A500ETF银华",        "index": "中证A500",  "group": "watch", "huijin_yi":   0.0},
+    {"code": "sh510300", "name": "沪深300ETF华泰柏瑞", "index": "沪深300",   "group": "core",  "huijin_yi": 735.13},
+    {"code": "sh510310", "name": "沪深300ETF易方达",   "index": "沪深300",   "group": "core",  "huijin_yi": 558.94},
+    {"code": "sh510050", "name": "上证50ETF华夏",      "index": "上证50",    "group": "core",  "huijin_yi": 487.59},
+    {"code": "sh510330", "name": "沪深300ETF华夏",     "index": "沪深300",   "group": "core",  "huijin_yi": 420.28},
+    {"code": "sz159919", "name": "沪深300ETF嘉实",     "index": "沪深300",   "group": "core",  "huijin_yi": 354.98},
+    {"code": "sh512100", "name": "中证1000ETF南方",    "index": "中证1000",  "group": "core",  "huijin_yi": 221.69},
+    {"code": "sh588080", "name": "科创50ETF易方达",    "index": "科创50",    "group": "core",  "huijin_yi": 216.07},
+    {"code": "sz159915", "name": "创业板ETF易方达",    "index": "创业板",     "group": "core",  "huijin_yi": 170.20},
+    {"code": "sh510500", "name": "中证500ETF南方",     "index": "中证500",   "group": "core",  "huijin_yi": 142.17},
+    {"code": "sz159845", "name": "中证1000ETF华夏",    "index": "中证1000",  "group": "core",  "huijin_yi": 137.26},
+    {"code": "sh560010", "name": "中证1000ETF广发",    "index": "中证1000",  "group": "core",  "huijin_yi": 105.50},
+    {"code": "sh510180", "name": "上证180ETF华安",     "index": "上证180",   "group": "core",  "huijin_yi":  52.32},
+    {"code": "sz159629", "name": "中证1000ETF富国",    "index": "中证1000",  "group": "core",  "huijin_yi":  36.34},
+    {"code": "sh510230", "name": "金融ETF国泰",        "index": "中证金融",   "group": "core",  "huijin_yi":  25.64},
+    {"code": "sz159922", "name": "中证500ETF嘉实",     "index": "中证500",   "group": "core",  "huijin_yi":  23.11},
+    {"code": "sh512500", "name": "中证500ETF华夏",     "index": "中证500",   "group": "core",  "huijin_yi":  20.51},
+    {"code": "sh515800", "name": "中证800ETF汇添富",   "index": "中证800",   "group": "core",  "huijin_yi":  13.08},
+    {"code": "sz159952", "name": "创业板ETF广发",      "index": "创业板",     "group": "core",  "huijin_yi":  10.91},
+    {"code": "sh588050", "name": "科创50ETF工银",      "index": "科创50",    "group": "core",  "huijin_yi":   9.70},
+    {"code": "sz159901", "name": "深证100ETF易方达",   "index": "深证100",   "group": "core",  "huijin_yi":   7.19},
+    {"code": "sh588000", "name": "科创50ETF华夏",      "index": "科创50",    "group": "watch", "huijin_yi":   0.0},
+    {"code": "sh512050", "name": "A500ETF华夏",        "index": "中证A500",  "group": "watch", "huijin_yi":   0.0},
+    {"code": "sz159338", "name": "中证A500ETF国泰",    "index": "中证A500",  "group": "watch", "huijin_yi":   0.0},
+    {"code": "sz159339", "name": "A500ETF银华",        "index": "中证A500",  "group": "watch", "huijin_yi":   0.0},
 ]
 
 # Empirical intraday turnover distribution for A-share ETFs (48 5-min points, cumulative ratio)
@@ -202,7 +202,7 @@ def main(argv):
 # cache for market data used by build_snapshot, stored once confirmed complete
 _snap_data_cache = {
     "realtime": None,   # {code: {...}} — all ETFs from tencent
-    "daily": {},        # tcode -> [daily bars...] — sina daily K
+    "daily": {},        # code -> [daily bars...] — sina daily K
 }
 
 
@@ -218,7 +218,7 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
 
     os.makedirs(FE_DIR, exist_ok=True)
     trade_date = datetime.now().strftime("%Y%m%d")
-    tcodes = [e["tcode"] for e in ETF_LIST]
+    codes = [e["code"] for e in ETF_LIST]
 
     # load history if not provided
     if shares_history is None:
@@ -235,8 +235,8 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
         realtime = _snap_data_cache["realtime"]
         logging.info("Using cached realtime quotes (%d ETFs)", len(realtime))
     else:
-        logging.info("Fetching realtime quotes (%d ETFs) ...", len(tcodes))
-        realtime = fetch_tencent_realtime(tcodes)
+        logging.info("Fetching realtime quotes (%d ETFs) ...", len(codes))
+        realtime = fetch_tencent_realtime(codes)
         logging.info("Got %d realtime entries", len(realtime))
         # cache if post-market (data won't change anymore)
         if datetime.now().strftime("%H%M") >= "1500":
@@ -247,14 +247,13 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
     items = []
     for etf in ETF_LIST:
         code = etf["code"]
-        tcode = etf["tcode"]
 
         if test_mode:
             daily = _mock_daily(code)
             bars_5min = []
         else:
             # daily K-line: from cache filled by update_daily_cache
-            daily = _snap_data_cache["daily"].get(tcode, [])
+            daily = _snap_data_cache["daily"].get(code, [])
 
         # shape MA: take last SHAPE_WINDOW days from vol5min_history, compute shape on the fly
         shape_hist_list = []
@@ -395,8 +394,8 @@ def update_shares_history(shares_history, target_date):
     Only save when BOTH price and shares are available; if incomplete, treat as not fetched.
     Returns (changed, done): whether data was updated, and whether all ETFs reached target_date.
     """
-    sse_codes = [e["code"] for e in ETF_LIST if e["tcode"].startswith("sh")]
-    szse_codes = [e["code"] for e in ETF_LIST if e["tcode"].startswith("sz")]
+    sse_codes = [e["code"] for e in ETF_LIST if e["code"].startswith("sh")]
+    szse_codes = [e["code"] for e in ETF_LIST if e["code"].startswith("sz")]
 
     # find the oldest "latest date" per market — determines the range we need to fetch
     def oldest_latest(codes):
@@ -437,8 +436,13 @@ def update_shares_history(shares_history, target_date):
                 e = batch_end.strftime("%Y%m%d")
                 logging.info("  batch %d: %s ~ %s", batch_num, s, e)
                 batch_data = fetch_szse_shares_range(s, e)
+                if batch_data:
+                    logging.info("    got %d days of SZSE shares data", len(batch_data))
+                else:
+                    logging.info("    SZSE shares: no data returned")
+                # batch_data keys are 6-digit ncode; map to full code
                 for d, row in batch_data.items():
-                    filtered = {c: row[c] for c in szse_codes if c in row}
+                    filtered = {c: row[c[2:]] for c in szse_codes if c[2:] in row}
                     if filtered:
                         if d not in new_shares_raw:
                             new_shares_raw[d] = {}
@@ -460,15 +464,19 @@ def update_shares_history(shares_history, target_date):
         if fill_dates:
             logging.info("Fetching SSE shares: %s -> %s (%d weekdays)",
                          fill_dates[0], fill_dates[-1], len(fill_dates))
+            sse_success = 0
             for d in fill_dates:
                 sse_data = fetch_sse_shares(d)
                 if not sse_data:
                     continue
-                filtered = {c: sse_data[c] for c in sse_codes if c in sse_data}
+                sse_success += 1
+                # sse_data keys are 6-digit ncode; map to full code
+                filtered = {c: sse_data[c[2:]] for c in sse_codes if c[2:] in sse_data}
                 if filtered:
                     if d not in new_shares_raw:
                         new_shares_raw[d] = {}
                     new_shares_raw[d].update(filtered)
+            logging.info("  SSE shares: got %d/%d days", sse_success, len(fill_dates))
 
     # if no shares data at all, nothing to do
     if not new_shares_raw:
@@ -489,11 +497,10 @@ def update_shares_history(shares_history, target_date):
         code = etf["code"]
         if code not in codes_with_new_shares:
             continue
-        tcode = etf["tcode"]
-        logging.info("  Fetching daily K for %s", tcode)
-        daily = fetch_daily(tcode, days=80)  # enough headroom for backfill
+        logging.info("  Fetching daily K for %s", code)
+        daily = fetch_daily(code, days=80)  # enough headroom for backfill
         if not daily:
-            logging.warning("  No daily data for %s", tcode)
+            logging.warning("  No daily data for %s", code)
             continue
         prices = {}
         for bar in daily:
@@ -540,8 +547,7 @@ def update_vol5min_history(vol5min_history, target_date):
 
     for etf in ETF_LIST:
         code = etf["code"]
-        tcode = etf["tcode"]
-        bars = fetch_sina_5min_range(tcode, datalen=VOL5MIN_BATCH_BARS)
+        bars = fetch_sina_5min_range(code, datalen=VOL5MIN_BATCH_BARS)
         if not bars:
             continue
 
@@ -593,8 +599,8 @@ def update_daily_cache(target_date):
     need_refresh = []
 
     for etf in ETF_LIST:
-        tcode = etf["tcode"]
-        cached = _snap_data_cache["daily"].get(tcode)
+        code = etf["code"]
+        cached = _snap_data_cache["daily"].get(code)
         if not cached:
             need_refresh.append(etf)
             continue
@@ -606,28 +612,28 @@ def update_daily_cache(target_date):
         return False, True
 
     for etf in need_refresh:
-        tcode = etf["tcode"]
-        old = _snap_data_cache["daily"].get(tcode)
+        code = etf["code"]
+        old = _snap_data_cache["daily"].get(code)
         old_last = old[-1]["date"].replace("-", "") if old else ""
-        daily = fetch_daily(tcode, days=40)
+        daily = fetch_daily(code, days=40)
         if not daily:
-            logging.warning("  daily: %s fetch failed", tcode)
+            logging.warning("  daily: %s fetch failed", code)
             continue
         new_last = daily[-1]["date"].replace("-", "")
         if new_last >= old_last:
-            _snap_data_cache["daily"][tcode] = daily
+            _snap_data_cache["daily"][code] = daily
             if new_last > old_last:
                 changed = True
         else:
             logging.warning("  daily: %s new_last=%s < old_last=%s, keep old cache",
-                            tcode, new_last, old_last)
+                            code, new_last, old_last)
             continue
-        logging.info("  daily: %s last=%s (was %s)", tcode, new_last, old_last or "none")
+        logging.info("  daily: %s last=%s (was %s)", code, new_last, old_last or "none")
 
     # done: every ETF has reached target_date
     done = True
     for etf in ETF_LIST:
-        cached = _snap_data_cache["daily"].get(etf["tcode"])
+        cached = _snap_data_cache["daily"].get(etf["code"])
         if not cached:
             done = False
             break
@@ -636,8 +642,8 @@ def update_daily_cache(target_date):
             done = False
             break
     complete = sum(1 for e in ETF_LIST
-                   if _snap_data_cache["daily"].get(e["tcode"])
-                   and _snap_data_cache["daily"][e["tcode"]][-1]["date"].replace("-", "") >= target_date)
+                   if _snap_data_cache["daily"].get(e["code"])
+                   and _snap_data_cache["daily"][e["code"]][-1]["date"].replace("-", "") >= target_date)
     logging.info("  daily: %d/%d ETFs up to %s", complete, len(ETF_LIST), target_date)
     return changed, done
 
@@ -646,7 +652,7 @@ def update_gjd_day_zstore(shares_history, target_date):
     """
     Backfill gjd-day data to zstore, from the first missing day up to target_date.
 
-    Row: {partkey_: "gjd-day", id: date.tcode, date, code (tcode with sh/sz prefix),
+    Row: {partkey_: "gjd-day", id: date.code, date, code (with sh/sz prefix),
           open, high, low, close, volume, outer, inner, turnover, shares}
 
     - open/high/low/close/volume/turnover from daily cache
@@ -667,36 +673,36 @@ def update_gjd_day_zstore(shares_history, target_date):
         logging.warning("zstore init failed: %s", e)
         return
 
-    # build per-tcode daily data map from cache
-    # daily_by_tcode: {tcode: {date_yyyymmdd: bar_dict}}
-    daily_by_tcode = {}
+    # build per-code daily data map from cache
+    # daily_by_code: {code: {date_yyyymmdd: bar_dict}}
+    daily_by_code = {}
     for etf in ETF_LIST:
-        tcode = etf["tcode"]
-        bars = _snap_data_cache["daily"].get(tcode, [])
+        code = etf["code"]
+        bars = _snap_data_cache["daily"].get(code, [])
         if not bars:
             continue
-        daily_by_tcode[tcode] = {}
+        daily_by_code[code] = {}
         for b in bars:
             d = b["date"].replace("-", "")
-            daily_by_tcode[tcode][d] = b
+            daily_by_code[code][d] = b
 
     # determine backfill date range from daily data (the limiting factor)
     # we only write dates that have daily K-line data; shares_history may go back further
     # but without daily data we can't produce a meaningful row anyway
     all_dates = set()
-    for tcode, dmap in daily_by_tcode.items():
+    for code, dmap in daily_by_code.items():
         all_dates.update(dmap.keys())
     all_dates = sorted(d for d in all_dates if d <= target_date)
     if not all_dates:
         return
 
-    # check what we already have in zstore for gjd-day, per-tcode
+    # check what we already have in zstore for gjd-day, per-code
     # each ETF may have different latest date (e.g. SZSE shares lag)
-    # existing_by_tcode: {tcode: {date: True}}
-    existing_by_tcode = {e["tcode"]: set() for e in ETF_LIST}
+    # existing_by_code: {code: {date: set}}
+    existing_by_code = {e["code"]: set() for e in ETF_LIST}
     try:
         # pull all existing rows within our date range, paginated (max 1000 per query)
-        all_tcodes = [e["tcode"] for e in ETF_LIST]
+        all_codes = [e["code"] for e in ETF_LIST]
         offset = 0
         page_size = 500
         while True:
@@ -706,16 +712,16 @@ def update_gjd_day_zstore(shares_history, target_date):
                                 ["partkey_", "=", ZSTORE_PARTKEY_DAY],
                                 ["date", ">=", int(all_dates[0])],
                                 ["date", "<=", int(target_date)],
-                                ["code", "in", all_tcodes]
+                                ["code", "in", all_codes]
                             ]},
                             order_by=[["date", "asc"]],
                             limit=page_size,
                             offset=offset)
             for r in rows:
-                tcode = r.get("code", "")
+                code = r.get("code", "")
                 d = str(r.get("date", ""))
-                if tcode and d and tcode in existing_by_tcode:
-                    existing_by_tcode[tcode].add(d)
+                if code and d and code in existing_by_code:
+                    existing_by_code[code].add(d)
             if len(rows) < page_size:
                 break
             offset += len(rows)
@@ -724,41 +730,41 @@ def update_gjd_day_zstore(shares_history, target_date):
         # on failure, assume nothing exists — will try to upsert everything
         # (upsert is idempotent, worst case is wasted bandwidth)
 
-    # determine per-tcode start date
-    # we still iterate all dates for simplicity, but skip dates already present per tcode
+    # determine per-code start date
+    # we still iterate all dates for simplicity, but skip dates already present per code
     fill_dates = all_dates
     logging.info("gjd-day zstore backfill range: %s ~ %s (%d days)",
                  all_dates[0], target_date, len(all_dates))
 
     # --- fetch outer/inner for target_date from Tencent realtime ---
     # we only use it if the realtime data date matches target_date
-    realtime_outer_inner = {}  # {tcode: (outer_lots, inner_lots)}
+    realtime_outer_inner = {}  # {code: (outer_lots, inner_lots)}
     if fill_dates[-1] == target_date:
-        tcodes = [e["tcode"] for e in ETF_LIST]
+        codes = [e["code"] for e in ETF_LIST]
         try:
-            rt = fetch_tencent_realtime(tcodes)
-            for tcode in tcodes:
-                if tcode in rt and rt[tcode].get("date") == target_date:
-                    realtime_outer_inner[tcode] = (
-                        rt[tcode].get("outer_lots", 0),
-                        rt[tcode].get("inner_lots", 0),
+            rt = fetch_tencent_realtime(codes)
+            for code in codes:
+                if code in rt and rt[code].get("date") == target_date:
+                    realtime_outer_inner[code] = (
+                        rt[code].get("outer_lots", 0),
+                        rt[code].get("inner_lots", 0),
                     )
         except Exception as e:
             logging.warning("fetch_tencent_realtime for gjd-day failed: %s", e)
 
     # --- preload gjd-0.5m bars for dates we need to fill (except target_date if realtime is complete) ---
-    # outer_inner_by_date: {date: {tcode: (outer, inner)}}
+    # outer_inner_by_date: {date: {code: (outer, inner)}}
     outer_inner_by_date = {d: {} for d in fill_dates}
     # target_date: prefer realtime
     if target_date in outer_inner_by_date:
-        for tcode, (o, i) in realtime_outer_inner.items():
-            outer_inner_by_date[target_date][tcode] = (o, i)
+        for code, (o, i) in realtime_outer_inner.items():
+            outer_inner_by_date[target_date][code] = (o, i)
 
-    # for other dates (and target_date tcodes missing from realtime), try gjd-0.5m
+    # for other dates (and target_date codes missing from realtime), try gjd-0.5m
     dates_need_05m = []
     for d in fill_dates:
-        tcodes_with = set(outer_inner_by_date[d].keys())
-        if len(tcodes_with) < len(ETF_LIST):
+        codes_with = set(outer_inner_by_date[d].keys())
+        if len(codes_with) < len(ETF_LIST):
             dates_need_05m.append(d)
 
     if dates_need_05m:
@@ -771,7 +777,7 @@ def update_gjd_day_zstore(shares_history, target_date):
                                     ["date", "=", int(d)]
                                 ]})
                 for r in rows:
-                    tcode = r.get("code", "")
+                    code = r.get("code", "")
                     bars_str = r.get("bars", "[]")
                     try:
                         bars = json.loads(bars_str) if isinstance(bars_str, str) else bars_str
@@ -782,8 +788,8 @@ def update_gjd_day_zstore(shares_history, target_date):
                     # sum outer/inner across all cells
                     total_outer = sum(cell[1] for cell in bars if len(cell) > 1)
                     total_inner = sum(cell[2] for cell in bars if len(cell) > 2)
-                    if tcode not in outer_inner_by_date[d]:
-                        outer_inner_by_date[d][tcode] = (round(total_outer, 2), round(total_inner, 2))
+                    if code not in outer_inner_by_date[d]:
+                        outer_inner_by_date[d][code] = (round(total_outer, 2), round(total_inner, 2))
         except Exception as e:
             logging.warning("load gjd-0.5m from zstore failed: %s", e)
 
@@ -793,25 +799,24 @@ def update_gjd_day_zstore(shares_history, target_date):
     for d in fill_dates:
         is_target = (d == target_date)
         for etf in ETF_LIST:
-            tcode = etf["tcode"]
             code = etf["code"]
 
-            # skip if this tcode already has data for this date
-            if d in existing_by_tcode.get(tcode, set()):
+            # skip if this code already has data for this date
+            if d in existing_by_code.get(code, set()):
                 skip_count += 1
                 continue
             row = {
                 "partkey_": ZSTORE_PARTKEY_DAY,
-                "id": f"{d}.{tcode}",
+                "id": f"{d}.{code}",
                 "date": int(d),
-                "code": tcode,
+                "code": code,
             }
             has_daily = False
             has_shares = False
             has_outer_inner = False
 
             # daily fields
-            daily_bar = daily_by_tcode.get(tcode, {}).get(d)
+            daily_bar = daily_by_code.get(code, {}).get(d)
             if daily_bar:
                 has_daily = True
                 row["open"] = daily_bar["open"]
@@ -821,24 +826,24 @@ def update_gjd_day_zstore(shares_history, target_date):
                 row["volume"] = daily_bar["volume_lots"]
                 row["turnover"] = daily_bar["amount_yi"]
 
-            # shares (shares_history uses 6-digit code without prefix)
+            # shares from shares_history
             sh_entry = shares_history.get(d, {}).get(code)
             if sh_entry is not None:
                 has_shares = True
                 # shares_history format: [close_price, shares_yi]
                 row["shares"] = sh_entry[1]
 
-            # outer/inner (keyed by tcode)
-            if tcode in outer_inner_by_date.get(d, {}):
+            # outer/inner
+            if code in outer_inner_by_date.get(d, {}):
                 has_outer_inner = True
-                outer, inner = outer_inner_by_date[d][tcode]
+                outer, inner = outer_inner_by_date[d][code]
                 row["outer"] = outer
                 row["inner"] = inner
 
             # target_date: must have daily + shares + outer/inner all complete
             if is_target:
                 if not (has_daily and has_shares and has_outer_inner):
-                    continue  # skip this tcode entirely for target_date
+                    continue  # skip this code entirely for target_date
 
             # historical days: write if we have at least something
             if not is_target and not has_daily and not has_shares and not has_outer_inner:
@@ -933,7 +938,6 @@ def build_item(etf, realtime_data, daily_kline, shape_avg):
 
     return {
         "code": etf["code"],
-        "tcode": etf["tcode"],
         "name": etf["name"],
         "index": etf["index"],
         "group": etf["group"],
@@ -1040,14 +1044,14 @@ def _http_get(url, timeout=10, referer=None):
         return None
 
 
-def fetch_tencent_realtime(tcodes):
+def fetch_tencent_realtime(codes):
     """
     batch call tx realtime {code: {price, prev_close, pct, amount_wan,
     amount_yi, outer_lots, inner_lots, turnover, mktcap_yi, shares, shares_yi, ts, date}}
     """
-    if not tcodes:
+    if not codes:
         return {}
-    url = f"https://qt.gtimg.cn/q={','.join(tcodes)}&r={int(datetime.now().timestamp())}"
+    url = f"https://qt.gtimg.cn/q={','.join(codes)}&r={int(datetime.now().timestamp())}"
     text = _http_get(url)
     if not text:
         return {}
@@ -1055,6 +1059,7 @@ def fetch_tencent_realtime(tcodes):
     result = {}
     pattern = re.compile(r'v_(\w+)="([^"]*)"')
     for m in pattern.finditer(text):
+        code = m.group(1)
         body = m.group(2)
         a = body.split("~")
         if len(a) < 40:
@@ -1065,8 +1070,6 @@ def fetch_tencent_realtime(tcodes):
                 return float(a[i])
             except (ValueError, IndexError):
                 return 0.0
-
-        code = a[2] if len(a) > 2 else ""
         shares = _n(72) if len(a) > 72 else 0.0
         ts = a[30] if len(a) > 30 else ""
         date = ts[:8] if len(ts) >= 8 else ""
@@ -1141,7 +1144,7 @@ def fetch_szse_shares_range(start_date, end_date):
         return {}
 
 
-def fetch_daily(tcode, days=40):
+def fetch_daily(code, days=40):
     """
     Daily K-line for ETF.  Fetch from both Tencent and Sina, merge by date
     (Tencent takes priority on conflict).  Returns the union, newest `days` bars.
@@ -1155,7 +1158,7 @@ def fetch_daily(tcode, days=40):
     # --- Tencent ---
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(days=days * 2 + 20)
-    df = common.safe_call(ak.stock_zh_a_hist_tx, symbol=tcode,
+    df = common.safe_call(ak.stock_zh_a_hist_tx, symbol=code,
                           start_date=start_dt.strftime("%Y%m%d"),
                           end_date=end_dt.strftime("%Y%m%d"),
                           adjust="")
@@ -1178,7 +1181,7 @@ def fetch_daily(tcode, days=40):
                 continue
 
     # --- Sina (fills gaps, Tencent data takes priority) ---
-    df = common.safe_call(ak.fund_etf_hist_sina, symbol=tcode)
+    df = common.safe_call(ak.fund_etf_hist_sina, symbol=code)
     if df is not None and not df.empty:
         for _, row in df.iterrows():
             try:
@@ -1200,7 +1203,7 @@ def fetch_daily(tcode, days=40):
                 continue
 
     if not merged:
-        logging.warning("daily %s: both tencent and sina returned no data", tcode)
+        logging.warning("daily %s: both tencent and sina returned no data", code)
         return []
 
     result = sorted(merged.values(), key=lambda x: x["date"])
@@ -1225,7 +1228,7 @@ def _parse_sina_5min_jsonp(text):
     return data
 
 
-def fetch_sina_5min_range(tcode, datalen=480):
+def fetch_sina_5min_range(code, datalen=480):
     """
     sina 5min K-line for multiple recent days.
     datalen: number of 5min bars to fetch (48 per trading day)
@@ -1234,7 +1237,7 @@ def fetch_sina_5min_range(tcode, datalen=480):
     """
     url = (
         f"https://quotes.sina.cn/cn/api/jsonp_v2.php/=/"
-        f"CN_MarketDataService.getKLineData?symbol={tcode}&scale=5&ma=no&datalen={datalen}"
+        f"CN_MarketDataService.getKLineData?symbol={code}&scale=5&ma=no&datalen={datalen}"
     )
     text = _http_get(url, referer="https://finance.sina.com.cn/")
     data = _parse_sina_5min_jsonp(text)
