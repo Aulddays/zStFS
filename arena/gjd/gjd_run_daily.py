@@ -23,11 +23,13 @@ import time
 import logging
 from datetime import datetime, timedelta
 from urllib.request import urlopen, Request
+from dotenv import load_dotenv
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_this_dir))   # arena/
 sys.path.insert(0, _this_dir)                      # arena/gjd/
 import cna_calendar
 import common
+from zstorec import zstore
 
 def setup_logging():
     logging.basicConfig(format='[%(asctime)s %(levelname)s] %(message)s', datefmt="%Y%m%d-%H%M%S", level=logging.INFO)
@@ -60,6 +62,15 @@ SLEEP_INTERVAL = 600
 VOL5MIN_BATCH_BARS = 480  # ~10 trading days, enough to cover gaps
 # keep vol5min history for N days (sliding window uses 20, with headroom)
 VOL5MIN_KEEP_DAYS = 60
+
+# zstore config
+ZSTORE_TABLE = "zStFS"
+ZSTORE_PARTKEY_DAY = "gjd-day"
+ZSTORE_PARTKEY_05M = "gjd-0.5m"
+
+load_dotenv()
+ZSTORE_URL = os.environ.get("ZSTORE_URL", None)
+ZSTORE_AUTHKEY = os.environ.get("ZSTORE_AUTHKEY", None)
 
 # ETFs
 # group: core = 2025年报汇金前十大持有人口径有持仓（最后一次实名披露）
@@ -156,6 +167,10 @@ def main(argv):
         if vol5min_changed:
             save_json(VOL5MIN_FILE, vol5min_history)
             logging.info("vol5min history saved: %s (%d days)", VOL5MIN_FILE, len(vol5min_history))
+
+        # sync daily data to zstore when shares or daily data changes
+        if shares_changed or daily_changed or round_num == 1:
+            update_gjd_day_zstore(shares_history, target_date)
 
         # one-shot mode: done after first round
         if not schedule_mode:
@@ -625,6 +640,227 @@ def update_daily_cache(target_date):
                    and _snap_data_cache["daily"][e["tcode"]][-1]["date"].replace("-", "") >= target_date)
     logging.info("  daily: %d/%d ETFs up to %s", complete, len(ETF_LIST), target_date)
     return changed, done
+
+
+def update_gjd_day_zstore(shares_history, target_date):
+    """
+    Backfill gjd-day data to zstore, from the first missing day up to target_date.
+
+    Row: {partkey_: "gjd-day", id: date.tcode, date, code (tcode with sh/sz prefix),
+          open, high, low, close, volume, outer, inner, turnover, shares}
+
+    - open/high/low/close/volume/turnover from daily cache
+    - shares from shares_history
+    - outer/inner priority:
+        1. Tencent realtime (if target_date and date matches)
+        2. gjd-0.5m bars from zstore (sum all cells)
+        3. skip the field if neither available
+    - target_date: all required fields must be present, otherwise skip the code entirely
+    - historical days: missing fields are simply omitted from the row
+    """
+    if not ZSTORE_URL or not ZSTORE_AUTHKEY:
+        logging.warning("ZSTORE_URL/ZSTORE_AUTHKEY not set, skip gjd-day zstore sync")
+        return
+    try:
+        z = zstore(ZSTORE_URL, backend="cosmos", authkey=ZSTORE_AUTHKEY)
+    except Exception as e:
+        logging.warning("zstore init failed: %s", e)
+        return
+
+    # build per-tcode daily data map from cache
+    # daily_by_tcode: {tcode: {date_yyyymmdd: bar_dict}}
+    daily_by_tcode = {}
+    for etf in ETF_LIST:
+        tcode = etf["tcode"]
+        bars = _snap_data_cache["daily"].get(tcode, [])
+        if not bars:
+            continue
+        daily_by_tcode[tcode] = {}
+        for b in bars:
+            d = b["date"].replace("-", "")
+            daily_by_tcode[tcode][d] = b
+
+    # determine backfill date range from daily data (the limiting factor)
+    # we only write dates that have daily K-line data; shares_history may go back further
+    # but without daily data we can't produce a meaningful row anyway
+    all_dates = set()
+    for tcode, dmap in daily_by_tcode.items():
+        all_dates.update(dmap.keys())
+    all_dates = sorted(d for d in all_dates if d <= target_date)
+    if not all_dates:
+        return
+
+    # check what we already have in zstore for gjd-day, per-tcode
+    # each ETF may have different latest date (e.g. SZSE shares lag)
+    # existing_by_tcode: {tcode: {date: True}}
+    existing_by_tcode = {e["tcode"]: set() for e in ETF_LIST}
+    try:
+        # pull all existing rows within our date range, paginated (max 1000 per query)
+        all_tcodes = [e["tcode"] for e in ETF_LIST]
+        offset = 0
+        page_size = 500
+        while True:
+            rows = z.select(ZSTORE_TABLE,
+                            fields=["date", "code"],
+                            where={"and": [
+                                ["partkey_", "=", ZSTORE_PARTKEY_DAY],
+                                ["date", ">=", int(all_dates[0])],
+                                ["date", "<=", int(target_date)],
+                                ["code", "in", all_tcodes]
+                            ]},
+                            order_by=[["date", "asc"]],
+                            limit=page_size,
+                            offset=offset)
+            for r in rows:
+                tcode = r.get("code", "")
+                d = str(r.get("date", ""))
+                if tcode and d and tcode in existing_by_tcode:
+                    existing_by_tcode[tcode].add(d)
+            if len(rows) < page_size:
+                break
+            offset += len(rows)
+    except Exception as e:
+        logging.warning("zstore select gjd-day failed: %s", e)
+        # on failure, assume nothing exists — will try to upsert everything
+        # (upsert is idempotent, worst case is wasted bandwidth)
+
+    # determine per-tcode start date
+    # we still iterate all dates for simplicity, but skip dates already present per tcode
+    fill_dates = all_dates
+    logging.info("gjd-day zstore backfill range: %s ~ %s (%d days)",
+                 all_dates[0], target_date, len(all_dates))
+
+    # --- fetch outer/inner for target_date from Tencent realtime ---
+    # we only use it if the realtime data date matches target_date
+    realtime_outer_inner = {}  # {tcode: (outer_lots, inner_lots)}
+    if fill_dates[-1] == target_date:
+        tcodes = [e["tcode"] for e in ETF_LIST]
+        try:
+            rt = fetch_tencent_realtime(tcodes)
+            for tcode in tcodes:
+                if tcode in rt and rt[tcode].get("date") == target_date:
+                    realtime_outer_inner[tcode] = (
+                        rt[tcode].get("outer_lots", 0),
+                        rt[tcode].get("inner_lots", 0),
+                    )
+        except Exception as e:
+            logging.warning("fetch_tencent_realtime for gjd-day failed: %s", e)
+
+    # --- preload gjd-0.5m bars for dates we need to fill (except target_date if realtime is complete) ---
+    # outer_inner_by_date: {date: {tcode: (outer, inner)}}
+    outer_inner_by_date = {d: {} for d in fill_dates}
+    # target_date: prefer realtime
+    if target_date in outer_inner_by_date:
+        for tcode, (o, i) in realtime_outer_inner.items():
+            outer_inner_by_date[target_date][tcode] = (o, i)
+
+    # for other dates (and target_date tcodes missing from realtime), try gjd-0.5m
+    dates_need_05m = []
+    for d in fill_dates:
+        tcodes_with = set(outer_inner_by_date[d].keys())
+        if len(tcodes_with) < len(ETF_LIST):
+            dates_need_05m.append(d)
+
+    if dates_need_05m:
+        try:
+            for d in dates_need_05m:
+                rows = z.select(ZSTORE_TABLE,
+                                fields=["code", "bars"],
+                                where={"and": [
+                                    ["partkey_", "=", ZSTORE_PARTKEY_05M],
+                                    ["date", "=", int(d)]
+                                ]})
+                for r in rows:
+                    tcode = r.get("code", "")
+                    bars_str = r.get("bars", "[]")
+                    try:
+                        bars = json.loads(bars_str) if isinstance(bars_str, str) else bars_str
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(bars, list) or not bars:
+                        continue
+                    # sum outer/inner across all cells
+                    total_outer = sum(cell[1] for cell in bars if len(cell) > 1)
+                    total_inner = sum(cell[2] for cell in bars if len(cell) > 2)
+                    if tcode not in outer_inner_by_date[d]:
+                        outer_inner_by_date[d][tcode] = (round(total_outer, 2), round(total_inner, 2))
+        except Exception as e:
+            logging.warning("load gjd-0.5m from zstore failed: %s", e)
+
+    # --- build rows for upsert ---
+    rows_to_write = []
+    skip_count = 0
+    for d in fill_dates:
+        is_target = (d == target_date)
+        for etf in ETF_LIST:
+            tcode = etf["tcode"]
+            code = etf["code"]
+
+            # skip if this tcode already has data for this date
+            if d in existing_by_tcode.get(tcode, set()):
+                skip_count += 1
+                continue
+            row = {
+                "partkey_": ZSTORE_PARTKEY_DAY,
+                "id": f"{d}.{tcode}",
+                "date": int(d),
+                "code": tcode,
+            }
+            has_daily = False
+            has_shares = False
+            has_outer_inner = False
+
+            # daily fields
+            daily_bar = daily_by_tcode.get(tcode, {}).get(d)
+            if daily_bar:
+                has_daily = True
+                row["open"] = daily_bar["open"]
+                row["high"] = daily_bar["high"]
+                row["low"] = daily_bar["low"]
+                row["close"] = daily_bar["close"]
+                row["volume"] = daily_bar["volume_lots"]
+                row["turnover"] = daily_bar["amount_yi"]
+
+            # shares (shares_history uses 6-digit code without prefix)
+            sh_entry = shares_history.get(d, {}).get(code)
+            if sh_entry is not None:
+                has_shares = True
+                # shares_history format: [close_price, shares_yi]
+                row["shares"] = sh_entry[1]
+
+            # outer/inner (keyed by tcode)
+            if tcode in outer_inner_by_date.get(d, {}):
+                has_outer_inner = True
+                outer, inner = outer_inner_by_date[d][tcode]
+                row["outer"] = outer
+                row["inner"] = inner
+
+            # target_date: must have daily + shares + outer/inner all complete
+            if is_target:
+                if not (has_daily and has_shares and has_outer_inner):
+                    continue  # skip this tcode entirely for target_date
+
+            # historical days: write if we have at least something
+            if not is_target and not has_daily and not has_shares and not has_outer_inner:
+                continue
+
+            rows_to_write.append(row)
+
+    if not rows_to_write:
+        logging.info("gjd-day zstore: no new rows to write (skipped %d existing)", skip_count)
+        return
+
+    try:
+        res = z.upsert(ZSTORE_TABLE, rows_to_write)
+        if isinstance(res, dict) and "succeeded" in res:
+            logging.info("gjd-day zstore: wrote %d/%d rows (skipped %d existing, %s ~ %s)",
+                         res["succeeded"], res.get("total", len(rows_to_write)),
+                         skip_count, all_dates[0], target_date)
+        else:
+            logging.info("gjd-day zstore: wrote %d rows (skipped %d)",
+                         len(rows_to_write), skip_count)
+    except Exception as e:
+        logging.warning("gjd-day zstore upsert failed: %s", e)
 
 
 def get_latest_trade_date():
