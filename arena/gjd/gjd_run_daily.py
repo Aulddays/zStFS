@@ -188,7 +188,6 @@ def main(argv):
 _snap_data_cache = {
     "realtime": None,   # {code: {...}} — all ETFs from tencent
     "daily": {},        # tcode -> [daily bars...] — sina daily K
-    "5min": {},         # tcode -> [5min bars...] — sina 5min K
 }
 
 
@@ -198,7 +197,7 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
 
     If shares_history / vol5min_history are provided, use them instead of loading from disk.
     If save_history is False, skip writing shares/vol5min files (caller handles saving).
-    Market data (realtime, daily K, 5min K) is cached globally once confirmed complete.
+    Market data (realtime, daily K) is cached globally once confirmed complete.
     """
     logging.info("Building snapshot (test_mode=%s) ...", test_mode)
 
@@ -231,8 +230,6 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
 
     # --- build per-ETF items ---
     items = []
-    today_vol5min = {}  # {code: [[time, amount_yi], ...]}  today's raw 5min bars (for tail_ratio)
-
     for etf in ETF_LIST:
         code = etf["code"]
         tcode = etf["tcode"]
@@ -241,26 +238,8 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
             daily = _mock_daily(code)
             bars_5min = []
         else:
-            # daily K-line: from cache (filled by update_daily_cache in schedule mode).
-            # if not cached (e.g. one-shot mode), fetch on the fly without caching.
-            if tcode in _snap_data_cache["daily"]:
-                daily = _snap_data_cache["daily"][tcode]
-            else:
-                daily = fetch_daily(tcode, days=40)
-
-            # 5min K-line: use cache if complete
-            if tcode in _snap_data_cache["5min"]:
-                bars_5min = _snap_data_cache["5min"][tcode]
-            else:
-                bars_5min = fetch_sina_5min(tcode)
-                # cache if today's data is complete (near full 48 bars)
-                if len(bars_5min) >= 45:
-                    _snap_data_cache["5min"][tcode] = bars_5min
-
-        # today's raw intraday data [[time, amount_yi], ...]
-        today_amounts = [[b["time"], b["amount_yi"]] for b in bars_5min] if bars_5min else []
-        # compute today's shape (cumulative turnover ratio)
-        today_shape = build_shape_from_amounts(today_amounts) if today_amounts else []
+            # daily K-line: from cache filled by update_daily_cache
+            daily = _snap_data_cache["daily"].get(tcode, [])
 
         # shape MA: take last SHAPE_WINDOW days from vol5min_history, compute shape on the fly
         shape_hist_list = []
@@ -275,27 +254,6 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
             shape_avg = [list(p) for p in DEFAULT_SHAPE]
 
         item = build_item(etf, realtime.get(code), daily, shape_avg)
-
-        # today's tail ratio (only filled when data is complete, typically after all 48 bars at close)
-        if today_shape and len(today_shape) >= 45:
-            item["tail_ratio"] = calc_tail_ratio(today_shape)
-            today_vol5min[code] = today_amounts
-        else:
-            item["tail_ratio"] = None
-
-        # tail ratio baseline: 20-day historical average
-        if shape_hist_list:
-            tail_vals = []
-            for s in shape_hist_list:
-                r = calc_tail_ratio(s)
-                if r is not None:
-                    tail_vals.append(r)
-            if tail_vals:
-                item["tail_ratio_base"] = round(sum(tail_vals) / len(tail_vals), 4)
-            else:
-                item["tail_ratio_base"] = 0.2906
-        else:
-            item["tail_ratio_base"] = 0.2906
 
         items.append(item)
         logging.info("  %s %s: amount=%.2f亿 avg20=%.2f亿 shape_hist=%d天",
@@ -366,6 +324,15 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
                 series_30.append([d, entry[0], entry[1]])
         item["shares_30d"] = series_30[-30:]
 
+    # shares_history for frontend: keep only last 1 calendar year
+    # full history stays in shares_history.json on disk
+    try:
+        latest_dt = datetime.strptime(latest_share_date, "%Y%m%d")
+        cutoff = (latest_dt - timedelta(days=365)).strftime("%Y%m%d")
+        shares_clean_frontend = {d: shares_clean[d] for d in share_dates if d >= cutoff}
+    except (ValueError, IndexError):
+        shares_clean_frontend = shares_clean
+
     # --- assemble snapshot ---
     snapshot = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -373,7 +340,7 @@ def build_snapshot(test_mode=False, shares_history=None, vol5min_history=None, s
         "prev_share_date": prev_share_date,
         "latest_share_date": latest_share_date,
         "items": items,
-        "shares_history": shares_clean,
+        "shares_history": shares_clean_frontend,
     }
 
     # --- save ---
@@ -751,8 +718,6 @@ def build_item(etf, realtime_data, daily_kline, shape_avg):
         "avg20_yi": avg20,
         "shape": shape_avg,
         "hist": hist,
-        "tail_ratio": None,
-        "tail_ratio_base": 0.2906,  # empirical value, to be replaced with historical data
         "subscr_net_yi": None,
         "prev_shares": None,
     }
@@ -805,21 +770,6 @@ def avg_shapes(shape_list):
         if vals:
             avg.append([t, round(sum(vals) / len(vals), 5)])
     return avg
-
-
-def calc_tail_ratio(shape, daily_amount=None):
-    """
-    Compute the tail-half-hour (14:30-15:00) share of full-day turnover from shape curve.
-    shape is a cumulative ratio curve; tail ratio = 1 - shape(point before 14:30)
-    """
-    if not shape:
-        return None
-    # find the nearest point before 14:30
-    for i, (t, r) in enumerate(shape):
-        if t >= "14:30":
-            before = shape[i - 1][1] if i > 0 else 0
-            return round(1.0 - before, 4)
-    return None
 
 
 def prev_trading_date(date_str):
@@ -1019,17 +969,6 @@ def fetch_daily(tcode, days=40):
 
     result = sorted(merged.values(), key=lambda x: x["date"])
     return result[-days:]
-
-
-def fetch_sina_5min(tcode):
-    """
-    sina 5min K-line for today via CN_MarketDataService.getKLineData
-    return: [{time, open, close, high, low, volume_lots, amount_yi}, ...]
-    Only today's bars are returned; data is already in 5-min intervals.
-    """
-    all_bars = fetch_sina_5min_range(tcode, datalen=48)
-    today_str = datetime.now().strftime("%Y%m%d")
-    return [b for b in all_bars if b["date"] == today_str]
 
 
 def _parse_sina_5min_jsonp(text):

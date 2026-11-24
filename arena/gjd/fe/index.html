@@ -306,7 +306,6 @@ footer code{background:#f5f5f5;padding:2px 6px;border-radius:3px;font-size:11px;
         <p><b>成交额 / 涨跌 / 规模 / 份额</b>：腾讯行情公开接口 <code>qt.gtimg.cn</code>，交易时段每 20 秒刷新。规模为行情口径的「价格 × 份额」，非基金净值口径。</p>
         <p><b>20 日均额</b>：新浪日 K 线精确成交额，取快照交易日之前 20 个交易日。已与实时成交额交叉验证，误差小于 0.1%。</p>
         <p><b>盘中怎么比才可比</b>：上午 11:30 的成交额是「半天」，直接除「全天 20 日均额」得到的倍数没有意义。本页改为<b>同时点对齐</b>：分母 = 20 日均额 × 该标的在此时点历史上平均已走完的比例（如 11:30 约 47%–55%），分子是当前累计成交额，两者都代表「到此刻为止」，可以直接比。表格里的「同时点倍数」是这个可比值，「已达成日均」是原始进度（半天就干了全天均额的多少倍），后者只作参考、不可直接下结论。</p>
-        <p><b>尾盘占比</b>：当日 14:30—15:00 成交额占全天比例，与 20 日均值（同为 14:30—15:00）比较。只有收盘后才计算，盘中不触发。</p>
         <p><b>主动净买入 / 份额申赎</b>：主动净买入由外盘内盘差估算，份额申赎为日度份额变化。信披新规后，份额变化是少数仍公开可验证的资金进出线索，比已停止披露的持有人名单更适合做当下判断。</p>
         <p><b>每日份额变化 / 加仓指数（图表）</b>：日度份额变化全部记为汪汪队操作是参考口径，实际申赎可能来自任何投资者；加仓指数用「首日=100」刻画净申赎的方向与幅度，<b>不做持仓比例锚定</b>——期初持仓已不可验证。沪市份额按上交所每日披露精确取值；深市无日频公开源，取最新公告值（T-1 口径），极少数日期可能按前值持平。均为近似推算，非官方披露数据。</p>
       </div>
@@ -892,7 +891,6 @@ function verdict(){
   var effSt = stale ? {trading:false, lunch:false, offhours:st.offhours} : st;
   var core = S.items.filter(function(i){return i.group==='core';});
   var sumAmt=0,sumBase=0,sumBaseAdj=0,sumNet=0,capW=0,pctW=0;
-  var tailCur=0,tailBase=0,tailAmt=0;
   core.forEach(function(it){
     var c=calcAdj(it, effSt);
     sumAmt+=it.amount_yi||0;
@@ -900,19 +898,11 @@ function verdict(){
     sumBaseAdj+=(it.avg20_yi||0)*c.done;
     sumNet+=c.net;
     var w=it.mktcap_yi||0; capW+=w; pctW+=(it.pct||0)*w;
-    if(it.tail_ratio!==null && it.tail_ratio!==undefined &&
-       it.tail_ratio_base!==null && it.tail_ratio_base!==undefined){
-      tailCur+=(it.amount_yi||0)*it.tail_ratio;
-      tailBase+=(it.amount_yi||0)*it.tail_ratio_base;
-      tailAmt+=(it.amount_yi||0);
-    }
   });
   var ratio    = sumBaseAdj>0 ? sumAmt/sumBaseAdj : 0;
   var rawRatio = sumBase>0 ? sumAmt/sumBase : 0;
   var done     = sumBase>0 ? sumBaseAdj/sumBase : 1;
   var wpct = capW>0 ? pctW/capW : 0;
-  var tail = tailAmt>0 ? tailCur/tailAmt : 0;
-  var tailB= tailAmt>0 ? tailBase/tailAmt : 0;
 
   var level='cool', title='', reason='';
   if(ratio>=1.8 && sumNet>0){
@@ -931,9 +921,6 @@ function verdict(){
     level='cool'; title='没看出上班迹象';
     reason='成交额只有历史同时点均值的 '+fmt(ratio,2)+' 倍，主动净买入 '+fmt(sumNet,1)+' 亿元，量价都平静。';
   }
-  if(tail>0 && tailB>0 && tail>tailB*1.25 && (level==='hot'||level==='mid')){
-    reason += ' 尾盘半小时成交占全天 '+fmt(tail*100,1)+'%，明显高于 20 日均值 '+fmt(tailB*100,1)+'%。';
-  }
   if(wpct< -0.5 && (level==='hot'||level==='mid')){
     reason += ' 池内规模加权涨跌 '+fmt(wpct,2)+'%，下跌日放量更符合护盘场景。';
   }
@@ -944,7 +931,7 @@ function verdict(){
 
   return {st:st,core:core,sumAmt:sumAmt,sumBase:sumBase,sumBaseAdj:sumBaseAdj,
           sumNet:sumNet,ratio:ratio,rawRatio:rawRatio,done:done,wpct:wpct,
-          tail:tail,tailB:tailB,level:level,title:title,reason:reason};
+          level:level,title:title,reason:reason};
 }
 
 function fmtDate(d){
