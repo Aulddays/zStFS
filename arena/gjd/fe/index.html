@@ -1094,12 +1094,16 @@ function renderTable(){
       dateMark = '<span class="muted" style="font-size:10px;margin-left:2px">('+fmtMMDD(it.share_date)+')</span>';
     }
     function signed1(n){ return (n>0?'+':'')+fmt(n,1); }
+    var prevShares = it.prev_shares ? it.prev_shares/1e8 : 0;
+    var sharePct = (shareDelta!==null && prevShares>0) ? shareDelta/prevShares*100 : null;
+    var prevMktcap = (mktcapDelta!==null && it.mktcap_yi) ? it.mktcap_yi - mktcapDelta : 0;
+    var mktcapPct = (mktcapDelta!==null && prevMktcap>0) ? mktcapDelta/prevMktcap*100 : null;
     var shareSub = shareDelta===null
       ? '<div class="muted" style="font-size:13px">—</div>'
-      : '<div class="num '+shareCls+'" style="font-size:13px">'+signed1(shareDelta)+'</div>';
+      : '<div class="num '+shareCls+'" style="font-size:13px">'+signed1(shareDelta)+' <span class="num '+shareCls+'">('+fmt(Math.abs(sharePct),1)+'%)</span></div>';
     var mktcapSub = mktcapDelta===null
       ? '<div class="muted" style="font-size:13px">—</div>'
-      : '<div class="num '+mktcapSubCls+'" style="font-size:13px">'+signed1(mktcapDelta)+'</div>';
+      : '<div class="num '+mktcapSubCls+'" style="font-size:13px">'+signed1(mktcapDelta)+' <span class="num '+mktcapSubCls+'">('+fmt(Math.abs(mktcapPct),1)+'%)</span></div>';
 
     html += '<tr>'+
       '<td><div class="name">'+it.name+'<span class="chip '+it.group+'">'+(it.group==='core'?'汪':'观')+'</span></div>'+
@@ -1159,7 +1163,7 @@ function applyLive(){
   return got;
 }
 function fetchRealtime(){
-  fetch('realtime?r=' + Date.now(), {cache: 'no-cache'})
+  fetch('api/realtime?r=' + Date.now(), {cache: 'no-cache'})
     .then(function(r){ return r.json(); })
     .then(function(data){
       if(data && data.data && Object.keys(data.data).length > 0){
