@@ -83,6 +83,18 @@ header{display:flex;align-items:flex-start;justify-content:space-between;gap:20p
 .chart-note b{color:var(--ink2)}
 .chart-empty{padding:46px 0;text-align:center;color:var(--ink3);font-size:12px;line-height:1.8}
 
+/* detail popup chart */
+#detailChart{position:fixed;display:none;z-index:50;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.12);padding:12px 14px;width:420px}
+#detailChart .title{font-size:12px;font-weight:700;margin-bottom:8px;color:var(--ink2)}
+#detailChart svg{display:block;width:100%;height:auto}
+#detailChart .tip{position:absolute;left:100%;top:12px;margin-left:10px;pointer-events:none;background:#fff;border:1px solid var(--line);border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.10);padding:7px 10px;font-size:11px;line-height:1.7;display:none;z-index:5;white-space:nowrap}
+#detailChart .tip b{font-size:12px}
+#detailChart .tip .tu{color:var(--up);font-weight:700}
+#detailChart .tip .td{color:var(--down);font-weight:700}
+#detailChart .legend{display:flex;gap:14px;font-size:10.5px;color:var(--ink3);margin-top:6px}
+#detailChart .legend span{display:inline-flex;align-items:center;gap:4px}
+#detailChart .legend i{width:10px;height:10px;display:inline-block;border-radius:2px}
+
 /* controls */
 .controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:24px 0 12px}
 .controls .grp{display:flex;align-items:center;gap:6px}
@@ -550,6 +562,294 @@ function sparkSharesPrice(data){
   svg += '<path d="'+path+'" fill="none" stroke="#005eb8" stroke-width="1"/>';
 
   return '<svg class="spark" width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'" aria-label="30日份额价格">'+svg+'</svg>';
+}
+
+// ---- detail chart popup (price line + share diff bars + volume bars) ----
+var _detailHideTimer = null;
+var _detailDailyCache = {};  // code -> daily data promise/array
+var DETAIL_DAYS = 64;       // reserved slot count (≈ 60 trading days)
+
+function showDetailChart(ev, code){
+  if(_detailHideTimer){ clearTimeout(_detailHideTimer); _detailHideTimer = null; }
+  var it = byCode[code];
+  if(!it) return;
+  var box = document.getElementById('detailChart');
+  var svg = box.querySelector('svg');
+  var tip = box.querySelector('.tip');
+  var title = box.querySelector('.title');
+
+  title.textContent = it.name + ' · ' + it.code + '（60日）';
+
+  // initial 30-day data from snapshot; right-aligned in DETAIL_DAYS slots
+  var days = buildDetailDaysFromSnapshot(it);
+
+  // draw with initial data (right-aligned)
+  drawDetailChart(svg, days, DETAIL_DAYS);
+  setupDetailHover(svg, tip, days, DETAIL_DAYS);
+
+  // position the popup
+  var W = 392, H = 180;
+  var rect = ev.currentTarget.getBoundingClientRect();
+  var left = rect.right + 12;
+  var top = rect.top;
+  if(left + W + 180 > window.innerWidth) left = rect.left - W - 180;
+  if(top + H + 40 > window.innerHeight) top = window.innerHeight - H - 40;
+  box.style.left = left + 'px';
+  box.style.top = top + 'px';
+  box.style.display = 'block';
+
+  // tooltip position
+  var flipped = left + W + 180 > window.innerWidth;
+  tip.style.left = flipped ? 'auto' : '100%';
+  tip.style.right = flipped ? '100%' : 'auto';
+  tip.style.marginLeft = flipped ? '0' : '10px';
+  tip.style.marginRight = flipped ? '10px' : '0';
+  if(days.length > 0){
+    tip.innerHTML = buildDetailTip(days[days.length-1]);
+    tip.style.display = 'block';
+  }
+
+  // async fetch full daily data from zstore
+  fetchDetailDaily(code, function(fullDays){
+    if(!fullDays || fullDays.length < 2) return;
+    drawDetailChart(svg, fullDays, DETAIL_DAYS);
+    setupDetailHover(svg, tip, fullDays, DETAIL_DAYS);
+    if(fullDays.length > 0){
+      tip.innerHTML = buildDetailTip(fullDays[fullDays.length-1]);
+      tip.style.display = 'block';
+    }
+  });
+}
+
+function buildDetailDaysFromSnapshot(it){
+  var sharesData = it.shares_30d || [];
+  var histData = it.hist || [];
+  var histByDate = {};
+  for(var i = 0; i < histData.length; i++){
+    var d = histData[i].date.replace(/-/g,'');
+    histByDate[d] = histData[i];
+  }
+  var days = [];
+  for(var i = 0; i < sharesData.length; i++){
+    var d = sharesData[i][0];
+    var h = histByDate[d];
+    days.push({
+      date: d,
+      price: sharesData[i][1],
+      shares: sharesData[i][2],
+      volume: h ? h.volume_lots : 0,
+      amount: h ? h.amount_yi : 0,
+    });
+  }
+  for(var i = 0; i < days.length; i++){
+    days[i].diff = i === 0 ? 0 : days[i].shares - days[i-1].shares;
+  }
+  return days;
+}
+
+function fetchDetailDaily(code, callback){
+  if(_detailDailyCache[code]){
+    if(_detailDailyCache[code].then){
+      _detailDailyCache[code].then(callback);
+    } else {
+      callback(_detailDailyCache[code]);
+    }
+    return;
+  }
+  var p = fetch('api/daily/' + code + '?r=' + Date.now(), {cache: 'no-cache'})
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      if(!data || !data.data || !data.data.length) return null;
+      var arr = [];
+      for(var i = 0; i < data.data.length; i++){
+        var row = data.data[i];
+        arr.push({
+          date: row.date,
+          price: row.close,
+          shares: row.shares_yi,
+          volume: row.volume_lots,
+          amount: row.amount_yi,
+        });
+      }
+      // compute diffs (first day has no prev)
+      for(var i = 0; i < arr.length; i++){
+        arr[i].diff = (i === 0 || arr[i].shares == null || arr[i-1].shares == null)
+          ? 0 : arr[i].shares - arr[i-1].shares;
+      }
+      _detailDailyCache[code] = arr;
+      return arr;
+    })
+    .catch(function(){ return null; });
+  _detailDailyCache[code] = p;
+  p.then(callback);
+}
+
+function drawDetailChart(svg, days, slotCount){
+  var W = 392, H = 180;
+  var padL = 8, padR = 8, padT = 10, padB = 22;
+  var plotW = W - padL - padR;
+  var plotH = H - padT - padB;
+  var n = days.length;
+  var slotW = plotW / slotCount;
+  var barW = Math.max(1.5, slotW * 0.6);
+  // right-align data in the available slots
+  var offset = slotCount - n;
+  if(offset < 0) offset = 0;
+
+  // scales — unified in 亿份. 1 lot = 100 shares
+  var maxAbsDiff = 0;
+  var maxVolYi = 0;
+  var pMin = Infinity, pMax = -Infinity;
+  for(var i = 0; i < n; i++){
+    if(days[i].shares != null && i > 0 && days[i-1].shares != null){
+      var diff = days[i].shares - days[i-1].shares;
+      if(Math.abs(diff) > maxAbsDiff) maxAbsDiff = Math.abs(diff);
+    }
+    var volYi = days[i].volume * 1e-6;
+    if(volYi > maxVolYi) maxVolYi = volYi;
+    if(days[i].price != null){
+      if(days[i].price < pMin) pMin = days[i].price;
+      if(days[i].price > pMax) pMax = days[i].price;
+    }
+  }
+  var yMax = Math.max(maxAbsDiff, maxVolYi);
+  if(yMax === 0) yMax = 1;
+  if(pMin === Infinity || pMax === -Infinity){ pMin = 0; pMax = 1; }
+  var pRange = pMax - pMin || 1;
+
+  var topH = plotH * 0.52;
+  var botH = plotH * 0.48;
+  // same scale on both sides of zero; zero line positioned proportionally
+  var yMaxAbove = yMax;
+  var yMaxBelow = maxAbsDiff;
+  var totalY = yMaxAbove + yMaxBelow || 1;
+  var scale = botH / totalY;
+  var zeroY = padT + topH + yMaxAbove * scale;
+  var minNeg = 6;
+  if(padT + plotH - zeroY < minNeg){
+    zeroY = padT + plotH - minNeg;
+    scale = Math.min(scale, (zeroY - padT - topH) / yMaxAbove);
+  }
+
+  var svgStr = '';
+
+  // zero line
+  svgStr += '<line x1="'+padL+'" y1="'+zeroY.toFixed(1)+'" x2="'+(W-padR)+'" y2="'+zeroY.toFixed(1)+'" stroke="#d0d0d0" stroke-dasharray="2,2"/>';
+
+  // volume bars (gray, behind, up from zero)
+  for(var i = 0; i < n; i++){
+    var volYi = days[i].volume * 1e-6;
+    if(volYi <= 0) continue;
+    var bh = volYi * scale;
+    if(bh < 0.5) bh = 0.5;
+    var bx = padL + (i + offset) * slotW + (slotW - barW) / 2;
+    var by = zeroY - bh;
+    svgStr += '<rect class="vol-bar" x="'+bx.toFixed(1)+'" y="'+by.toFixed(1)+
+              '" width="'+barW.toFixed(1)+'" height="'+bh.toFixed(1)+
+              '" fill="#cccccc" opacity="0.5"/>';
+  }
+
+  // share diff bars (red/green, in front)
+  for(var i = 0; i < n; i++){
+    var d = days[i].diff;
+    if(d == null || (i === 0)) continue;  // skip first day (no diff)
+    var bh = Math.abs(d) * scale;
+    if(bh < 0.5) bh = 0.5;
+    var bx = padL + (i + offset) * slotW + (slotW - barW) / 2;
+    var by, color;
+    if(d >= 0){
+      by = zeroY - bh;
+      color = '#ff4713';
+    } else {
+      by = zeroY;
+      color = '#00875a';
+    }
+    svgStr += '<rect class="diff-bar" x="'+bx.toFixed(1)+'" y="'+by.toFixed(1)+
+              '" width="'+barW.toFixed(1)+'" height="'+bh.toFixed(1)+
+              '" fill="'+color+'" opacity="0.85"/>';
+  }
+
+  // price line
+  var path = '';
+  var started = false;
+  for(var i = 0; i < n; i++){
+    if(days[i].price == null) continue;
+    var px = padL + (i + offset) * slotW + slotW / 2;
+    var py = padT + topH - (days[i].price - pMin) / pRange * (topH - 4);
+    py = Math.max(padT + 2, Math.min(padT + topH - 2, py));
+    path += (started ? 'L' : 'M') + px.toFixed(1) + ',' + py.toFixed(1) + ' ';
+    started = true;
+  }
+  if(path) svgStr += '<path d="'+path+'" fill="none" stroke="#005eb8" stroke-width="1.5"/>';
+
+  // vertical guide line (hidden by default)
+  svgStr += '<line id="detailVLine" x1="0" y1="'+padT+'" x2="0" y2="'+(padT+plotH)+'" stroke="#888" stroke-width="1" stroke-dasharray="3,2" style="display:none"/>';
+
+  // transparent hit zones (only over actual data)
+  for(var i = 0; i < n; i++){
+    var hx = padL + (i + offset) * slotW;
+    svgStr += '<rect class="hit-zone" data-i="'+i+'" x="'+hx.toFixed(1)+'" y="'+padT+
+              '" width="'+slotW.toFixed(1)+'" height="'+plotH+
+              '" fill="transparent" style="cursor:crosshair"/>';
+  }
+
+  svg.setAttribute('viewBox', '0 0 '+W+' '+H);
+  svg.setAttribute('width', W);
+  svg.setAttribute('height', H);
+  svg.innerHTML = svgStr;
+}
+
+function setupDetailHover(svg, tip, days, slotCount){
+  var W = 392;
+  var padL = 8, padR = 8;
+  var plotW = W - padL - padR;
+  var slotW = plotW / slotCount;
+  var offset = slotCount - days.length;
+  if(offset < 0) offset = 0;
+
+  var vline = svg.querySelector('#detailVLine');
+  var zones = svg.querySelectorAll('.hit-zone');
+  for(var i = 0; i < zones.length; i++){
+    zones[i].addEventListener('mouseenter', function(e){
+      var idx = parseInt(this.getAttribute('data-i'));
+      var day = days[idx];
+      var cx = padL + (idx + offset) * slotW + slotW / 2;
+      vline.setAttribute('x1', cx);
+      vline.setAttribute('x2', cx);
+      vline.style.display = 'block';
+      tip.innerHTML = buildDetailTip(day);
+      tip.style.display = 'block';
+    });
+    zones[i].addEventListener('mouseleave', function(){
+      vline.style.display = 'none';
+    });
+  }
+}
+
+function hideDetailChart(){
+  if(_detailHideTimer) clearTimeout(_detailHideTimer);
+  _detailHideTimer = setTimeout(function(){
+    document.getElementById('detailChart').style.display = 'none';
+  }, 150);
+}
+
+function detailChartEnter(){
+  if(_detailHideTimer){ clearTimeout(_detailHideTimer); _detailHideTimer = null; }
+}
+
+function detailChartLeave(){
+  hideDetailChart();
+}
+
+function signedFmt(n, d){ return (n>0?'+':'')+fmt(n,d); }
+
+function buildDetailTip(day){
+  return '<b>'+fmtDate(day.date)+'</b><br>'+
+    '价格 <b>'+fmt(day.price,3)+'</b><br>'+
+    '份额 <b>'+fmt(day.shares,1)+'</b> 亿份<br>'+
+    '份额变化 <span class="'+(day.diff>=0?'tu':'td')+'">'+signedFmt(day.diff,2)+' 亿份</span><br>'+
+    '成交量 <b>'+fmt(day.volume/1e4,1)+'</b> 万手<br>'+
+    '成交额 <b>'+fmt(day.amount,2)+'</b> 亿';
 }
 
 // ---- intraday realtime sparkline (5min bars, up to 48) ----
@@ -1110,7 +1410,7 @@ function renderTable(){
            '<div class="code num">'+it.code+'</div></td>'+
       '<td><div class="num">'+fmt(it.shares_yi,1)+dateMark+'</div>'+shareSub+'</td>'+
       '<td><div class="num">'+fmt(it.mktcap_yi,1)+dateMark+'</div>'+mktcapSub+'</td>'+
-      '<td>'+sparkSharesPrice(it.shares_30d)+'</td>'+
+      '<td class="spark-cell" onmouseenter="showDetailChart(event,\''+it.code+'\')" onmouseleave="hideDetailChart()">'+sparkSharesPrice(it.shares_30d)+'</td>'+
       '<td>'+sparkRealtime(RT && RT.data ? RT.data[it.code] : null, RT ? RT.max_bars : 0, it.prev_close)+'</td>'+
       '<td class="num" style="font-weight:700">'+fmt(it.amount_yi,2)+amtSub+'</td>'+
       '<td><div class="ratio num '+rCls+'">'+fmt(c.ratio,2)+'<b>×</b></div>'+ratioBar+'</td>'+
@@ -1298,5 +1598,17 @@ function scheduleSnapshot(){
 
 loadSnapshot(boot);
 </script>
+
+<div id="detailChart" onmouseenter="detailChartEnter()" onmouseleave="detailChartLeave()">
+  <div class="title"></div>
+  <svg></svg>
+  <div class="tip"></div>
+  <div class="legend">
+    <span><i style="background:#005eb8"></i>价格</span>
+    <span><i style="background:#ff4713;opacity:.7"></i>份额变化</span>
+    <span><i style="background:#bbb"></i>成交量</span>
+  </div>
+</div>
+
 </body>
 </html>
