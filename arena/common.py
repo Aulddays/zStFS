@@ -1,6 +1,7 @@
 import tqdm as _tqdm
 import logging
 import os
+import concurrent.futures
 from contextlib import contextmanager
 from dotenv import load_dotenv
 import httpx
@@ -68,11 +69,29 @@ def _quiet_tqdm():
     finally:
         _tqdm.tqdm.__init__ = orig_init
 
-def safe_call(func, *args, **kwargs):
-    """Call an akshare function safely; return None on failure."""
-    try:
+def safe_call(func, *args, safe_call_timeout=600, **kwargs):
+    """Call a function safely (silence tqdm, catch exceptions).
+    safe_call_timeout: max seconds to wait (default 10min). None means no timeout.
+    Returns the function result, or None on timeout / exception.
+    """
+    def _run():
         with _quiet_tqdm():
             return func(*args, **kwargs)
+
+    if safe_call_timeout is None:
+        try:
+            return _run()
+        except Exception as e:
+            logging.warning(f"{func.__name__} failed: {e}")
+            return None
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run)
+            return future.result(timeout=safe_call_timeout)
+    except concurrent.futures.TimeoutError:
+        logging.warning(f"{func.__name__} timed out after {safe_call_timeout}s")
+        return None
     except Exception as e:
         logging.warning(f"{func.__name__} failed: {e}")
         return None

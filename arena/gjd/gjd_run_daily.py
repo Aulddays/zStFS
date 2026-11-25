@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(_this_dir))   # arena/
 sys.path.insert(0, _this_dir)                      # arena/gjd/
 import cna_calendar
 import common
+import akshare as ak
 from zstorec import zstore
 
 def setup_logging():
@@ -889,13 +890,12 @@ def get_latest_trade_date():
     start_dt = end_dt - timedelta(days=10)
     start_date = start_dt.strftime("%Y%m%d")
 
+    df = common.safe_call(ak.stock_zh_a_daily, symbol="sh000001",
+                          start_date=start_date, end_date=end_date, adjust="")
+    if df is None or df.empty:
+        logging.warning("get_latest_trade_date: no data, fallback to end_date")
+        return end_date
     try:
-        import akshare as ak
-        df = ak.stock_zh_a_daily(symbol="sh000001", start_date=start_date,
-                                 end_date=end_date, adjust="")
-        if df is None or df.empty:
-            logging.warning("get_latest_trade_date: no data, fallback to end_date")
-            return end_date
         last_date = str(df.iloc[-1]["date"])[:10].replace("-", "")
         return last_date
     except Exception as e:
@@ -1097,9 +1097,11 @@ def fetch_sse_shares(date_str):
     fetch one-day SSE-official ETF share data  (using akshare)
     returns {code: shares_yi}  (亿份), {} on failure
     """
+    df = common.safe_call(ak.fund_etf_scale_sse, date=date_str)
+    if df is None or df.empty:
+        logging.warning("SSE shares %s failed: no data", date_str)
+        return {}
     try:
-        import akshare as ak
-        df = ak.fund_etf_scale_sse(date=date_str)
         result = {}
         for _, row in df.iterrows():
             code = str(row["基金代码"]).strip()
@@ -1107,7 +1109,7 @@ def fetch_sse_shares(date_str):
             result[code] = round(shares / 1e8, 4)  # 转亿份
         return result
     except Exception as e:
-        logging.warning("SSE shares %s failed: %s", date_str, e)
+        logging.warning("SSE shares %s parse failed: %s", date_str, e)
         return {}
 
 
@@ -1125,11 +1127,12 @@ def fetch_szse_shares_range(start_date, end_date):
     fetch SZSE-official ETF share data for a date range (using akshare).
     returns {date_str: {code: shares_yi}}, {} on failure
     """
+    df = common.safe_call(ak.fund_scale_daily_szse,
+                    start_date=start_date, end_date=end_date, symbol="ETF")
+    if df is None or df.empty:
+        logging.warning("SZSE shares %s~%s failed: no data", start_date, end_date)
+        return {}
     try:
-        import akshare as ak
-        df = ak.fund_scale_daily_szse(
-            start_date=start_date, end_date=end_date, symbol="ETF"
-        )
         result = {}
         for _, row in df.iterrows():
             d = str(row["日期"]).replace("-", "")
@@ -1140,7 +1143,7 @@ def fetch_szse_shares_range(start_date, end_date):
             result[d][code] = round(shares / 1e8, 4)
         return result
     except Exception as e:
-        logging.warning("SZSE shares %s~%s failed: %s", start_date, end_date, e)
+        logging.warning("SZSE shares %s~%s parse failed: %s", start_date, end_date, e)
         return {}
 
 
@@ -1151,8 +1154,6 @@ def fetch_daily(code, days=40):
     return: [{date, open, close, high, low, volume_lots, amount_yi}, ...]
     In ascending order by date.
     """
-    import akshare as ak
-
     merged = {}  # date_str -> bar dict
 
     # --- Tencent ---
