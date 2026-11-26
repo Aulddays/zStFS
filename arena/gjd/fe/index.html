@@ -86,7 +86,7 @@ header{display:flex;align-items:flex-start;justify-content:space-between;gap:20p
 /* detail popup chart */
 #detailChart{position:fixed;display:none;z-index:50;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.12);padding:12px 14px;width:420px}
 #detailChart .title{font-size:12px;font-weight:700;margin-bottom:8px;color:var(--ink2)}
-#detailChart svg{display:block;width:100%;height:auto}
+#detailChart svg{display:block;width:100%;height:auto;overflow:visible}
 #detailChart .tip{position:absolute;left:100%;top:12px;margin-left:10px;pointer-events:none;background:#fff;border:1px solid var(--line);border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.10);padding:7px 10px;font-size:11px;line-height:1.7;display:none;z-index:5;white-space:nowrap}
 #detailChart .tip b{font-size:12px}
 #detailChart .tip .tu{color:var(--up);font-weight:700}
@@ -566,8 +566,10 @@ function sparkSharesPrice(data){
 
 // ---- detail chart popup (price line + share diff bars + volume bars) ----
 var _detailHideTimer = null;
-var _detailDailyCache = {};  // code -> daily data promise/array
-var DETAIL_DAYS = 64;       // reserved slot count (≈ 60 trading days)
+var _detailDailyCache = {};  // code -> {data, ts} or promise
+var _detailCurrentCode = null;
+var DETAIL_DAYS = 94;       // reserved slot count (≈ 90 trading days)
+var DETAIL_DAILY_TTL = 5 * 60 * 1000; // daily cache TTL: 5 min
 
 function showDetailChart(ev, code){
   if(_detailHideTimer){ clearTimeout(_detailHideTimer); _detailHideTimer = null; }
@@ -578,28 +580,37 @@ function showDetailChart(ev, code){
   var tip = box.querySelector('.tip');
   var title = box.querySelector('.title');
 
-  title.textContent = it.name + ' · ' + it.code + '（60日）';
+  title.textContent = it.name + ' · ' + it.code + '（90日）';
+  _detailCurrentCode = code;
 
-  // initial 30-day data from snapshot; right-aligned in DETAIL_DAYS slots
-  var days = buildDetailDaysFromSnapshot(it);
+  // initial data: 30-day history + today from realtime (already on the page)
+  var days = appendTodayRealtime(buildDetailDaysFromSnapshot(it), it);
 
-  // draw with initial data (right-aligned)
   drawDetailChart(svg, days, DETAIL_DAYS);
   setupDetailHover(svg, tip, days, DETAIL_DAYS);
 
-  // position the popup
+  // position the popup + tooltip
   var W = 392, H = 180;
+  var tipW = 160;
   var rect = ev.currentTarget.getBoundingClientRect();
-  var left = rect.right + 12;
+  var spaceRight = window.innerWidth - rect.right - 12;
+  var spaceLeft = rect.left - 12;
+  var needW = W + tipW + 10;
+  var flipped = spaceRight < needW && spaceLeft >= needW;
+  var left = flipped ? rect.left - W - 12 - tipW - 10 : rect.right + 12;
   var top = rect.top;
-  if(left + W + 180 > window.innerWidth) left = rect.left - W - 180;
-  if(top + H + 40 > window.innerHeight) top = window.innerHeight - H - 40;
   box.style.left = left + 'px';
   box.style.top = top + 'px';
   box.style.display = 'block';
+  // adjust top to fit full popup (including legend) on screen
+  var boxH = box.offsetHeight;
+  if(top + boxH + 8 > window.innerHeight){
+    top = window.innerHeight - boxH - 8;
+    if(top < 8) top = 8;
+    box.style.top = top + 'px';
+  }
 
   // tooltip position
-  var flipped = left + W + 180 > window.innerWidth;
   tip.style.left = flipped ? 'auto' : '100%';
   tip.style.right = flipped ? '100%' : 'auto';
   tip.style.marginLeft = flipped ? '0' : '10px';
@@ -611,14 +622,49 @@ function showDetailChart(ev, code){
 
   // async fetch full daily data from zstore
   fetchDetailDaily(code, function(fullDays){
+    if(_detailCurrentCode !== code) return;
     if(!fullDays || fullDays.length < 2) return;
-    drawDetailChart(svg, fullDays, DETAIL_DAYS);
-    setupDetailHover(svg, tip, fullDays, DETAIL_DAYS);
-    if(fullDays.length > 0){
-      tip.innerHTML = buildDetailTip(fullDays[fullDays.length-1]);
+    // append today's realtime data if not already in daily series
+    var withToday = appendTodayRealtime(fullDays, it);
+    drawDetailChart(svg, withToday, DETAIL_DAYS);
+    setupDetailHover(svg, tip, withToday, DETAIL_DAYS);
+    if(withToday.length > 0){
+      tip.innerHTML = buildDetailTip(withToday[withToday.length-1]);
       tip.style.display = 'block';
     }
   });
+}
+
+function appendTodayRealtime(days, it){
+  var today = it.date;
+  if(!today) return days;
+  var last = days.length > 0 ? days[days.length-1].date : '';
+  if(last >= today) return days;
+  if(it.price == null && !it.amount_yi) return days;
+  var vol = it.volume_lots || 0;
+  var amt = it.amount_yi || 0;
+  var nb = null;
+  if(it.outer_lots != null && it.inner_lots != null)
+    nb = it.outer_lots - it.inner_lots;
+  // projected full-day volume based on shape progress
+  var volFull = null;
+  if(vol > 0){
+    var p = dayProgress(it, marketState());
+    if(p > 0.05 && p < 1) volFull = vol / p;
+  }
+  var arr = days.slice();
+  arr.push({
+    date: today,
+    price: it.price || null,
+    shares: null,
+    volume: vol,
+    volumeFull: volFull,
+    amount: amt,
+    netBuy: nb,
+    isToday: true,
+    diff: null,
+  });
+  return arr;
 }
 
 function buildDetailDaysFromSnapshot(it){
@@ -647,28 +693,49 @@ function buildDetailDaysFromSnapshot(it){
   return days;
 }
 
+/**
+ * Fetch daily data for one ETF.
+ * - If fresh cached data exists (< TTL), calls callback once with cached data.
+ * - If stale cached data exists (> TTL), calls callback immediately with stale
+ *   data, then fetches fresh data in background and calls callback again.
+ * - If no cache, fetches and calls callback when done.
+ */
 function fetchDetailDaily(code, callback){
-  if(_detailDailyCache[code]){
-    if(_detailDailyCache[code].then){
-      _detailDailyCache[code].then(callback);
-    } else {
-      callback(_detailDailyCache[code]);
-    }
+  var cached = _detailDailyCache[code];
+  var now = Date.now();
+
+  // cached data available (not a pending promise)
+  if(cached && !cached.then && cached.data){
+    callback(cached.data);
+    if(cached.ts && now - cached.ts < DETAIL_DAILY_TTL)
+      return; // fresh enough, skip refetch
+  }
+
+  // a fetch is already in flight
+  if(cached && cached.then){
+    cached.then(function(arr){ if(arr) callback(arr); });
     return;
   }
-  var p = fetch('api/daily/' + code + '?r=' + Date.now(), {cache: 'no-cache'})
+
+  // start a fresh fetch
+  var prevCache = (cached && !cached.then) ? cached : null;
+  var p = fetch('api/daily/' + code + '?limit=' + DETAIL_DAYS + '&r=' + now, {cache: 'no-cache'})
     .then(function(r){ return r.json(); })
     .then(function(data){
       if(!data || !data.data || !data.data.length) return null;
       var arr = [];
       for(var i = 0; i < data.data.length; i++){
         var row = data.data[i];
+        var netBuy = null;
+        if(row.outer_lots != null && row.inner_lots != null)
+          netBuy = row.outer_lots - row.inner_lots;
         arr.push({
           date: row.date,
           price: row.close,
           shares: row.shares_yi,
           volume: row.volume_lots,
           amount: row.amount_yi,
+          netBuy: netBuy,
         });
       }
       // compute diffs (first day has no prev)
@@ -676,65 +743,152 @@ function fetchDetailDaily(code, callback){
         arr[i].diff = (i === 0 || arr[i].shares == null || arr[i-1].shares == null)
           ? 0 : arr[i].shares - arr[i-1].shares;
       }
-      _detailDailyCache[code] = arr;
+      _detailDailyCache[code] = { data: arr, ts: Date.now() };
       return arr;
     })
-    .catch(function(){ return null; });
+    .catch(function(){
+      // restore previous cache on failure so stale data remains usable
+      if(prevCache) _detailDailyCache[code] = prevCache;
+      else delete _detailDailyCache[code];
+      return null;
+    });
   _detailDailyCache[code] = p;
-  p.then(callback);
+  p.then(function(arr){ if(arr) callback(arr); });
 }
 
 function drawDetailChart(svg, days, slotCount){
   var W = 392, H = 180;
-  var padL = 8, padR = 8, padT = 10, padB = 22;
+  var padL = 42, padR = 8, padT = 10, padB = 4;
   var plotW = W - padL - padR;
   var plotH = H - padT - padB;
+  // if data exceeds slot count, use the most recent slotCount days
   var n = days.length;
+  if(n > slotCount){
+    days = days.slice(n - slotCount);
+    n = slotCount;
+  }
   var slotW = plotW / slotCount;
   var barW = Math.max(1.5, slotW * 0.6);
   // right-align data in the available slots
   var offset = slotCount - n;
-  if(offset < 0) offset = 0;
 
-  // scales — unified in 亿份. 1 lot = 100 shares
-  var maxAbsDiff = 0;
+  // scales. 1 lot = 100 shares, all measured in 亿份.
+  var maxPosDiff = 0;
+  var maxNegDiff = 0;
   var maxVolYi = 0;
+  var maxPosNet = 0;
+  var maxNegNet = 0;
+  var hasNetBuy = false;
   var pMin = Infinity, pMax = -Infinity;
   for(var i = 0; i < n; i++){
     if(days[i].shares != null && i > 0 && days[i-1].shares != null){
       var diff = days[i].shares - days[i-1].shares;
-      if(Math.abs(diff) > maxAbsDiff) maxAbsDiff = Math.abs(diff);
+      if(diff > maxPosDiff) maxPosDiff = diff;
+      if(-diff > maxNegDiff) maxNegDiff = -diff;
     }
     var volYi = days[i].volume * 1e-6;
     if(volYi > maxVolYi) maxVolYi = volYi;
+    if(days[i].volumeFull != null){
+      var fullYi = days[i].volumeFull * 1e-6;
+      if(fullYi > maxVolYi) maxVolYi = fullYi;
+    }
+    if(days[i].netBuy != null){
+      hasNetBuy = true;
+      var nbYi = days[i].netBuy * 1e-6;
+      if(nbYi > maxPosNet) maxPosNet = nbYi;
+      if(nbYi < -maxNegNet) maxNegNet = -nbYi;
+    }
     if(days[i].price != null){
       if(days[i].price < pMin) pMin = days[i].price;
       if(days[i].price > pMax) pMax = days[i].price;
     }
   }
-  var yMax = Math.max(maxAbsDiff, maxVolYi);
-  if(yMax === 0) yMax = 1;
+  var posMag = Math.max(maxPosDiff, maxVolYi, maxPosNet);
+  var negMag = Math.max(maxNegDiff, maxNegNet);
+  if(posMag === 0 && negMag === 0) posMag = 1;
   if(pMin === Infinity || pMax === -Infinity){ pMin = 0; pMax = 1; }
   var pRange = pMax - pMin || 1;
 
-  var topH = plotH * 0.52;
-  var botH = plotH * 0.48;
-  // same scale on both sides of zero; zero line positioned proportionally
-  var yMaxAbove = yMax;
-  var yMaxBelow = maxAbsDiff;
-  var totalY = yMaxAbove + yMaxBelow || 1;
-  var scale = botH / totalY;
-  var zeroY = padT + topH + yMaxAbove * scale;
-  var minNeg = 6;
-  if(padT + plotH - zeroY < minNeg){
-    zeroY = padT + plotH - minNeg;
-    scale = Math.min(scale, (zeroY - padT - topH) / yMaxAbove);
-  }
+  var gap = 12;
+  var topH = (plotH - gap) * 0.5;
+  var botH = plotH - gap - topH;
+  var priceBotY = padT + topH;
+  var barTopY = padT + topH + gap;
+  // zero line splits bar area proportionally to pos/neg magnitude.
+  // same scale on both sides (so 1 unit = same px above and below zero).
+  var totalMag = posMag + negMag || 1;
+  var posH = botH * (posMag / totalMag);
+  var negH = botH * (negMag / totalMag);
+  if(negH < 3){ negH = 3; posH = botH - negH; }
+  if(posH < 3){ posH = 3; negH = botH - posH; }
+  var zeroY = barTopY + posH;
+  var scale = posH / posMag;
 
   var svgStr = '';
 
-  // zero line
+  // price y-axis grid (3 divisions = 4 lines)
+  for(var i = 0; i <= 3; i++){
+    var py = priceBotY - (topH - 4) * (i / 3);
+    var pVal = pMin + pRange * (i / 3);
+    var pDy = (i === 0 ? 0 : 3);  // bottom label sits above line
+    svgStr += '<line x1="'+padL+'" y1="'+py.toFixed(1)+'" x2="'+(W-padR)+'" y2="'+py.toFixed(1)+'" stroke="#ececec" stroke-width="1"/>'+
+              '<text x="'+(padL-4)+'" y="'+(py+pDy).toFixed(1)+'" text-anchor="end" font-size="9" fill="#777">'+fmt(pVal, pVal>=10?1:2)+'</text>';
+  }
+
+  // bar y-axis grid: positive 3 divisions + zero line + negative 3 divisions
+  // top label sits below the line
+  for(var i = 1; i <= 3; i++){
+    var by = zeroY - posH * (i / 3);
+    var bVal = posMag * (i / 3);
+    var label = bVal >= 10 ? fmt(bVal,0) : fmt(bVal,1);
+    var bDy = (i === 3 ? 6 : 3);  // top label sits below line
+    svgStr += '<line x1="'+padL+'" y1="'+by.toFixed(1)+'" x2="'+(W-padR)+'" y2="'+by.toFixed(1)+'" stroke="#ececec" stroke-width="1"/>'+
+              '<text x="'+(padL-4)+'" y="'+(by+bDy).toFixed(1)+'" text-anchor="end" font-size="9" fill="#777">'+label+' 亿份</text>';
+  }
+  // negative grid: same step size as positive, draw as many full steps as fit
+  var stepPx = posH / 3;
+  var stepVal = posMag / 3;
+  var maxNegSteps = Math.floor(negH / stepPx);
+  for(var i = 1; i <= maxNegSteps && i <= 6; i++){
+    var by2 = zeroY + stepPx * i;
+    if(by2 > padT + plotH - 2) break;
+    var bVal2 = stepVal * i;
+    var label2 = '-' + (bVal2 >= 10 ? fmt(bVal2,0) : fmt(bVal2,1)) + ' 亿份';
+    svgStr += '<line x1="'+padL+'" y1="'+by2.toFixed(1)+'" x2="'+(W-padR)+'" y2="'+by2.toFixed(1)+'" stroke="#ececec" stroke-width="1"/>'+
+              '<text x="'+(padL-4)+'" y="'+(by2+3).toFixed(1)+'" text-anchor="end" font-size="9" fill="#777">'+label2+'</text>';
+  }
+
+  // zero line (on top of grid)
   svgStr += '<line x1="'+padL+'" y1="'+zeroY.toFixed(1)+'" x2="'+(W-padR)+'" y2="'+zeroY.toFixed(1)+'" stroke="#d0d0d0" stroke-dasharray="2,2"/>';
+
+  // x-axis dividers: week boundary = dashed, month boundary = solid
+  var lastMonth = null, lastWeek = null;
+  for(var i = 0; i < n; i++){
+    var d = days[i].date;
+    if(!d || d.length !== 8) continue;
+    var month = d.slice(4, 6);
+    var day = parseInt(d.slice(6, 8), 10);
+    var yr = parseInt(d.slice(0, 4), 10);
+    // day of week: Sunday=0
+    var dt = new Date(yr, parseInt(month,10)-1, day);
+    var dow = dt.getDay();
+    var bx = padL + (i + offset) * slotW;
+    var lineX = bx;  // left edge of the slot
+    if(i === 0 && lastMonth === null){
+      lastMonth = month;
+      continue;
+    }
+    var priceTopLine = padT + 2;  // top grid line (same as price line top clamp)
+    if(month !== lastMonth){
+      svgStr += '<line x1="'+lineX.toFixed(1)+'" y1="'+priceTopLine+'" x2="'+lineX.toFixed(1)+'" y2="'+priceBotY+'" stroke="#b8d0e6" stroke-width="1" stroke-dasharray="4,3"/>';
+      svgStr += '<line x1="'+lineX.toFixed(1)+'" y1="'+barTopY+'" x2="'+lineX.toFixed(1)+'" y2="'+zeroY+'" stroke="#b8d0e6" stroke-width="1" stroke-dasharray="4,3"/>';
+      lastMonth = month;
+    } else if(dow === 1 && lastWeek !== month+'-'+d.slice(6,8)){
+      svgStr += '<line x1="'+lineX.toFixed(1)+'" y1="'+priceTopLine+'" x2="'+lineX.toFixed(1)+'" y2="'+priceBotY+'" stroke="#ddd" stroke-width="1" stroke-dasharray="2,3"/>';
+      svgStr += '<line x1="'+lineX.toFixed(1)+'" y1="'+barTopY+'" x2="'+lineX.toFixed(1)+'" y2="'+zeroY+'" stroke="#ddd" stroke-width="1" stroke-dasharray="2,3"/>';
+      lastWeek = month+'-'+d.slice(6,8);
+    }
+  }
 
   // volume bars (gray, behind, up from zero)
   for(var i = 0; i < n; i++){
@@ -744,9 +898,23 @@ function drawDetailChart(svg, days, slotCount){
     if(bh < 0.5) bh = 0.5;
     var bx = padL + (i + offset) * slotW + (slotW - barW) / 2;
     var by = zeroY - bh;
+    var isToday = days[i].isToday;
+    var volColor = isToday ? '#a8a8a8' : '#c0c0c0';
     svgStr += '<rect class="vol-bar" x="'+bx.toFixed(1)+'" y="'+by.toFixed(1)+
               '" width="'+barW.toFixed(1)+'" height="'+bh.toFixed(1)+
-              '" fill="#cccccc" opacity="0.5"/>';
+              '" fill="'+volColor+'" opacity="0.9"/>';
+    // projected extension for today (lighter gray)
+    if(isToday && days[i].volumeFull != null){
+      var fullYi = days[i].volumeFull * 1e-6;
+      var fullH = fullYi * scale;
+      var projH = fullH - bh;
+      if(projH > 0.5){
+        var projY = by - projH;
+        svgStr += '<rect class="vol-proj" x="'+bx.toFixed(1)+'" y="'+projY.toFixed(1)+
+                  '" width="'+barW.toFixed(1)+'" height="'+projH.toFixed(1)+
+                  '" fill="#cfcfcf" opacity="0.8"/>';
+      }
+    }
   }
 
   // share diff bars (red/green, in front)
@@ -759,14 +927,30 @@ function drawDetailChart(svg, days, slotCount){
     var by, color;
     if(d >= 0){
       by = zeroY - bh;
-      color = '#ff4713';
+      color = '#FF917D';
     } else {
       by = zeroY;
-      color = '#00875a';
+      color = '#8BCDAE';
     }
     svgStr += '<rect class="diff-bar" x="'+bx.toFixed(1)+'" y="'+by.toFixed(1)+
               '" width="'+barW.toFixed(1)+'" height="'+bh.toFixed(1)+
-              '" fill="'+color+'" opacity="0.85"/>';
+              '" fill="'+color+'" opacity="1"/>';
+  }
+
+  // net buy line (orange, in bar area, same scale)
+  if(hasNetBuy){
+    var nbPath = '';
+    var nbStarted = false;
+    for(var i = 0; i < n; i++){
+      if(days[i].netBuy == null) continue;
+      var nbYi = days[i].netBuy * 1e-6;
+      var nx = padL + (i + offset) * slotW + slotW / 2;
+      var ny = zeroY - nbYi * scale;
+      ny = Math.max(barTopY + 1, Math.min(padT + plotH - 1, ny));
+      nbPath += (nbStarted ? 'L' : 'M') + nx.toFixed(1) + ',' + ny.toFixed(1) + ' ';
+      nbStarted = true;
+    }
+    if(nbPath) svgStr += '<path d="'+nbPath+'" fill="none" stroke="#CA830B" stroke-width="2"/>';
   }
 
   // price line
@@ -784,6 +968,7 @@ function drawDetailChart(svg, days, slotCount){
 
   // vertical guide line (hidden by default)
   svgStr += '<line id="detailVLine" x1="0" y1="'+padT+'" x2="0" y2="'+(padT+plotH)+'" stroke="#888" stroke-width="1" stroke-dasharray="3,2" style="display:none"/>';
+  svgStr += '<text id="detailVDate" x="0" y="'+(padT-4).toFixed(1)+'" text-anchor="middle" font-size="10" fill="#444" style="display:none"> </text>';
 
   // transparent hit zones (only over actual data)
   for(var i = 0; i < n; i++){
@@ -801,11 +986,14 @@ function drawDetailChart(svg, days, slotCount){
 
 function setupDetailHover(svg, tip, days, slotCount){
   var W = 392;
-  var padL = 8, padR = 8;
+  var padL = 42, padR = 8;
   var plotW = W - padL - padR;
   var slotW = plotW / slotCount;
+  // match drawDetailChart: trim to last slotCount days if overflow
+  if(days.length > slotCount){
+    days = days.slice(days.length - slotCount);
+  }
   var offset = slotCount - days.length;
-  if(offset < 0) offset = 0;
 
   var vline = svg.querySelector('#detailVLine');
   var zones = svg.querySelectorAll('.hit-zone');
@@ -817,11 +1005,16 @@ function setupDetailHover(svg, tip, days, slotCount){
       vline.setAttribute('x1', cx);
       vline.setAttribute('x2', cx);
       vline.style.display = 'block';
+      var vdate = svg.querySelector('#detailVDate');
+      vdate.setAttribute('x', cx);
+      vdate.textContent = fmtDateShort(day.date);
+      vdate.style.display = 'block';
       tip.innerHTML = buildDetailTip(day);
       tip.style.display = 'block';
     });
     zones[i].addEventListener('mouseleave', function(){
       vline.style.display = 'none';
+      svg.querySelector('#detailVDate').style.display = 'none';
     });
   }
 }
@@ -843,13 +1036,28 @@ function detailChartLeave(){
 
 function signedFmt(n, d){ return (n>0?'+':'')+fmt(n,d); }
 
+function fmtDateShort(d){
+  if(!d||d.length!==8) return d||'';
+  var wk=['日','一','二','三','四','五','六'];
+  var dt=new Date(parseInt(d.slice(0,4),10),parseInt(d.slice(4,6),10)-1,parseInt(d.slice(6,8),10));
+  return parseInt(d.slice(4,6),10)+'.'+parseInt(d.slice(6,8),10)+' ('+wk[dt.getDay()]+')';
+}
+
 function buildDetailTip(day){
-  return '<b>'+fmtDate(day.date)+'</b><br>'+
-    '价格 <b>'+fmt(day.price,3)+'</b><br>'+
-    '份额 <b>'+fmt(day.shares,1)+'</b> 亿份<br>'+
-    '份额变化 <span class="'+(day.diff>=0?'tu':'td')+'">'+signedFmt(day.diff,2)+' 亿份</span><br>'+
-    '成交量 <b>'+fmt(day.volume/1e4,1)+'</b> 万手<br>'+
+  var html = '<b>'+fmtDate(day.date)+'</b><br>'+
+    '价格 <b>'+fmt(day.price,3)+'</b><br>';
+  if(day.shares != null && day.diff != null){
+    html += '份额 <b>'+fmt(day.shares,1)+'</b> 亿份<br>'+
+      '份额变化 <span class="'+(day.diff>=0?'tu':'td')+'">'+signedFmt(day.diff,2)+' 亿份</span><br>';
+  }
+  html += '成交量 <b>'+fmt(day.volume/1e4,1)+'</b> 万手<br>'+
     '成交额 <b>'+fmt(day.amount,2)+'</b> 亿';
+  if(day.netBuy != null){
+    var nb = day.netBuy;
+    html += '<br>净买入 <span class="'+(nb>=0?'tu':'td')+'">'+signedFmt(nb/1e4,1)+' 万手</span>';
+  }
+  if(day.isToday) html += '<br><span style="color:#999">盘中实时</span>';
+  return html;
 }
 
 // ---- intraday realtime sparkline (5min bars, up to 48) ----
@@ -1454,6 +1662,7 @@ function applyLive(){
     var it=byCode[code]; if(!it) return;
     it.price=q.price; it.prev_close=q.prev_close; it.pct=q.pct;
     it.amount_wan=q.amount_wan; it.amount_yi=q.amount_wan/1e4;
+    it.volume_lots=q.volume_lots;
     it.outer_lots=q.outer_lots; it.inner_lots=q.inner_lots;
     it.turnover=q.turnover; it.mktcap_yi=q.mktcap_yi;
     // 份额为日频披露数据，盘中无更新源；申赎 diff 基于官方份额历史计算
@@ -1606,7 +1815,8 @@ loadSnapshot(boot);
   <div class="legend">
     <span><i style="background:#005eb8"></i>价格</span>
     <span><i style="background:#ff4713;opacity:.7"></i>份额变化</span>
-    <span><i style="background:#bbb"></i>成交量</span>
+    <span><i style="background:#c0c0c0"></i>成交量</span>
+    <span><i style="background:#CA830B;height:2px;margin-top:4px"></i>净买入</span>
   </div>
 </div>
 

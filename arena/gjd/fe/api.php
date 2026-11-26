@@ -60,7 +60,8 @@ if ($parts[0] === 'realtime')
 }
 else if ($parts[0] === 'daily' && isset($parts[1]))
 {
-	handle_daily($parts[1]);
+	$limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 64;
+	handle_daily($parts[1], $limit);
 }
 else
 {
@@ -180,7 +181,7 @@ function handle_realtime()
 }
 
 // =================== daily ===================
-function handle_daily($code)
+function handle_daily($code, $limit = 64)
 {
 	// validate code format: sh/sz + 6 digits
 	if (!preg_match('/^(sh|sz)\d{6}$/', $code))
@@ -189,6 +190,8 @@ function handle_daily($code)
 		echo json_encode(['error' => 'invalid code']);
 		return;
 	}
+	if ($limit < 1) $limit = 64;
+	if ($limit > 500) $limit = 500;
 
 	$zstore_url = _env_get('ZSTORE_URL');
 	$zstore_auth = _env_get('ZSTORE_AUTHKEY');
@@ -214,8 +217,7 @@ function handle_daily($code)
 		return;
 	}
 
-	// query last 65 days (enough for 60 trading days)
-	$limit = 65;
+	// query $limit rows (each row is one trading day)
 
 	try
 	{
